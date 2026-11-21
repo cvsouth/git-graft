@@ -19,6 +19,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Files Git writes during a cloned checkout record their stat data, so the first `git status` in a graft reads no file contents.
 - A file whose committed blob already has CRLF line endings, under `core.autocrlf` or `text=auto`, is no longer reported modified, which made `merge` refuse a clean graft on file systems without cloning. Graft rechecks a file whose timestamps changed only within the same second with Git's own comparison, as `git status` would.
 - A graft checked out by Git records the change time of its top-level files after moving them into place, so its index matches the files exactly.
+- A merge or undo into the branch checked out in the primary no longer overwrites an ignored file created there after Graft's last check. Git's `read-tree -u` replaces ignored files without asking, so each file the update creates is now written by `git checkout-index`, which creates it exclusively and refuses a path that is already taken. Graft then returns every other file to the previous commit and reports `destination_has_local_changes` naming the path; a retry reports `checkout_recovery_required` instead.
+- A retry of an undo that stopped after Git turned a directory back into a file no longer refuses that file as untracked.
 
 ## [0.1.0] - 2026-11-21
 
