@@ -6,10 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Fixed
-
-- An `add` killed during its checkout could leave a graft without an index or with tracked files missing, which `git commit -a` would record as deletions. The graft now holds its index lock from the moment it is reserved until its checkout is published, so Git refuses to commit an unfinished graft. Retrying the request archives the unfinished attempt whole, with every file it held, and builds the graft again. Replies about the graft list the archive in `archived_attempts`. Restoring an archived creation that never finished is refused with `unfinished_creation`, and the archive is left as it was.
-
 ## [0.1.0] - 2026-11-21
 
 First public release.
@@ -22,7 +18,7 @@ First public release.
 - Merging: `git graft merge` imports a graft's commits into `main` or `--into <branch>`, reports conflicts before changing anything, and archives the graft. `--undo` appends a reversal commit.
 - Archive and restore: `merge`, `remove` and `prune` archive a graft instead of deleting it; `git graft restore` reopens it.
 - Leases: a secret per graft proves ownership; leases can be renewed and expire, and `prune` archives expired grafts.
-- Also: `list`, `status`, `exec`, `lock`, `unlock`, `move`, `repair` and `doctor`. Every command prints JSON and accepts `--help`; a manual page ships with the crate.
+- Also: `list`, `status`, `exec`, `lock`, `unlock`, `move`, `repair` and `doctor`. Every command prints JSON. `git graft --help` and the manual page explain the workflow, leases and error codes, and each command's `--help` has examples.
 - MCP server (`git-graft mcp`, stdio) with nine tools: `graft_add`, `graft_status`, `graft_exec`, `graft_merge`, `graft_remove`, `graft_restore`, `graft_list`, `graft_renew` and `graft_add_dependency`. Execution and dependency tools require `--allow-exec`.
 - An agent skill in `skills/git-graft/SKILL.md`.
 - Platforms: macOS (Intel, Apple silicon), Linux (x86_64, aarch64; static musl) and Windows (x64, ARM64). Disk savings need APFS, Btrfs or XFS; on ext4 and NTFS grafts work but files are full copies. Requires Git 2.46 or newer.
@@ -30,9 +26,10 @@ First public release.
 
 ### Safety
 
-- `remove` refuses unmerged commits, branches, tags and stashes (`unmerged_work`); `remove --discard` after a landed merge reports `unmerged_commits`, and a merge whose graft gained commits keeps it active (`"removed": false`).
+- `remove` refuses unmerged commits, branches, tags and stashes (`unmerged_work`), and accepts commits a branch of the primary already contains, such as work merged with plain Git; `remove --discard` after a landed merge reports `unmerged_commits`, and a merge whose graft gained commits keeps it active (`"removed": false`).
 - A damaged record (`record_damaged`) no longer blocks other grafts or prune, a moved primary fails closed (`primary_moved`), and archived leases name how to restore (`graft_archived`).
-- Interrupted checkout updates resume or reverse from the files on disk, stale staging locks are reclaimed, and `exec` background jobs keep their graft busy.
+- Interrupted checkout updates resume or reverse from the files on disk, stale staging locks are reclaimed, and `exec` background jobs keep their graft busy, on Windows too.
+- An interrupted `add` never leaves a graft Git can commit from: the graft holds its index lock from reservation until its checkout is published. Retrying the request archives the unfinished attempt whole, lists it in `archived_attempts` and builds the graft again; restoring that archive is refused with `unfinished_creation` and leaves it as it was.
 - Merges refuse paths that the filesystem folds onto ignored files by Unicode case or normalization.
 - Cache purges keep saved and registered layers, `deps layer remove` retires layers to `.git/graft/retained-layers/`, and restore reports `already_exists` and `archive_damaged` without touching the archive.
 
