@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `text=auto` with `core.autocrlf=true` no longer makes every file of a new graft come from Git.
 - Files Git writes during a cloned checkout record their stat data, so the first `git status` in a graft reads no file contents.
+- A file whose committed blob already has CRLF line endings, under `core.autocrlf` or `text=auto`, is no longer reported modified, which made `merge` refuse a clean graft on file systems without cloning. Graft rechecks a file whose timestamps changed only within the same second with Git's own comparison, as `git status` would.
+- A graft checked out by Git records the change time of its top-level files after moving them into place, so its index matches the files exactly.
 
 ## [0.1.0] - 2026-11-21
 
