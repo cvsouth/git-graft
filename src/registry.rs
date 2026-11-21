@@ -510,6 +510,7 @@ pub(crate) fn atomic_ordered(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Order everything written to `file`, a file or directory, before every
 /// later write, as [`atomic_ordered`] does. Elsewhere this is a full sync.
+#[cfg(unix)]
 pub(crate) fn order(file: &File) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     if apple_sync(file, libc::F_BARRIERFSYNC)? {
