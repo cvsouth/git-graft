@@ -326,18 +326,38 @@ impl Source {
                 "unsupported Git repository state ({name})"
             );
         }
-        let mut directories = BTreeMap::new();
-        for name in self.objects.names()? {
-            let kind = match name.as_bytes() {
-                b"info" => Kind::Info,
-                b"pack" => Kind::Pack,
-                bytes if lower_hex(bytes, 2) => Kind::Loose,
-                _ => bail!("unsupported entry in Git object directory"),
-            };
-            let child = self.objects.directory(&name)?;
-            let listing = child.inventory(kind, objects.device, width)?;
-            directories.insert(name, listing);
-        }
+        let names = self.objects.names()?;
+        // Fan-out directories are listed independently, by several workers.
+        let chunk = names.len().div_ceil(WORKERS).max(1);
+        let directories = std::thread::scope(|scope| {
+            let workers: Vec<_> = names
+                .chunks(chunk)
+                .map(|batch| {
+                    scope.spawn(move || {
+                        batch
+                            .iter()
+                            .map(|name| {
+                                let kind = match name.as_bytes() {
+                                    b"info" => Kind::Info,
+                                    b"pack" => Kind::Pack,
+                                    bytes if lower_hex(bytes, 2) => Kind::Loose,
+                                    _ => bail!("unsupported entry in Git object directory"),
+                                };
+                                let child = self.objects.directory(name)?;
+                                Ok((name.clone(), child.inventory(kind, objects.device, width)?))
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(crate::workspace::joined)
+                .collect::<Result<Vec<_>>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeMap<_, _>>();
         ensure!(
             directories.contains_key(OsStr::new("pack"))
                 && directories.contains_key(OsStr::new("info")),
