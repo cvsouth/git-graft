@@ -1614,6 +1614,15 @@ pub(super) fn reserve_locked(
         }
         // Archive the whole attempt, so nothing it held is lost.
         if let Err(error) = begin_retirement(p, &mut r, Status::Dropped, None) {
+            if held_open(&error) {
+                return Err(fault(
+                    "workspace_busy",
+                    format!(
+                        "A process still has files open in the interrupted attempt of graft {name}, so Graft could not archive it. Nothing was lost. Wait for that process to exit, or close it, then retry the same request"
+                    ),
+                    json!({"name":r.name,"path":r.path}),
+                ));
+            }
             return Err(fault(
                 "spawn_incomplete",
                 format!("The interrupted attempt could not be archived: {error:#}"),
@@ -1712,6 +1721,17 @@ pub(super) fn reserve_locked(
         ));
     }
     Ok((r, lock))
+}
+
+/// Whether `error` is Windows refusing to move a directory because a process
+/// still has a file, or its working directory, open inside it. Retrying once
+/// that process exits succeeds.
+fn held_open(error: &anyhow::Error) -> bool {
+    cfg!(windows)
+        && error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<io::Error>())
+            .any(|cause| matches!(cause.raw_os_error(), Some(5 | 32)))
 }
 
 /// The record a retry of `request_id` concerns: the live graft holding that

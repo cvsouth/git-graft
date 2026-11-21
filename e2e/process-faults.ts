@@ -134,6 +134,15 @@ export function age(ctx: Context): void {
   }
 }
 
+/** Whether a Git process whose command line names `dir` is still running. */
+function gitRunningIn(ctx: Context, dir: string): boolean {
+  const out = process.platform === 'win32'
+    ? ctx.command('powershell', ['-NoProfile', '-Command', 'Get-CimInstance Win32_Process | ForEach-Object { $_.CommandLine }'])
+    : ctx.command('ps', ['-A', '-ww', '-o', 'args=']);
+  assert.equal(out.status, 0, out.error?.message ?? out.stderr);
+  return out.stdout.split(/\r?\n/).some(line => /\bgit(\.exe)?["\s]/.test(line) && line.includes(dir));
+}
+
 function graftStatus(ctx: Context, name: string): ObjectResult | undefined {
   const listing = ctx.cli(['list']);
   assert(Array.isArray(listing.workspaces));
@@ -731,20 +740,30 @@ export const cases: Scenario[] = [
       assert.deepEqual(readFileSync(join(ctx.repo, '.git', 'index')), index);
       assert.equal(ctx.git(['status', '--porcelain']), '');
       assert.equal(readFileSync(join(ctx.repo, 'payload.dat'), 'utf8'), 'filtered payload\n');
-      // The filter outlives the killed add; let it finish before retrying.
+      // The filter and its Git process outlive the killed add; let them exit
+      // before retrying.
       await waitFor(() => existsSync(finished), 'the orphaned checkout filter');
       // Until recovery, a reservation without a published index keeps an
       // index lock, so Git cannot commit its missing files as deletions.
       const pending = graftStatus(ctx, 'interrupted');
       assert.equal(pending?.status, 'pending', JSON.stringify(pending));
       const reserved = String(pending?.path);
+      await waitFor(() => !gitRunningIn(ctx, reserved), 'the orphaned Git checkout');
       if (!existsSync(join(reserved, '.git', 'index'))) {
         assert(existsSync(join(reserved, '.git', 'index.lock')), 'an unfinished graft left Git able to write its index');
       }
       // Retrying the same request completes the graft; another request cannot take the name.
       assert.equal(ctx.fail(['add', 'interrupted', '--request-id', randomUUID()]).code, 'already_exists');
       // The retry archives the interrupted attempt whole and builds afresh.
-      const retried = await graft(ctx, ['add', 'interrupted', '--history', history, '--request-id', id]);
+      // On Windows a handle a process still holds can block the archive
+      // move; that is reported as busy, and the retry succeeds once it closes.
+      const retry = () => graft(ctx, ['add', 'interrupted', '--history', history, '--request-id', id]);
+      let retried = await retry();
+      for (const deadline = Date.now() + 30_000; !retried.ok && Date.now() < deadline; retried = await retry()) {
+        assert.equal(retried.json.code, 'workspace_busy', JSON.stringify(retried.json));
+        assert.equal(graftStatus(ctx, 'interrupted')?.path, reserved);
+        await delay(250);
+      }
       assert(retried.ok, JSON.stringify(retried.json));
       const path = String(retried.json.path);
       assert.equal(path, reserved);
