@@ -50,7 +50,6 @@ fn prepare(primary: &Path, root: &Path, format: &str, base: &str) -> Result<Opti
     let width = if format == "sha1" { 20 } else { 32 };
     let source = Source::open(primary)?;
     let before = source.inventory(width)?;
-    source.verify_layout()?;
 
     let admin_path = root.canonicalize()?.join(".git");
     let admin = Directory::absolute(&admin_path)?;
@@ -66,7 +65,10 @@ fn prepare(primary: &Path, root: &Path, format: &str, base: &str) -> Result<Opti
         .args(["cat-file", "-t", base]);
     // Reopen Git's path from the filesystem root. A stable detached directory
     // inode is insufficient if the donor has replaced it at its original name.
-    // The donor recheck reads only the primary, so it overlaps the snapshot check.
+    // The donor's layout is checked once, here: the clone stays unpublished
+    // until it passes, and an unchanged inventory proves the layout was the
+    // same during the clone. It reads only the primary, so it overlaps the
+    // snapshot check.
     let (kind, current) = std::thread::scope(|scope| {
         let current = scope.spawn(|| -> Result<Inventory> {
             let current = Source::open(primary)?;
