@@ -891,13 +891,18 @@ impl Update {
         }
         let fresh = !self.has_mutated_checkout();
         self.protect_ignored(path, objects)?;
-        self.two_tree(path, objects, true, true)?;
         publish()?;
         self.protect_ignored(path, objects)?;
-        if fresh {
-            // Publishing can take a while. Check again for an edit made since,
-            // so that Git's own check before it writes is not the only one.
-            self.refuse_overlapping_edits(path, objects)?;
+        // Git's dry run checks each file it would replace against the private
+        // index, so an edit made since the first check, while publishing for
+        // instance, stops the update here: just before the journal records
+        // that files may change, not after. Only then is the status read
+        // again, to name the edited paths.
+        if let Err(error) = self.two_tree(path, objects, true, true) {
+            if fresh {
+                self.refuse_overlapping_edits(path, objects)?;
+            }
+            return Err(error);
         }
         self.set_phase(Phase::Updating)?;
         self.two_tree(path, objects, true, false)?;
@@ -1396,23 +1401,51 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_made_while_the_merge_publishes_is_refused_before_any_write() -> Result<()> {
-        let (_temp, p, _lock, plan) = partial_fixture()?;
-        let index = fs::read(p.common.join("index"))?;
-        let error = apply(&p, &plan, || {
-            fs::write(p.repo.join("b.txt"), "edited during the merge\n")?;
-            Ok(())
-        })
-        .unwrap_err();
-        let reported = crate::api::error_json(&error);
-        assert_eq!(reported["code"], "destination_has_local_changes");
-        assert_eq!(reported["details"]["paths"], json!(["b.txt"]));
-        assert_eq!(read(&p, "b.txt")?, "edited during the merge\n");
-        assert_eq!(read(&p, "a.txt")?, "a\n");
-        assert!(!p.repo.join("added.txt").exists());
-        assert_eq!(fs::read(p.common.join("index"))?, index);
-        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.old);
-        assert!(Update::load(&p.common)?.is_none());
+    fn an_edit_made_after_the_first_check_is_refused_before_the_journal_says_updating() -> Result<()>
+    {
+        type Edit = fn(&Path) -> Result<()>;
+        let cases: [(Edit, &str, Edit); 2] = [
+            (
+                |repo| Ok(fs::write(repo.join("b.txt"), "edited during the merge\n")?),
+                "b.txt",
+                |repo| Ok(fs::write(repo.join("b.txt"), "b\n")?),
+            ),
+            (
+                |repo| {
+                    Ok(fs::write(
+                        repo.join("added.txt"),
+                        "created during the merge\n",
+                    )?)
+                },
+                "added.txt",
+                |repo| Ok(fs::remove_file(repo.join("added.txt"))?),
+            ),
+        ];
+        for (edit, edited, revert) in cases {
+            let (_temp, p, _lock, plan) = partial_fixture()?;
+            let index = fs::read(p.common.join("index"))?;
+            // Publishing runs after the first check and before Git's dry run.
+            let error = apply(&p, &plan, || edit(&p.repo)).unwrap_err();
+            let reported = crate::api::error_json(&error);
+            assert_eq!(
+                reported["code"], "destination_has_local_changes",
+                "{reported}"
+            );
+            assert_eq!(reported["details"]["paths"], json!([edited]));
+            assert!(read(&p, edited)?.ends_with("during the merge\n"));
+            assert_eq!(read(&p, "a.txt")?, "a\n");
+            assert_eq!(fs::read(p.common.join("index"))?, index);
+            assert_eq!(git::oid(&p.repo, "HEAD")?, plan.old);
+            // No journal is left behind, in Updating or any phase.
+            assert!(Update::load(&p.common)?.is_none());
+            assert!(!p.common.join("index.lock").exists());
+
+            revert(&p.repo)?;
+            apply(&p, &plan, || Ok(()))?;
+            assert_eq!(git::oid(&p.repo, "HEAD")?, plan.new);
+            assert_eq!(read(&p, "b.txt")?, "B\n");
+            assert_eq!(read(&p, "added.txt")?, "added\n");
+        }
         Ok(())
     }
 
