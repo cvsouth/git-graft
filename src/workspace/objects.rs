@@ -330,6 +330,10 @@ fn repository_path(repo: &Path, path: &str) -> Result<PathBuf> {
 }
 
 fn write_settings(root: &Path, settings: &[(String, String)]) -> Result<()> {
+    if settings.is_empty() {
+        return Ok(());
+    }
+    // One direct write replaces a Git process per setting.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if config_batch::append(root, settings)? {
         return Ok(());

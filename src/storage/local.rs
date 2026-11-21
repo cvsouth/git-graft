@@ -102,7 +102,8 @@ fn materialize<F: FnOnce() -> Result<()>>(
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 struct Early<'s> {
     /// Blob sizes of a planned manifest.
-    sizes: Option<std::thread::ScopedJoinHandle<'s, Option<std::collections::HashMap<String, u64>>>>,
+    sizes:
+        Option<std::thread::ScopedJoinHandle<'s, Option<std::collections::HashMap<String, u64>>>>,
     /// The primary's index listing, for a full checkout.
     tracked: Option<std::thread::ScopedJoinHandle<'s, Result<Option<Vec<u8>>>>>,
 }

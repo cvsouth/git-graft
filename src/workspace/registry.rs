@@ -1010,11 +1010,7 @@ fn order_record(directory: &Path, r: &Record) -> Result<()> {
     store_record(directory, r, crate::registry::atomic_ordered)
 }
 
-fn store_record(
-    directory: &Path,
-    r: &Record,
-    write: fn(&Path, &[u8]) -> Result<()>,
-) -> Result<()> {
+fn store_record(directory: &Path, r: &Record, write: fn(&Path, &[u8]) -> Result<()>) -> Result<()> {
     validate_record(r)?;
     let path = directory.join(format!("{}.json", r.id));
     ensure!(absent_or_regular(&path)?, "graft record path is occupied");

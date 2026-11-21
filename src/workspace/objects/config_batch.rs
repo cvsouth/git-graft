@@ -39,23 +39,21 @@ fn initial_config(data: &[u8]) -> bool {
 }
 
 pub(super) fn append(root: &Path, settings: &[(String, String)]) -> Result<bool> {
-    if settings.len() < 4
-        || !settings.iter().all(|(key, value)| {
-            matches!(
-                key.as_str(),
-                "user.name"
-                    | "user.email"
-                    | "author.name"
-                    | "author.email"
-                    | "committer.name"
-                    | "committer.email"
-                    | "core.autocrlf"
-                    | "core.eol"
-                    | "core.safecrlf"
-                    | "core.bigfilethreshold"
-            ) && !value.chars().any(char::is_control)
-        })
-    {
+    if !settings.iter().all(|(key, value)| {
+        matches!(
+            key.as_str(),
+            "user.name"
+                | "user.email"
+                | "author.name"
+                | "author.email"
+                | "committer.name"
+                | "committer.email"
+                | "core.autocrlf"
+                | "core.eol"
+                | "core.safecrlf"
+                | "core.bigfilethreshold"
+        ) && !value.chars().any(char::is_control)
+    }) {
         return Ok(false);
     }
     let admin = root.join(".git");
@@ -92,7 +90,8 @@ pub(super) fn append(root: &Path, settings: &[(String, String)]) -> Result<bool>
     }
     lock.as_file().set_permissions(meta.permissions())?;
     lock.write_all(&data)?;
-    lock.as_file().sync_all()?;
+    // Ordered before the checkout; finishing the graft makes it durable.
+    crate::registry::order(lock.as_file())?;
     ensure!(
         identity(&fs::symlink_metadata(&config)?) == identity(&meta),
         "private Git configuration changed while applying settings"

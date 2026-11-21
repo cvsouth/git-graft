@@ -123,8 +123,7 @@ impl Snapshot {
             }
         }
         // Ordered before the checkout; finishing the graft makes it durable.
-        crate::registry::order(&self.admin.0)
-            .context("sync independent Git object snapshot")?;
+        crate::registry::order(&self.admin.0).context("sync independent Git object snapshot")?;
         Ok(Some(self.receipt))
     }
 }
