@@ -96,6 +96,8 @@ fn run(repo: PathBuf, mut command: Entry) -> anyhow::Result<Option<serde_json::V
 
 fn main() -> ExitCode {
     trace::mark("start");
+    #[cfg(windows)]
+    runtime::keep_standard_handles_private();
     let cli = Cli::parse();
     match run(cli.repo, cli.command) {
         Ok(Some(value)) => {
