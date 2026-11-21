@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
 import { execute, parseExact, type Scenario } from './harness.ts';
 
@@ -259,7 +259,10 @@ export const cases: Scenario[] = [
       const restored = String(ctx.cli(['restore', 'unicode-archive', '--lease', restore.lease]).path);
       for (const name of names) assert.equal(readFileSync(join(restored, name), 'utf8'), `untracked ${name}\n`, name);
 
-      rmSync(join(ws.path, 'übung-notes.txt'));
+      // On Windows, Node 24's rmSync left this non-ASCII name in place without an
+      // error, and the merge rightly refused it. Unlink it and check the listing.
+      unlinkSync(join(ws.path, 'übung-notes.txt'));
+      assert(!readdirSync(ws.path).includes('übung-notes.txt'), 'the uncommitted Unicode file was not removed');
       assert.equal(ctx.cli(['merge', 'unicode', '--lease', ws.lease]).commit, tip);
       for (const name of names) assert.equal(readFileSync(join(ctx.repo, name), 'utf8'), `contents of ${name}\n`, name);
       assert.equal(ctx.git(['status', '--porcelain']), '');
