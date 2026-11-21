@@ -218,9 +218,15 @@ export const cases: Scenario[] = [
       assert.equal(ctx.git(['rev-parse', 'HEAD']), old);
       assert.deepEqual(readFileSync(join(ctx.repo, '.git', 'index')), index);
       assert.equal(existsSync(join(ctx.repo, 'feature.txt')), false);
+      // Edits the person makes before the retry, none in the merge's paths.
+      write(ctx.repo, 'tracked.txt', 'edited before the retry\r\n');
+      write(ctx.repo, 'scratch.txt', 'untracked before the retry\n');
       const receipt = ctx.cli(landArgs(workspace, name));
       assert.equal(receipt.commit, tip);
       assert.equal(read(ctx.repo, 'feature.txt'), 'prepared work\n');
+      assert.deepEqual(readFileSync(join(ctx.repo, 'tracked.txt')), Buffer.from('edited before the retry\r\n'));
+      assert.equal(read(ctx.repo, 'scratch.txt'), 'untracked before the retry\n');
+      assert.equal(ctx.git(['status', '--porcelain']), ' M tracked.txt\n?? scratch.txt');
       assert.equal(existsSync(journal), false);
       assert.equal(existsSync(join(ctx.repo, '.git', 'index.lock')), false);
     },
@@ -451,20 +457,40 @@ export const cases: Scenario[] = [
     },
   })),
   {
-    name: 'landing protects dirty destination and ignored collision',
+    name: 'landing merges around unrelated destination edits and refuses overlapping ones',
     run(ctx) {
       const workspace = ctx.spawn('dirty');
       write(workspace.path, 'collision.txt', 'landed\n');
+      write(workspace.path, 'tracked.txt', 'graft edit\n');
       const tip = commit(ctx, workspace.path, 'feature');
       const old = ctx.git(['rev-parse', 'HEAD']).trim();
+      const refused = (paths: string[]) => {
+        const index = readFileSync(join(ctx.repo, '.git', 'index'));
+        const failure = ctx.fail(landArgs(workspace, 'dirty'));
+        assert.equal(failure.code, 'destination_has_local_changes', String(failure.message));
+        assert.deepEqual(field(failure.details).paths, paths);
+        assert.equal(field(failure.details).target, 'main');
+        assert.equal(ctx.git(['rev-parse', 'HEAD']).trim(), old);
+        assert.deepEqual(readFileSync(join(ctx.repo, '.git', 'index')), index);
+      };
+      // Unrelated work the merge must carry through unchanged.
+      write(ctx.repo, 'notes.txt', 'staged unrelated\r\n');
+      ctx.git(['add', 'notes.txt']);
+      write(ctx.repo, 'notes.txt', 'staged unrelated\r\nand unstaged\n');
+      write(ctx.repo, 'untracked.txt', 'untracked user file\n');
+      // A staged and an unstaged edit to a file the merge changes.
       write(ctx.repo, 'tracked.txt', 'staged user edit\n');
       ctx.git(['add', 'tracked.txt']);
       write(ctx.repo, 'tracked.txt', 'local edit\n');
-      assert.match(String(ctx.fail(landArgs(workspace, 'dirty')).message), /local changes/i);
+      refused(['tracked.txt']);
       assert.equal(read(ctx.repo, 'tracked.txt'), 'local edit\n');
-      assert.equal(ctx.git(['rev-parse', 'HEAD']).trim(), old);
       assert.equal(ctx.git(['show', ':tracked.txt']), 'staged user edit');
       ctx.git(['restore', '--source=HEAD', '--staged', '--worktree', '--', 'tracked.txt']);
+      // An untracked file where the merge adds one.
+      write(ctx.repo, 'collision.txt', 'untracked user data\n');
+      refused(['collision.txt']);
+      assert.equal(read(ctx.repo, 'collision.txt'), 'untracked user data\n');
+      rmSync(join(ctx.repo, 'collision.txt'));
       const gitDir = ctx.git(['rev-parse', '--absolute-git-dir']).trim();
       write(gitDir, 'info/exclude', 'collision.txt\n');
       write(ctx.repo, 'collision.txt', 'ignored user data\n');
@@ -475,6 +501,11 @@ export const cases: Scenario[] = [
       assert.equal(ctx.git(['rev-parse', 'HEAD'], workspace.path), tip);
       assert.equal(ctx.cli(landArgs(workspace, 'dirty')).commit, tip);
       assert.equal(read(ctx.repo, 'collision.txt'), 'landed\n');
+      assert.equal(read(ctx.repo, 'tracked.txt'), 'graft edit\n');
+      assert.deepEqual(readFileSync(join(ctx.repo, 'notes.txt')), Buffer.from('staged unrelated\r\nand unstaged\n'));
+      assert.equal(ctx.git(['cat-file', 'blob', ':notes.txt']), 'staged unrelated');
+      assert.equal(read(ctx.repo, 'untracked.txt'), 'untracked user file\n');
+      assert.equal(ctx.git(['status', '--porcelain']), 'AM notes.txt\n?? untracked.txt');
     },
   },
   {
@@ -815,7 +846,9 @@ export const cases: Scenario[] = [
       ctx.git(['add', '--', 'feature.txt'], workspace.path);
       write(workspace.path, 'feature.txt', 'edit after failure\n');
 
-      assert.match(String(ctx.fail(land).message), /local changes/);
+      const dirty = ctx.fail(land);
+      assert.equal(dirty.code, 'local_changes', String(dirty.message));
+      assert.deepEqual(field(dirty.details).paths, [{ path: 'feature.txt', status: 'modified' }]);
       const drop = owned('remove');
       assert.match(String(ctx.fail(drop).message), /merge is pending/);
       assert.equal(read(workspace.path, 'feature.txt'), 'edit after failure\n');

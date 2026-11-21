@@ -251,7 +251,7 @@ export const cases: Scenario[] = [
     },
   })),
   {
-    name: 'undo leaves dirty target and an ignored path collision intact',
+    name: 'undo goes ahead around unrelated target edits and refuses overlapping ones',
     run(ctx) {
       const name = 'dirty-target';
       const old = commit(ctx, ctx.repo, 'removed.txt', 'present before landing\n');
@@ -266,14 +266,18 @@ export const cases: Scenario[] = [
       ctx.git(['add', '--', 'tracked.txt']);
       writeFileSync(tracked, 'unstaged user edit\n');
       writeFileSync(untracked, 'untracked user file\n');
-      assert.match(String(ctx.fail(args).message), /local changes/i);
+      // The undo brings removed.txt back, so a file there is refused.
+      const restored = join(ctx.repo, 'removed.txt');
+      writeFileSync(restored, 'untracked user file in the undo path\n');
+      const refused = ctx.fail(args);
+      assert.equal(refused.code, 'destination_has_local_changes', String(refused.message));
+      assert.deepEqual((refused.details as Record<string, unknown>).paths, ['removed.txt']);
       assert.equal(ctx.git(['rev-parse', 'HEAD']), landed);
       assert.equal(ctx.git(['show', ':tracked.txt']), 'staged user edit');
       assert.equal(readFileSync(tracked, 'utf8'), 'unstaged user edit\n');
       assert.equal(readFileSync(untracked, 'utf8'), 'untracked user file\n');
-
-      ctx.git(['restore', '--source=HEAD', '--staged', '--worktree', '--', 'tracked.txt']);
-      rmSync(untracked);
+      assert.equal(readFileSync(restored, 'utf8'), 'untracked user file in the undo path\n');
+      rmSync(restored);
       const common = ctx.git(['rev-parse', '--path-format=absolute', '--git-common-dir']);
       mkdirSync(join(common, 'info'), { recursive: true });
       writeFileSync(join(common, 'info', 'exclude'), '/removed.txt\n');
@@ -284,6 +288,10 @@ export const cases: Scenario[] = [
       assert.equal(readFileSync(collision, 'utf8'), 'ignored user file\n');
       rmSync(collision);
       assertUndo(ctx, 'HEAD', old, landed, ctx.cli(args).commit);
+      assert.equal(readFileSync(join(ctx.repo, 'removed.txt'), 'utf8'), 'present before landing\n');
+      assert.equal(ctx.git(['show', ':tracked.txt']), 'staged user edit');
+      assert.equal(readFileSync(tracked, 'utf8'), 'unstaged user edit\n');
+      assert.equal(readFileSync(untracked, 'utf8'), 'untracked user file\n');
     },
   },
   {

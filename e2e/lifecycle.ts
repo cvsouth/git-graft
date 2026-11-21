@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn as spawnProcess } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
@@ -411,6 +411,44 @@ export const cases: Scenario[] = [
         const restored = ctx.cli(['restore', name, '--lease', w.lease]);
         assert.equal(work(ctx, String(restored.path)), before, `the archive lost work of ${name}`);
       }
+    },
+  },
+  {
+    name: 'remove names each local change with its status and archives them only with discard',
+    async run(ctx) {
+      const w = ctx.spawn('edited');
+      writeFileSync(join(w.path, 'tracked.txt'), 'uncommitted edit\n');
+      writeFileSync(join(w.path, 'notes.txt'), 'untracked notes\n');
+      const exclude = join(ctx.git(['rev-parse', '--absolute-git-dir'], w.path), 'info', 'exclude');
+      mkdirSync(dirname(exclude), { recursive: true });
+      writeFileSync(exclude, 'build/\n');
+      mkdirSync(join(w.path, 'build'));
+      writeFileSync(join(w.path, 'build', 'out.txt'), 'ignored output\n');
+      const before = work(ctx, w.path);
+      const expected = {
+        paths: [
+          { path: 'tracked.txt', status: 'modified' },
+          { path: 'notes.txt', status: 'untracked' },
+          { path: 'build/', status: 'ignored' },
+        ],
+        count: 3,
+        discard_archives: true,
+      };
+      const refused = ctx.fail(['remove', 'edited', '--lease', w.lease]);
+      assert.equal(refused.code, 'local_changes', String(refused.message));
+      assert.deepEqual(refused.details, expected);
+      assert.match(String(refused.message), /remove --discard/);
+      const tool = await mcpTool(ctx, 'graft_remove', { name: 'edited', lease: w.lease });
+      assert.equal(tool.isError, true);
+      assert.equal(tool.content.code, 'local_changes');
+      assert.deepEqual(tool.content.details, expected);
+      assert.equal(work(ctx, w.path), before, 'a refused remove changed the graft');
+      assert.equal(readFileSync(join(w.path, 'build', 'out.txt'), 'utf8'), 'ignored output\n');
+      assert.equal(drop(ctx, 'edited', w.lease, '--discard').action, 'remove');
+      const restored = String(ctx.cli(['restore', 'edited', '--lease', w.lease]).path);
+      assert.equal(readFileSync(join(restored, 'tracked.txt'), 'utf8'), 'uncommitted edit\n');
+      assert.equal(readFileSync(join(restored, 'notes.txt'), 'utf8'), 'untracked notes\n');
+      assert.equal(readFileSync(join(restored, 'build', 'out.txt'), 'utf8'), 'ignored output\n');
     },
   },
   {

@@ -641,11 +641,15 @@ export const cases: Scenario[] = [
       ctx.git(['switch', 'retry-target']);
       const landArgs = { ...owned, into: 'retry-target', squash: true };
       writeFileSync(join(target, 'keep.txt'), 'local work\n');
+      writeFileSync(join(target, 'tracked.txt'), 'local edit in the merge path\n');
       const dirty = await call(client, 'graft_merge', landArgs, true);
-      assert.match(string(dirty.message, 'destination refusal'), /local changes/);
+      assert.equal(dirty.code, 'destination_has_local_changes', string(dirty.message, 'destination refusal'));
+      assert.deepEqual(object(dirty.details, 'destination refusal details').paths, ['tracked.txt']);
       assert.equal(readFileSync(join(target, 'keep.txt'), 'utf8'), 'local work\n');
+      assert.equal(readFileSync(join(target, 'tracked.txt'), 'utf8'), 'local edit in the merge path\n');
       assert.equal(ctx.git(['rev-parse', 'HEAD'], target), base);
       assert(existsSync(workspace.path));
+      ctx.git(['checkout', '--', 'tracked.txt'], target);
       ctx.git(['add', 'keep.txt'], target);
       ctx.git(['commit', '-m', 'Preserve local work'], target);
       const previous = ctx.git(['rev-parse', 'HEAD'], target);
