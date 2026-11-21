@@ -391,4 +391,111 @@ export const cases: Scenario[] = [{
     assert.equal(readFileSync(oldModule, 'utf8'), 'module.exports = "edited in the graft";\n');
     ctx.cli(['heartbeat', 'old', '--lease', old.lease]);
   },
+}, {
+  name: 'sharing an npm workspaces project is refused with a typed fault and a fallback',
+  run(ctx) {
+    const fixture = npmArchive(ctx.root);
+    const manifest = { name: 'monorepo', version: '1.0.0', private: true, workspaces: ['packages/local'],
+      dependencies: { 'graft-fixture': '1.0.0' } };
+    const member = { name: 'local', version: '1.0.0' };
+    mkdirSync(join(ctx.repo, 'packages', 'local'), { recursive: true });
+    writeFileSync(join(ctx.repo, 'package.json'), JSON.stringify(manifest));
+    writeFileSync(join(ctx.repo, 'packages', 'local', 'package.json'), JSON.stringify(member));
+    writeFileSync(join(ctx.repo, 'package-lock.json'), JSON.stringify({ name: manifest.name, version: manifest.version,
+      lockfileVersion: 3, requires: true, packages: {
+        '': manifest,
+        'node_modules/graft-fixture': { version: '1.0.0', resolved: 'https://127.0.0.1:1/graft-fixture.tgz', integrity: fixture.integrity },
+        'node_modules/local': { resolved: 'packages/local', link: true },
+        'packages/local': member,
+      } }));
+    ctx.git(['add', '.']);
+    ctx.git(['commit', '-qm', 'workspaces project']);
+    const cache = join(ctx.root, 'npm-cache');
+    npm(ctx, ['cache', 'add', fixture.path, '--offline', '--cache', cache]);
+    npm(ctx, ['ci', '--offline', '--ignore-scripts', '--cache', cache]);
+    assert(lstatSync(join(ctx.repo, 'node_modules', 'local')).isSymbolicLink());
+
+    const refused = ctx.fail(['deps', 'share', '--key', 'fixture']);
+    assert.equal(refused.code, 'dependencies_not_shareable', JSON.stringify(refused));
+    const details = objectResult(refused.details);
+    assert.equal(details.field, 'workspaces');
+    assert.equal(details.path, 'package.json');
+    assert.match(String(details.reason), /workspaces/);
+    assert.match(String(details.fallback), /npm ci/);
+    assert.match(String(details.fallback), /deps add/);
+    assert.match(String(refused.message), /npm ci/);
+    // Nothing was registered: a new graft attaches no install.
+    const graft = ctx.spawn('plain');
+    assert(!('dependencies' in objectResult(graft.result.storage)));
+    assert(!existsSync(join(graft.path, 'node_modules')));
+  },
+}, {
+  name: 'a graft with only its attached shared install removes without --discard until the install changes',
+  run(ctx) {
+    const fixture = npmArchive(ctx.root, 4096);
+    const manifest = { name: 'consumer', version: '1.0.0', private: true, dependencies: { 'graft-fixture': '1.0.0' } };
+    writeFileSync(join(ctx.repo, 'package.json'), JSON.stringify(manifest));
+    writeFileSync(join(ctx.repo, 'package-lock.json'), JSON.stringify({ name: manifest.name, version: manifest.version,
+      lockfileVersion: 3, requires: true, packages: {
+        '': manifest,
+        'node_modules/graft-fixture': { version: '1.0.0', resolved: 'https://127.0.0.1:1/graft-fixture.tgz', integrity: fixture.integrity },
+      } }));
+    ctx.git(['add', 'package.json', 'package-lock.json']);
+    ctx.git(['commit', '-qm', 'locked fixture']);
+    const cache = join(ctx.root, 'npm-cache');
+    npm(ctx, ['cache', 'add', fixture.path, '--offline', '--cache', cache]);
+    npm(ctx, ['ci', '--offline', '--ignore-scripts', '--cache', cache]);
+    const attempt = ctx.command(ctx.bin, ['--repo', ctx.repo, '--json', 'deps', 'share', '--key', 'fixture']);
+    assert.ifError(attempt.error);
+    if (attempt.status !== 0) {
+      assert.equal(objectResult(JSON.parse(attempt.stderr || attempt.stdout)).code, 'cow_unavailable');
+      ctx.unavailable('shared dependencies require native copy-on-write');
+    }
+
+    // Untouched since attaching: remove archives it, and every byte survives.
+    const fresh = ctx.spawn('fresh');
+    assert.equal(objectResult(objectResult(fresh.result.storage).dependencies).status, 'attached');
+    const freshInstall = tree(join(fresh.path, 'node_modules'));
+    const removed = ctx.cli(['remove', 'fresh', '--lease', fresh.lease]);
+    assert.equal(removed.removed, true);
+    assert(!existsSync(fresh.path));
+    const reopened = ctx.cli(['restore', 'fresh', '--lease', String(removed.recovery_lease)]);
+    assert.deepEqual(tree(join(String(reopened.path), 'node_modules')), freshInstall);
+
+    // Merge applies the same check to committed work beside the unchanged install.
+    const merged = ctx.spawn('merged');
+    writeFileSync(join(merged.path, 'feature.txt'), 'done\n');
+    ctx.git(['add', 'feature.txt'], merged.path);
+    ctx.git(['commit', '-qm', 'feature'], merged.path);
+    assert.equal(ctx.cli(['merge', 'merged', '--lease', merged.lease]).removed, true);
+    assert.equal(readFileSync(join(ctx.repo, 'feature.txt'), 'utf8'), 'done\n');
+
+    // Another ignored file still counts, even beside an unchanged install.
+    const other = ctx.spawn('other');
+    mkdirSync(join(other.path, 'ignored'));
+    writeFileSync(join(other.path, 'ignored', 'note.txt'), 'local');
+    const refused = ctx.fail(['remove', 'other', '--lease', other.lease]);
+    assert.equal(refused.code, 'local_changes', JSON.stringify(refused));
+    const others = (objectResult(refused.details).paths as { path: string }[]).map(entry => entry.path);
+    assert.deepEqual(others, ['ignored/']);
+
+    // A change after attaching makes the install local work.
+    for (const [name, change] of [
+      ['edited', (modules: string) => writeFileSync(join(modules, 'graft-fixture', 'index.js'), 'module.exports = 1;\n')],
+      ['added', (modules: string) => writeFileSync(join(modules, 'graft-extra.txt'), 'extra')],
+      ['deleted', (modules: string) => rmSync(join(modules, 'graft-fixture', 'package.json'))],
+    ] as const) {
+      const changed = ctx.spawn(name);
+      const modules = join(changed.path, 'node_modules');
+      change(modules);
+      const edited = tree(modules);
+      const blocked = ctx.fail(['remove', name, '--lease', changed.lease]);
+      assert.equal(blocked.code, 'local_changes', JSON.stringify(blocked));
+      const paths = (objectResult(blocked.details).paths as { path: string }[]).map(entry => entry.path);
+      assert.deepEqual(paths, ['node_modules/']);
+      assert.deepEqual(tree(modules), edited);
+      const kept = ctx.cli(['remove', name, '--lease', changed.lease, '--discard']);
+      assert.equal(kept.removed, true);
+    }
+  },
 }];

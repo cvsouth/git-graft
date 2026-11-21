@@ -13,8 +13,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A graft mirrors its primary's line endings. A primary file is reused when Git's own line-ending conversion of it, the one `git status` compares and `git add` stores, gives exactly the committed blob, verified by hashing the converted bytes or, for a file equal to its blob, by Git's index stat test. With `core.autocrlf=true`, an LF primary's text files are now cloned instead of written in full. Paths with a filter, `ident` or a working-tree encoding still come from Git, and so does any file `git add` would refuse under `core.safecrlf=true`.
 - `doctor` reports `file_sharing.shared` from cloning support alone; line-ending settings no longer stop sharing.
 
+- `deps share` refuses a project that cannot share, such as one with npm workspaces, overrides or linked or bundled packages, as `dependencies_not_shareable` instead of `operation_failed`. `details` names the `reason`, the offending `field` and `path` and a `fallback`: run `npm ci` in the graft, or use `deps add`. Workspaces stay unsupported because their links leave `node_modules`; the rules are in [what can be shared](docs/operations.md#what-can-be-shared).
+
 ### Fixed
 
+- `remove` and `merge` no longer report `local_changes` for the shared `node_modules` that Graft itself attached when the graft has not changed it. The attach receipt now records the verified `contents` digest, and the install counts as local work again once any file in it is added, edited or deleted. The archive keeps every file either way, and other ignored files still count.
 - `text=auto` with `core.autocrlf=true` no longer makes every file of a new graft come from Git.
 - Files Git writes during a cloned checkout record their stat data, so the first `git status` in a graft reads no file contents.
 - A file whose committed blob already has CRLF line endings, under `core.autocrlf` or `text=auto`, is no longer reported modified, which made `merge` refuse a clean graft on file systems without cloning. Graft rechecks a file whose timestamps changed only within the same second with Git's own comparison, as `git status` would.
