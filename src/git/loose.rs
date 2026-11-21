@@ -50,12 +50,14 @@ pub(crate) fn blob_sizes(
     })
 }
 
-/// The size in a loose object's header if it names a blob: `blob`, a space,
-/// the decimal size and a NUL.
+/// The size in a loose object's header if it names a blob, by the rules of
+/// Git's `unpack_loose_header` and `parse_loose_header`: the header, with its
+/// NUL, fits in Git's 32-byte buffer, and is `blob`, one space and the size in
+/// canonical decimal, without a sign or leading zeros, that fits in 64 bits.
 fn blob_size(file: &File, inflate: &mut Decompress) -> Option<u64> {
     // The header ends within the first bytes of the zlib stream.
     let mut input = [0; 512];
-    let mut header = [0; 32];
+    let mut header = [0; MAX_HEADER];
     let read = file.read_at(&mut input, 0).ok()?;
     inflate.reset(true);
     inflate
@@ -64,11 +66,18 @@ fn blob_size(file: &File, inflate: &mut Decompress) -> Option<u64> {
     let header = &header[..usize::try_from(inflate.total_out()).ok()?];
     let end = header.iter().position(|&byte| byte == 0)?;
     let size = header[..end].strip_prefix(b"blob ")?;
-    if size.is_empty() || !size.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    std::str::from_utf8(size).ok()?.parse().ok()
+    let canonical = match size {
+        [b'0'] => true,
+        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    // Git dies on a size that overflows; parsing refuses it here.
+    canonical.then(|| std::str::from_utf8(size).ok()?.parse().ok())?
 }
+
+/// Git's `MAX_HEADER_LEN`: a loose header without a NUL in this many bytes
+/// is too long for Git to read.
+const MAX_HEADER: usize = 32;
 
 #[cfg(test)]
 mod tests {
@@ -129,5 +138,67 @@ mod tests {
         git(repo, &["repack", "-adq"]);
         git(repo, &["prune-packed"]);
         assert_eq!(blob_sizes(&objects, &ids[..2], |_, _| true), [None, None]);
+    }
+
+    /// Store `body` under `id` as a loose object exactly as given.
+    fn write_loose(objects: &Path, id: &str, body: &[u8]) {
+        use std::io::Write;
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(body).unwrap();
+        let directory = objects.join(&id[..2]);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(&id[2..]), encoder.finish().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn headers_follow_gits_loose_header_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "--quiet", "--template="]);
+        let objects = repo.join(".git/objects");
+        let long = format!("blob {}\0", "1".repeat(30));
+        let cases: [(&[u8], Option<u64>); 14] = [
+            (b"blob 5\0hello", Some(5)),
+            (b"blob 0\0", Some(0)),
+            (b"blob 05\0hello", None),
+            (b"blob 00\0", None),
+            (b"blob +5\0hello", None),
+            (b"blob -5\0hello", None),
+            (b"blob  5\0hello", None),
+            (b"blob 5 \0hello", None),
+            (b"blob \0", None),
+            (b"blob\0", None),
+            (b"Blob 5\0hello", None),
+            (b"tree 5\0hello", None),
+            (b"blob 99999999999999999999\0", None),
+            (long.as_bytes(), None),
+        ];
+        for (index, (body, expected)) in cases.into_iter().enumerate() {
+            // Git refuses the all-zero null ID before reading anything.
+            let id = format!("{:040x}", index + 1);
+            write_loose(&objects, &id, body);
+            assert_eq!(
+                blob_sizes(&objects, &[&id], |_, _| true),
+                [expected],
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+            // Git reads exactly the blob headers accepted here.
+            let read = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["cat-file", "-t", &id])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            let blob = read.status.success() && read.stdout == b"blob\n";
+            assert_eq!(
+                blob,
+                expected.is_some(),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 }
