@@ -53,9 +53,13 @@ function assertEnvironmentIntact(ctx: Context, env: ReturnType<typeof environmen
 }
 
 /** Hold a file open on Windows without sharing, as an editor or build tool might. */
+let holders = 0;
 async function holdOpen(ctx: Context, file: string) {
-  const ready = join(ctx.root, 'holder-ready-' + basename(file));
-  const release = join(ctx.root, 'holder-release-' + basename(file));
+  // Each holder needs its own signal files: a stale ready or release file
+  // from an earlier hold of the same name would end this one before it starts.
+  const id = `${++holders}-${basename(file)}`;
+  const ready = join(ctx.root, 'holder-ready-' + id);
+  const release = join(ctx.root, 'holder-release-' + id);
   const script = join(ctx.root, 'holder.ps1');
   writeFileSync(script, [
     'param($Path, $Ready, $Release)',
@@ -743,7 +747,7 @@ export const cases: Scenario[] = [
         } finally {
           await release();
         }
-        assert.equal(refused.ok, false, `${args[0]} succeeded while a file was held open`);
+        assert.equal(refused.ok, false, `${args[0]} succeeded while a file was held open: ${JSON.stringify(refused.json)}`);
         assert.equal(readFileSync(target, 'utf8'), 'open in an editor\n');
         const retried = graftAt(ctx, ctx.repo, args);
         assert.equal(retried.ok, true, JSON.stringify(retried.json));
