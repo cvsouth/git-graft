@@ -155,7 +155,13 @@ const mcp = surface(publicTools, [...advertisedTools].sort(), coveredTools);
 const passed = results.filter(result => result.status === 'passed').length;
 const unavailable = results.filter(result => result.status === 'unavailable').length;
 const failed = results.length - passed - unavailable;
-const ok = passed === results.length && (group !== undefined || (cli.missing.length === 0 && mcp.missing.length === 0));
+// Some scenarios need a cloning file system, and the kill-step cases need a
+// POSIX shell, so they are unavailable on ext4 and NTFS. That is expected
+// only where CI says Git checkout is the backend; anywhere else, including
+// local runs, an unavailable scenario fails the run.
+const unavailableExpected = process.env.GIT_GRAFT_EXPECT_BACKEND === 'git';
+const ok = failed === 0 && (unavailable === 0 || unavailableExpected)
+  && (group !== undefined || (cli.missing.length === 0 && mcp.missing.length === 0));
 assert.deepEqual(identifyBinary(binary), binaryIdentity, 'The executable changed during the end-to-end run');
 const report = {
   generated_at: new Date().toISOString(),
