@@ -39,7 +39,7 @@ mod eol;
 mod native;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod verify;
-pub(crate) use local::{materialize_local, materialize_planned};
+pub(crate) use local::{KnownSizes, materialize_local, materialize_planned};
 
 /// Content of the index lock a graft creation holds from its reservation
 /// until it publishes the checkout's index. Git's own index locks are empty

@@ -7,7 +7,6 @@ use crate::workspace::objects::{Primary, finish_head};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     thread,
@@ -106,7 +105,7 @@ pub(in crate::workspace) fn needs_tip_proof(state: &Path, base: &str) -> bool {
 /// Check out `plan` while a worker runs `transfer` beside it. Until the
 /// checkout is ready to publish its index, Git in the graft reads only the
 /// plan's proof store. `publish` then completes the transfer's result.
-/// `sizes` holds blob sizes already proven for the checkout.
+/// `sizes` receives blob sizes the transfer proves for the checkout.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::workspace::objects) fn checkout<T: Send>(
     source: &Primary<'_>,
@@ -115,7 +114,7 @@ pub(in crate::workspace::objects) fn checkout<T: Send>(
     base: &str,
     reference: &str,
     plan: LoosePlan,
-    sizes: Option<&HashMap<String, u64>>,
+    sizes: Option<crate::storage::KnownSizes>,
     transfer: impl FnOnce(&LoosePlan) -> Result<T> + Send,
     publish: impl FnOnce(T, &LoosePlan) -> Result<Value>,
 ) -> Result<(Value, Option<Value>)> {

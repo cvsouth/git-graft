@@ -7,10 +7,13 @@ use std::{collections::HashMap, path::PathBuf};
 struct CheckoutMetadata<'a> {
     objects: Option<&'a Path>,
     index: Option<&'a TipIndex>,
-    /// Blob sizes already read from the history the checkout will use.
+    /// Blob sizes read from the history the checkout will use, when ready.
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
-    sizes: Option<&'a HashMap<String, u64>>,
+    sizes: Option<KnownSizes>,
 }
+
+/// Receives blob sizes another worker has proven for a planned checkout.
+pub(crate) type KnownSizes = std::sync::mpsc::Receiver<std::sync::Arc<HashMap<String, u64>>>;
 
 pub(crate) fn materialize_local(
     workspace: &Path,
@@ -32,7 +35,7 @@ pub(crate) fn materialize_local(
 }
 
 /// Prepare files from a verified manifest and join history checks before index
-/// publication. `sizes` holds blob sizes the caller has already proven.
+/// publication. `sizes` receives blob sizes the caller proves meanwhile.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize_planned<F: FnOnce() -> Result<()>>(
     workspace: &Path,
@@ -41,7 +44,7 @@ pub(crate) fn materialize_planned<F: FnOnce() -> Result<()>>(
     primary: &Path,
     proof_objects: Option<&Path>,
     manifest: Option<&TipIndex>,
-    sizes: Option<&HashMap<String, u64>>,
+    sizes: Option<KnownSizes>,
     ready: F,
 ) -> Result<Value> {
     let mut ready = Some(ready);
@@ -81,7 +84,7 @@ fn materialize<F: FnOnce() -> Result<()>>(
     oid: &str,
     sparse: &[String],
     primary: &Path,
-    metadata: CheckoutMetadata<'_>,
+    mut metadata: CheckoutMetadata<'_>,
     ready: F,
 ) -> Result<Value> {
     // Blob sizes only depend on object IDs, and the primary's index listing
@@ -89,12 +92,13 @@ fn materialize<F: FnOnce() -> Result<()>>(
     // both while the workspace index is prepared.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     return std::thread::scope(|scope| {
-        let known = metadata.sizes;
+        let known = metadata.sizes.take();
         let early = Early {
             sizes: metadata.index.map(|manifest| {
                 scope.spawn(move || {
+                    let known = known.and_then(|known| known.recv().ok());
                     let loose;
-                    let known = match known {
+                    let known = match &known {
                         Some(known) => known,
                         None => {
                             let objects = primary.join(".git").join("objects");

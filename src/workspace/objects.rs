@@ -502,9 +502,7 @@ pub(super) fn initialize(
             finish_head(primary, root, reference, &base, None)?;
             return Ok((receipt, None));
         };
-        let sizes = snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.loose_blob_sizes(plan.index.blobs()));
+        let (proven, sizes) = std::sync::mpsc::channel();
         return history::tip::checkout(
             source,
             root,
@@ -512,16 +510,21 @@ pub(super) fn initialize(
             &base,
             reference,
             plan,
-            sizes.as_ref(),
+            Some(sizes),
             |plan| {
-                if let (Some(snapshot), Some(sizes)) = (&snapshot, &sizes) {
-                    // A blob read from the snapshot's own loose files is proven.
-                    plan.verify_local(root, &snapshot.objects(), |mut blobs| {
-                        blobs.retain(|blob| !sizes.contains_key(*blob));
-                        Ok(blobs)
-                    })?;
-                }
-                Ok(snapshot)
+                let Some(snapshot) = snapshot else {
+                    return Ok(None);
+                };
+                let sizes = std::sync::Arc::new(snapshot.loose_blob_sizes(plan.index.blobs()));
+                // The checkout's size proof waits for these; it reads the
+                // primary itself if they never arrive.
+                let _ = proven.send(sizes.clone());
+                // A blob read from the snapshot's own loose files is proven.
+                plan.verify_local(root, &snapshot.objects(), |mut blobs| {
+                    blobs.retain(|blob| !sizes.contains_key(*blob));
+                    Ok(blobs)
+                })?;
+                Ok(Some(snapshot))
             },
             |snapshot, plan| {
                 if let Some(snapshot) = snapshot
