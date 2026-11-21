@@ -515,9 +515,19 @@ impl Source {
             "Git object directory changed during cloning"
         );
         // Opening each fresh clone costs more than the clone itself, so the
-        // checks read its stat and attribute names by path. A clone has no
-        // data to write back: its blocks are the donor's, and APFS commits
-        // the cloned entries' metadata with the directory synced below.
+        // checks read its stat and attribute names without opening it. macOS
+        // has no descriptor-relative listxattr, so the names come from the
+        // absolute path; that path is inside this graft's private staging
+        // directory, which nothing else writes, so it names the entry the
+        // descriptor-relative stat checked.
+        //
+        // No object is fsynced on its own. A clone has no data to write back:
+        // its blocks are the donor's. This relies on APFS committing all
+        // earlier namespace changes, these cloned entries included, together
+        // with the fan-out directory's fsync below, the staging directory's
+        // write barrier and the final F_FULLFSYNC when the graft finishes.
+        // Linux, which copies objects with FICLONE into new files, still
+        // syncs each file in `clone_entries`.
         let mut totals = Totals::default();
         let mut path = target.as_os_str().as_bytes().to_vec();
         path.push(b'/');
