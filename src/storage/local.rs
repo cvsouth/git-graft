@@ -516,19 +516,11 @@ pub(super) mod direct {
     /// The sizes of `files`' blobs that are loose in `objects`, an object
     /// directory Git reads, from the header Git would read.
     pub(super) fn loose_sizes(objects: &Path, files: &[Entry]) -> HashMap<String, u64> {
-        let blobs: Vec<&str> = files
+        let blobs = files
             .iter()
             .filter(|entry| entry.regular())
-            .map(|entry| entry.blob.as_str())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        let sizes = crate::git::loose::blob_sizes(objects, &blobs, |_, _| true);
-        blobs
-            .into_iter()
-            .zip(sizes)
-            .filter_map(|(blob, size)| Some((blob.to_owned(), size?)))
-            .collect()
+            .map(|entry| entry.blob.as_str());
+        crate::git::loose::blob_sizes(objects, blobs, |_, _| true)
     }
 
     /// Each regular file blob's size, or `None` if Git cannot report them all.

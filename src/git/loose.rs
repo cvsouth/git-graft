@@ -3,6 +3,7 @@
 //! Git's own size and type queries inflate the same header, one object at a
 //! time in one process. Reading it here lets several workers share the work.
 use std::{
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     os::unix::fs::{FileExt, OpenOptionsExt},
     path::Path,
@@ -10,16 +11,21 @@ use std::{
 
 use flate2::{Decompress, FlushDecompress};
 
-/// Each of `blobs`' size, read from its loose object file in `objects`.
+/// The size of each of `blobs` that is a loose blob in `objects`.
 ///
 /// A blob gets no size if it is not loose there, its header does not name a
 /// blob, or `accept` rejects the file once its header has been read.
-pub(crate) fn blob_sizes(
+pub(crate) fn blob_sizes<'a>(
     objects: &Path,
-    blobs: &[&str],
+    blobs: impl IntoIterator<Item = &'a str>,
     accept: impl Fn(&str, &File) -> bool + Sync,
-) -> Vec<Option<u64>> {
+) -> HashMap<String, u64> {
     const WORKERS: usize = 4;
+    let blobs: Vec<&str> = blobs
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     let chunk = blobs.len().div_ceil(WORKERS).max(1);
     std::thread::scope(|scope| {
         let workers: Vec<_> = blobs
@@ -30,14 +36,16 @@ pub(crate) fn blob_sizes(
                     let mut inflate = Decompress::new(true);
                     batch
                         .iter()
-                        .map(|blob| {
+                        .filter_map(|&blob| {
                             let (prefix, name) = blob.split_at_checked(2)?;
                             let file = OpenOptions::new()
                                 .read(true)
                                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                                 .open(objects.join(prefix).join(name))
                                 .ok()?;
-                            blob_size(&file, &mut inflate).filter(|_| accept(blob, &file))
+                            let size =
+                                blob_size(&file, &mut inflate).filter(|_| accept(blob, &file))?;
+                            Some((blob.to_owned(), size))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -119,25 +127,23 @@ mod tests {
             "x",
         ];
         assert_eq!(
-            blob_sizes(&objects, &ids, |_, _| true),
-            [Some(0), Some(5000), None, None, None]
+            blob_sizes(&objects, ids, |_, _| true),
+            HashMap::from([(empty.clone(), 0), (text.clone(), 5000)])
         );
         // The caller's check runs after the header and can still refuse.
         assert_eq!(
-            blob_sizes(&objects, &ids, |id, _| id != text),
-            [Some(0), None, None, None, None]
+            blob_sizes(&objects, ids, |id, _| id != text),
+            HashMap::from([(empty.clone(), 0)])
         );
-        // Blobs spread across workers keep their order.
-        let many: Vec<&str> = std::iter::repeat_n([empty.as_str(), missing.as_str()], 9)
-            .flatten()
-            .collect();
-        let expected: Vec<_> = std::iter::repeat_n([Some(0), None], 9).flatten().collect();
-        assert_eq!(blob_sizes(&objects, &many, |_, _| true), expected);
+        // Repeated blobs spread across workers are read once each.
+        let many =
+            std::iter::repeat_n([empty.as_str(), text.as_str(), missing.as_str()], 9).flatten();
+        assert_eq!(blob_sizes(&objects, many, |_, _| true).len(), 2);
         // Packed blobs are left to Git.
         git(repo, &["add", "--", "empty", "text"]);
         git(repo, &["repack", "-adq"]);
         git(repo, &["prune-packed"]);
-        assert_eq!(blob_sizes(&objects, &ids[..2], |_, _| true), [None, None]);
+        assert!(blob_sizes(&objects, ids, |_, _| true).is_empty());
     }
 
     /// Store `body` under `id` as a loose object exactly as given.
@@ -178,8 +184,10 @@ mod tests {
             let id = format!("{:040x}", index + 1);
             write_loose(&objects, &id, body);
             assert_eq!(
-                blob_sizes(&objects, &[&id], |_, _| true),
-                [expected],
+                blob_sizes(&objects, [id.as_str()], |_, _| true)
+                    .get(&id)
+                    .copied(),
+                expected,
                 "{}",
                 String::from_utf8_lossy(body)
             );

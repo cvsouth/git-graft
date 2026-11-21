@@ -6,7 +6,7 @@
 //! and graph completeness rely on the donor's Git database being consistent.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File, Metadata},
     io,
@@ -137,7 +137,6 @@ impl Snapshot {
         &self,
         blobs: impl Iterator<Item = &'a str>,
     ) -> HashMap<String, u64> {
-        let blobs: Vec<&str> = blobs.collect::<HashSet<_>>().into_iter().collect();
         let inventoried = |blob: &str, file: &File| {
             let stamp = blob.split_at_checked(2).and_then(|(prefix, name)| {
                 let listing = self.inventory.directories.get(OsStr::new(prefix))?;
@@ -148,12 +147,7 @@ impl Snapshot {
                     .is_ok_and(|metadata| Stamp::from(&metadata) == *stamp)
             })
         };
-        let sizes = crate::git::loose::blob_sizes(&self.donor, &blobs, inventoried);
-        blobs
-            .into_iter()
-            .zip(sizes)
-            .filter_map(|(blob, size)| Some((blob.to_owned(), size?)))
-            .collect()
+        crate::git::loose::blob_sizes(&self.donor, blobs, inventoried)
     }
 
     pub(super) fn publish(self, root: &Path) -> Result<Option<Value>> {
