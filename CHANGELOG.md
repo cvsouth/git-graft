@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- An `add` killed during a Git checkout (ext4, NTFS and other volumes without file cloning) could be recovered as a graft missing tracked files, which `git commit -a` would record as deletions. Retrying the request or restoring the archive now finishes the checkout, and an unfinished graft keeps an index lock so Git refuses to commit it.
+
 ## [0.1.0] - 2026-11-21
 
 First public release.
