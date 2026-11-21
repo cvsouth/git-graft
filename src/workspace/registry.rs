@@ -1428,6 +1428,16 @@ fn flush_if_elsewhere(path: &Path, other: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Fully flush an unfinished reservation before a reply hands out its lease:
+/// its steps were only ordered, and finish never flushed them.
+pub(super) fn flush_reservation(p: &Project, r: &Record) -> Result<()> {
+    sync_directory(&record_directory(p, false)?)?;
+    match r.path.parent() {
+        Some(parent) if exists(parent)? => sync_directory(parent),
+        _ => Ok(()),
+    }
+}
+
 fn same_filesystem(source: &Path, destination: &Path) -> Result<bool> {
     let parent = destination.parent().context("destination has no parent")?;
     Ok(file_id(source)?.volume == file_id(parent)?.volume)
@@ -1688,6 +1698,8 @@ pub(super) fn reserve_locked(
                     json!({"name":r.name,"path":r.path}),
                 ));
             }
+            // Best effort: the reply is still accurate if the flush fails.
+            let _ = flush_reservation(p, &r);
             return Err(fault(
                 "spawn_incomplete",
                 format!("The interrupted attempt could not be archived: {error:#}"),
@@ -1787,6 +1799,8 @@ pub(super) fn reserve_locked(
         order_record(&directory, &r)
     })();
     if let Err(error) = result {
+        // Best effort: the reply is still accurate if the flush fails.
+        let _ = flush_reservation(p, &r);
         return Err(fault(
             "spawn_incomplete",
             format!("Workspace reservation could not be placed: {error:#}"),
