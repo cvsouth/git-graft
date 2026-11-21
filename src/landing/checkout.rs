@@ -787,8 +787,8 @@ impl Update {
     /// update, so that `read-tree` can finish it (`forward`) or reverse it.
     /// Each changed path takes the entry whose version its file holds. Git
     /// removes a file before it writes the replacement, so a missing file
-    /// takes the entry of the side the update moves from, and is written
-    /// again. Staged entries for other paths are kept. A changed path with
+    /// takes the entry of the side without the path, if there is one, or else
+    /// of the side the update moves from, and is written again. Staged entries for other paths are kept. A changed path with
     /// any other content or staged version stops recovery before a file is
     /// written.
     fn rebuild(
@@ -856,11 +856,19 @@ impl Update {
             let old = (&change.old, &from_old, &from_new);
             let new = (&change.new, &from_new, &from_old);
             let (first, second) = if forward { (old, new) } else { (new, old) };
-            if let Some((entry, _, _)) = [first, second]
+            let holding: Vec<_> = [first, second]
                 .into_iter()
-                .find(|(entry, own, other)| holds(entry, own, other, name))
+                .filter(|(entry, own, other)| holds(entry, own, other, name))
+                .map(|(entry, _, _)| entry)
+                .collect();
+            // Both sides hold only a missing file. The side without the path
+            // cannot clash with a file or directory written in its place.
+            if let Some(entry) = holding
+                .iter()
+                .find(|entry| !entry.present())
+                .or(holding.first())
             {
-                chosen.push((&name[..], entry));
+                chosen.push((&name[..], *entry));
             } else {
                 edited.push(name.clone());
             }
@@ -1271,22 +1279,29 @@ mod tests {
         Ok(())
     }
 
+    /// The plan of an undo of the applied `plan`: a commit on top of it that
+    /// returns to the previous tree.
+    fn undo_plan(p: &Project, plan: &Plan) -> Result<Plan> {
+        let previous = git::text(&p.repo, &["rev-parse", &format!("{}^{{tree}}", plan.old)])?;
+        let reversal = git::text(
+            &p.repo,
+            &["commit-tree", &previous, "-p", &plan.new, "-m", "undo"],
+        )?;
+        Ok(Plan {
+            target: plan.target.clone(),
+            old: plan.new.clone(),
+            new: reversal,
+            tip: plan.new.clone(),
+        })
+    }
+
     #[test]
     fn an_undo_keeps_unrelated_edits() -> Result<()> {
         let (_temp, p, _lock, plan) = partial_fixture()?;
         apply(&p, &plan, || Ok(()))?;
         let repo = &p.repo;
-        let previous = git::text(repo, &["rev-parse", &format!("{}^{{tree}}", plan.old)])?;
-        let reversal = git::text(
-            repo,
-            &["commit-tree", &previous, "-p", &plan.new, "-m", "undo"],
-        )?;
-        let undo = Plan {
-            target: plan.target.clone(),
-            old: plan.new.clone(),
-            new: reversal.clone(),
-            tip: plan.new.clone(),
-        };
+        let undo = undo_plan(&p, &plan)?;
+        let reversal = undo.new.clone();
         fs::write(repo.join("b.txt"), "edited after the merge\n")?;
         assert_refused(&p, &undo, &["b.txt"])?;
         fs::write(repo.join("b.txt"), "B\n")?;
@@ -1572,6 +1587,29 @@ mod tests {
         assert_eq!(changed, "unrelated.txt");
         assert!(Update::load(&p.common)?.is_none());
         assert!(!p.common.join("index.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn retry_finishes_an_update_stopped_after_a_directory_became_a_file() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        apply(&p, &plan, || Ok(()))?;
+        let undo = undo_plan(&p, &plan)?;
+        // The undo stopped after Git removed `swap/inner` and wrote `swap`.
+        let mut update = Update::begin(&p.common, &undo)?;
+        let index = fs::read(p.common.join("index"))?;
+        registry::atomic(&update.directory.join("index.before"), &index)?;
+        registry::atomic(&update.directory.join("index.next"), &index)?;
+        update.set_phase(Phase::Updating)?;
+        drop(update);
+        fs::remove_dir_all(p.repo.join("swap"))?;
+        fs::write(p.repo.join("swap"), "file\n")?;
+        apply(&p, &undo, || Ok(()))?;
+        assert_eq!(git::oid(&p.repo, "HEAD")?, undo.new);
+        assert_eq!(read(&p, "swap")?, "file\n");
+        assert_eq!(read(&p, "a.txt")?, "a\n");
+        assert!(git::changes(&p.repo)?.iter().all(|c| c.status == "!!"));
+        assert!(Update::load(&p.common)?.is_none());
         Ok(())
     }
 
