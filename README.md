@@ -77,7 +77,7 @@ When you're done, merge it into `main` from your checkout:
 git graft merge fix-parser --lease <lease>
 ```
 
-Merging archives the graft rather than deleting it; `git graft restore fix-parser` brings it back. Use `--into <branch>` to merge somewhere else, and `git graft list` to see every graft.
+Merging archives the graft rather than deleting it, and returns a `recovery_lease`; `git graft restore fix-parser --lease <recovery_lease>` brings it back. Use `--into <branch>` to merge somewhere else, and `git graft list` to see every graft.
 
 ### Sharing dependencies
 
