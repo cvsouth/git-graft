@@ -402,6 +402,11 @@ pub(crate) fn subsecond_changes(git_dir: &Path, worktree: &Path) -> Vec<(Vec<u8>
         let Ok(metadata) = fs::symlink_metadata(worktree.join(OsStr::from_bytes(&name))) else {
             continue;
         };
+        // Only regular files can be confirmed by hashing their contents: a
+        // submodule is a directory and a symbolic link's blob is its target.
+        if !metadata.is_file() {
+            continue;
+        }
         let mut current = [0; STAT];
         Stat::from_metadata(&metadata).write(&mut current);
         let same = |range: std::ops::Range<usize>| current[range.clone()] == stat[range];
