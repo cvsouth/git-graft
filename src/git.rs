@@ -396,18 +396,29 @@ fn status(dir: &Path, untracked: &str, ignored: &str) -> Result<Vec<Change>> {
     Ok(changes)
 }
 
-/// Edits Git reports clean because it compares timestamps in whole seconds,
-/// confirmed by hashing the files as `git add` would. `overrides` are the
-/// `-c` settings used for the status, so no repository filter runs.
+/// Edits Git reports clean because it compares timestamps in whole seconds.
+/// `overrides` are the `-c` settings used for the status, so no repository
+/// filter runs.
+///
+/// Git itself rechecks the suspects, exactly as `git status` would: in a copy
+/// of the index dated 1970 every entry is racily clean, so `git diff-files`
+/// compares each named file's cleaned contents with its staged blob. Git's
+/// clean needs the index: under `core.autocrlf` or `text=auto` it keeps the
+/// CRs of a file whose staged blob already holds them. `git hash-object`
+/// reads no index and would convert them, reporting such a file modified.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn subsecond_edits(dir: &Path, overrides: &[String], reported: &[Change]) -> Result<Vec<Change>> {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, time::Duration, time::UNIX_EPOCH};
+    /// Path bytes per `git diff-files` command line, well inside every
+    /// platform's argument limit.
+    const BATCH: usize = 128 * 1024;
     let git_dir = dir.join(".git");
     if !fs::symlink_metadata(&git_dir).is_ok_and(|metadata| metadata.is_dir()) {
         return Ok(Vec::new());
     }
     let suspects: Vec<_> = crate::storage::subsecond_changes(&git_dir, dir)
         .into_iter()
-        .filter(|(name, _)| {
+        .filter(|name| {
             let name = String::from_utf8_lossy(name);
             !reported.iter().any(|change| change.path == name)
         })
@@ -415,41 +426,54 @@ fn subsecond_edits(dir: &Path, overrides: &[String], reported: &[Change]) -> Res
     if suspects.is_empty() {
         return Ok(Vec::new());
     }
-    let mut input = Vec::new();
-    for (name, _) in &suspects {
-        input.extend_from_slice(name);
-        input.push(b'\n');
+    let mut index = tempfile::NamedTempFile::new()?;
+    io::copy(
+        &mut fs::File::open(git_dir.join("index")).context("read the Git index")?,
+        index.as_file_mut(),
+    )?;
+    // Git treats no entry as racy in an index without a timestamp.
+    index
+        .as_file()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(1))?;
+    let mut edits = Vec::new();
+    let mut remaining = suspects.as_slice();
+    while !remaining.is_empty() {
+        let mut length = 0;
+        let count = remaining
+            .iter()
+            .take_while(|name| {
+                length += name.len() + 1;
+                length <= BATCH
+            })
+            .count()
+            .max(1);
+        let (batch, rest) = remaining.split_at(count);
+        remaining = rest;
+        let mut diff = command(dir);
+        diff.env("GIT_INDEX_FILE", index.path())
+            .args(["--no-optional-locks", "--literal-pathspecs"])
+            .args(overrides)
+            .args(["diff-files", "--name-only", "-z", "--"])
+            .args(batch.iter().map(|name| OsStr::from_bytes(name)));
+        let output = diff.output()?;
+        ensure!(
+            output.status.success(),
+            "recheck changed files: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        edits.extend(
+            output
+                .stdout
+                .split(|&b| b == 0)
+                .filter(|name| !name.is_empty())
+                .map(|name| Change {
+                    status: " M".into(),
+                    path: String::from_utf8_lossy(name).into_owned(),
+                    name: name.to_vec(),
+                }),
+        );
     }
-    let mut stdin = tempfile::tempfile()?;
-    std::io::Write::write_all(&mut stdin, &input)?;
-    std::io::Seek::rewind(&mut stdin)?;
-    let mut hash = command(dir);
-    hash.arg("--no-optional-locks")
-        .args(overrides)
-        .args(["hash-object", "--stdin-paths"])
-        .stdin(stdin);
-    let output = hash.output()?;
-    ensure!(
-        output.status.success(),
-        "hash changed files: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let hashes = String::from_utf8(output.stdout)?;
-    let hashes: Vec<&str> = hashes.lines().collect();
-    ensure!(
-        hashes.len() == suspects.len(),
-        "Git hashed an unexpected number of files"
-    );
-    Ok(suspects
-        .into_iter()
-        .zip(hashes)
-        .filter(|((_, staged), now)| staged != now)
-        .map(|((name, _), _)| Change {
-            status: " M".into(),
-            path: String::from_utf8_lossy(&name).into_owned(),
-            name,
-        })
-        .collect())
+    Ok(edits)
 }
 
 /// A clean porcelain status can hide user work behind index flags or a paused
@@ -576,6 +600,69 @@ mod tests {
         fs::write(repo.join("f.txt"), "a\n")?;
         changes(&repo)?;
         assert!(!marker.exists(), "a repository-defined filter ran");
+        Ok(())
+    }
+
+    /// Under core.autocrlf Git keeps the CRs of a file whose staged blob
+    /// already holds them. A file whose stat moved only within its second is
+    /// rechecked that way too, not reported modified.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn subsecond_suspects_are_rechecked_with_the_index() -> Result<()> {
+        use std::time::{Duration, UNIX_EPOCH};
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo)?;
+        bytes(&repo, &["init", "-q", "--template="])?;
+        bytes(&repo, &["config", "core.autocrlf", "false"])?;
+        let file = repo.join("mixed.txt");
+        fs::write(&file, "one\r\ntwo\n")?;
+        bytes(&repo, &["add", "mixed.txt"])?;
+        bytes(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "x",
+            ],
+        )?;
+        bytes(&repo, &["config", "core.autocrlf", "true"])?;
+        // Retry until the new stat stays within the recorded second.
+        let mut suspected = false;
+        for _ in 0..50 {
+            fs::write(&file, "one\r\ntwo\n")?;
+            bytes(&repo, &["add", "mixed.txt"])?;
+            let modified = fs::metadata(&file)?
+                .modified()?
+                .duration_since(UNIX_EPOCH)?;
+            let moved = Duration::new(
+                modified.as_secs(),
+                (modified.subsec_nanos() + 1) % 1_000_000_000,
+            );
+            fs::File::options()
+                .write(true)
+                .open(&file)?
+                .set_modified(UNIX_EPOCH + moved)?;
+            if !crate::storage::subsecond_changes(&repo.join(".git"), &repo).is_empty() {
+                suspected = true;
+                break;
+            }
+        }
+        assert!(suspected, "the stat never moved within its second");
+        assert_eq!(bytes(&repo, &["status", "--porcelain"])?, b"");
+        let changes = changes(&repo)?;
+        assert!(
+            changes.is_empty(),
+            "{:?}",
+            changes
+                .iter()
+                .map(|c| (&c.status, &c.path))
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 

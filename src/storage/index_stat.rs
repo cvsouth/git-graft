@@ -357,15 +357,14 @@ impl Trusted {
 }
 
 /// Tracked files in `worktree` whose `lstat` differs from the index at
-/// `git_dir/index` only in the sub-second parts of its timestamps, each with
-/// its staged object ID.
+/// `git_dir/index` only in the sub-second parts of its timestamps.
 ///
 /// Git compares whole seconds unless it was built with `USE_NSEC`, so it
 /// reports such a file clean without reading it. The index still records
 /// nanoseconds, which exposes a same-size edit that restored the old
 /// modification time within the same second.
 #[cfg(unix)]
-pub(crate) fn subsecond_changes(git_dir: &Path, worktree: &Path) -> Vec<(Vec<u8>, String)> {
+pub(crate) fn subsecond_changes(git_dir: &Path, worktree: &Path) -> Vec<Vec<u8>> {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
     let index = git_dir.join("index");
     let Some(recorded) = [20, 32]
@@ -375,7 +374,7 @@ pub(crate) fn subsecond_changes(git_dir: &Path, worktree: &Path) -> Vec<(Vec<u8>
         return Vec::new();
     };
     let mut found = Vec::new();
-    for (name, (stat, oid)) in recorded.entries {
+    for (name, (stat, _)) in recorded.entries {
         // Empty stat data already makes Git compare the contents.
         if stat[..24].iter().chain(&stat[28..]).all(|&b| b == 0) {
             continue;
@@ -395,7 +394,7 @@ pub(crate) fn subsecond_changes(git_dir: &Path, worktree: &Path) -> Vec<(Vec<u8>
         // ctime and mtime seconds, device, inode, uid, gid and size.
         let whole_seconds = same(0..4) && same(8..12) && same(16..24) && same(28..STAT);
         if whole_seconds && !identical {
-            found.push((name, oid));
+            found.push(name);
         }
     }
     found
