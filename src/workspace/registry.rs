@@ -1001,10 +1001,20 @@ fn persist(p: &Project, r: &Record) -> Result<()> {
 }
 
 fn write_record(directory: &Path, r: &Record) -> Result<()> {
+    store_record(directory, r, atomic)
+}
+
+/// [`write_record`] during a reservation: ordered before the steps that
+/// follow, and made durable with them when [`finish`] writes the record.
+fn order_record(directory: &Path, r: &Record) -> Result<()> {
+    store_record(directory, r, crate::registry::atomic_ordered)
+}
+
+fn store_record(directory: &Path, r: &Record, write: fn(&Path, &[u8]) -> Result<()>) -> Result<()> {
     validate_record(r)?;
     let path = directory.join(format!("{}.json", r.id));
     ensure!(absent_or_regular(&path)?, "graft record path is occupied");
-    atomic(&path, &serde_json::to_vec(r)?)
+    write(&path, &serde_json::to_vec(r)?)
 }
 
 /// Whether `path` is missing or an ordinary file reached without a link.
@@ -1396,6 +1406,38 @@ pub(super) fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Order the entries of the directory `path` before every later write
+/// without flushing the device (see [`crate::registry::order`]). Creating a
+/// graft orders its steps this way: the creation reports nothing until
+/// [`finish`] durably writes the active record, which flushes them all.
+pub(super) fn order_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    crate::registry::order(&File::open(path)?)?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Fully flush the device holding `path` if `other` is on another device.
+/// Barriers order writes within one device only, so a creation step that
+/// another device's next write depends on is flushed instead.
+fn flush_if_elsewhere(path: &Path, other: &Path) -> Result<()> {
+    if file_id(path)?.volume != file_id(other)?.volume {
+        sync_directory(path)?;
+    }
+    Ok(())
+}
+
+/// Fully flush an unfinished reservation before a reply hands out its lease:
+/// its steps were only ordered, and finish never flushed them.
+pub(super) fn flush_reservation(p: &Project, r: &Record) -> Result<()> {
+    sync_directory(&record_directory(p, false)?)?;
+    match r.path.parent() {
+        Some(parent) if exists(parent)? => sync_directory(parent),
+        _ => Ok(()),
+    }
+}
+
 fn same_filesystem(source: &Path, destination: &Path) -> Result<bool> {
     let parent = destination.parent().context("destination has no parent")?;
     Ok(file_id(source)?.volume == file_id(parent)?.volume)
@@ -1429,11 +1471,17 @@ fn relocate(p: &Project, r: &Record, from: &Path, to: &Path, fresh_placement: bo
         }
     }
     // Persist the directory entries before committing the journal record.
+    // A fresh placement only orders them, as the rest of the creation does.
     let from_parent = from.parent().context("source has no parent")?;
     let to_parent = to.parent().context("destination has no parent")?;
-    sync_directory(to_parent)?;
+    let sync = if fresh_placement {
+        order_directory
+    } else {
+        sync_directory
+    };
+    sync(to_parent)?;
     if from_parent != to_parent && exists(from_parent)? {
-        sync_directory(from_parent)?;
+        sync(from_parent)?;
     }
     // An external Git command can run independently of our locks. If a
     // nested checkout appeared during the rename, retain both the data and
@@ -1650,6 +1698,8 @@ pub(super) fn reserve_locked(
                     json!({"name":r.name,"path":r.path}),
                 ));
             }
+            // Best effort: the reply is still accurate if the flush fails.
+            let _ = flush_reservation(p, &r);
             return Err(fault(
                 "spawn_incomplete",
                 format!("The interrupted attempt could not be archived: {error:#}"),
@@ -1691,16 +1741,19 @@ pub(super) fn reserve_locked(
     let admin = stage.path().join(".git");
     dir(&admin)?;
     let id = Uuid::new_v4().to_string();
-    atomic(
+    // Each step below is ordered before the next rather than flushed: a power
+    // loss keeps a prefix of them, which recovery handles like an interrupted
+    // reservation. The graft is reported only after finish flushes them all.
+    crate::registry::atomic_ordered(
         &admin.join(MARKER),
         &serde_json::to_vec(&marker(p, &id, name))?,
     )?;
     // Hold the index lock from the start, so Git cannot write an index for
     // missing files at any point before the checkout is published.
     crate::storage::reserve_index(&admin)?;
-    sync_directory(&admin)?;
-    sync_directory(stage.path())?;
-    sync_directory(&root)?;
+    order_directory(&admin)?;
+    order_directory(stage.path())?;
+    order_directory(&root)?;
     crate::trace::mark("reserve: stage marker");
     let identity = Identity::read(stage.path())?;
     crate::trace::mark("reserve: identity");
@@ -1732,15 +1785,22 @@ pub(super) fn reserve_locked(
         superseded_by: None,
     };
     let result = (|| {
-        write_record(&directory, &r)?;
+        // The stage precedes its record, the record the move, and the move
+        // the cleared transition, also when the records are on another device.
+        flush_if_elsewhere(&root, &directory)?;
+        order_record(&directory, &r)?;
         crate::trace::mark("reserve: write placement");
+        flush_if_elsewhere(&directory, &root)?;
         // The private stage was just created with only our marker and lock.
         relocate(p, &r, &from, &r.path, true)?;
         crate::trace::mark("reserve: relocate");
+        flush_if_elsewhere(&root, &directory)?;
         r.transition = None;
-        write_record(&directory, &r)
+        order_record(&directory, &r)
     })();
     if let Err(error) = result {
+        // Best effort: the reply is still accurate if the flush fails.
+        let _ = flush_reservation(p, &r);
         return Err(fault(
             "spawn_incomplete",
             format!("Workspace reservation could not be placed: {error:#}"),
@@ -1820,6 +1880,8 @@ pub fn finish(p: &Project, r: &mut Record) -> Result<()> {
         true,
     )?;
     verify_git_location(&live.path, detached)?;
+    // The record's durable write below flushes only its own device.
+    flush_if_elsewhere(&live.path.join(".git"), &directory)?;
     live.initialized = true;
     live.status = Status::Active;
     live.heartbeat = now();

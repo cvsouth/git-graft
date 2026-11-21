@@ -77,26 +77,38 @@ fn materialize<F: FnOnce() -> Result<()>>(
     metadata: CheckoutMetadata<'_>,
     ready: F,
 ) -> Result<Value> {
-    // Blob sizes only depend on object IDs, so the primary can report them
-    // while the workspace index is prepared.
+    // Blob sizes only depend on object IDs, and the primary's index listing
+    // only selects candidates that are proven later, so the primary reports
+    // both while the workspace index is prepared.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     return std::thread::scope(|scope| {
-        let sizes = metadata.index.map(|manifest| {
-            scope.spawn(move || direct::blob_sizes(|| git_command(primary), &manifest.entries))
-        });
+        let early = Early {
+            sizes: metadata.index.map(|manifest| {
+                scope.spawn(move || direct::blob_sizes(|| git_command(primary), &manifest.entries))
+            }),
+            tracked: sparse
+                .is_empty()
+                .then(|| scope.spawn(|| direct::donor_index(primary))),
+        };
         materialize_with(
-            workspace, state, oid, sparse, primary, metadata, ready, sizes,
+            workspace, state, oid, sparse, primary, metadata, ready, early,
         )
     });
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     materialize_with(workspace, state, oid, sparse, primary, metadata, ready, ())
 }
 
+/// Primary queries started before the checkout plan needs them.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-type Sizes<'s> =
-    Option<std::thread::ScopedJoinHandle<'s, Option<std::collections::HashMap<String, u64>>>>;
+struct Early<'s> {
+    /// Blob sizes of a planned manifest.
+    sizes:
+        Option<std::thread::ScopedJoinHandle<'s, Option<std::collections::HashMap<String, u64>>>>,
+    /// The primary's index listing, for a full checkout.
+    tracked: Option<std::thread::ScopedJoinHandle<'s, Result<Option<Vec<u8>>>>>,
+}
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-type Sizes<'s> = ();
+type Early<'s> = ();
 
 #[allow(clippy::too_many_arguments)]
 fn materialize_with<F: FnOnce() -> Result<()>>(
@@ -107,22 +119,34 @@ fn materialize_with<F: FnOnce() -> Result<()>>(
     primary: &Path,
     metadata: CheckoutMetadata<'_>,
     ready: F,
-    sizes: Sizes<'_>,
+    early: Early<'_>,
 ) -> Result<Value> {
     let proof_objects = metadata.objects;
-    let oid = checkout_identity_with_objects(workspace, oid, proof_objects)?;
+    // Checking the checkout's identity only reads, and preparing a planned
+    // index only writes the private scratch index, so both run at once.
+    // Nothing reaches the working tree until the identity is confirmed.
+    let (identity, checkout, prepared) = std::thread::scope(|scope| {
+        let identity =
+            scope.spawn(|| checkout_identity_with_objects(workspace, oid, proof_objects));
+        let checkout = LocalCheckout::reserve(workspace, proof_objects);
+        let prepared = match (&checkout, metadata.index) {
+            (Ok(checkout), Some(manifest)) => manifest.prepare(checkout).is_ok(),
+            _ => false,
+        };
+        (crate::workspace::joined(identity), checkout, prepared)
+    });
+    let oid = identity?;
     validate_sparse(workspace, &oid, sparse)?;
-    let mut checkout = LocalCheckout::reserve(workspace, proof_objects)?;
-    crate::trace::mark("checkout: identity and reserve");
+    let mut checkout = checkout?;
+    crate::trace::mark("checkout: identity and index");
     let listed;
     let files = if let Some(manifest) = metadata.index {
-        if manifest.prepare(&checkout).is_err() {
+        if !prepared {
             ready()?;
             drop(checkout);
             return materialize_local(workspace, state, &oid, sparse, primary);
         }
         checkout.planned = true;
-        crate::trace::mark("checkout: prepare index");
         &manifest.entries
     } else {
         listed = entries_with_objects(workspace, &oid, proof_objects)?;
@@ -131,7 +155,7 @@ fn materialize_with<F: FnOnce() -> Result<()>>(
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let receipt = {
-        let planned = direct::plan(&checkout, &oid, sparse, files, state, primary, sizes)?;
+        let planned = direct::plan(&checkout, &oid, sparse, files, state, primary, early)?;
         crate::trace::mark("checkout: plan donors");
         match planned {
             Ok(plan) => direct::install(&checkout, &oid, files, plan, ready)?,
@@ -143,7 +167,7 @@ fn materialize_with<F: FnOnce() -> Result<()>>(
     };
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let receipt = {
-        let _ = (state, primary, sizes);
+        let _ = (state, primary, early);
         ready()?;
         // Report the same reason as the cloning platforms for a sparse request.
         let reason = if sparse.is_empty() {
@@ -343,7 +367,7 @@ pub(super) mod direct {
         files: &[Entry],
         state: &Path,
         primary: &Path,
-        sizes: super::Sizes<'_>,
+        early: super::Early<'_>,
     ) -> Result<std::result::Result<Plan, &'static str>> {
         if !sparse.is_empty() {
             return Ok(Err("sparse checkout"));
@@ -377,9 +401,13 @@ pub(super) mod direct {
         // workers before using their results to select donor files.
         let (tracked, policy, conversions, sizes) = std::thread::scope(|scope| -> Result<_> {
             let config = scope.spawn(|| raw_file_policy(checkout.worktree, gitlinks));
-            let sizes = match sizes {
+            let sizes = match early.sizes {
                 Some(early) => early,
                 None => scope.spawn(|| blob_sizes(|| checkout.proof_command(), files)),
+            };
+            let tracked = match early.tracked {
+                Some(early) => early,
+                None => scope.spawn(|| donor_index(&primary)),
             };
             // Git also applies info/attributes and user and system rules when
             // the selected tree has no .gitattributes of its own.
@@ -391,7 +419,7 @@ pub(super) mod direct {
                 };
                 checkout_conversions(checkout.proof_command(), source, files.iter())
             });
-            let tracked = donor_index(&primary)?;
+            let tracked = crate::workspace::joined(tracked)?;
             let policy = config
                 .join()
                 .map_err(|_| anyhow::anyhow!("checkout configuration worker failed"))??;
@@ -566,7 +594,7 @@ pub(super) mod direct {
             .collect()
     }
 
-    fn donor_index(primary: &Path) -> Result<Option<Vec<u8>>> {
+    pub(super) fn donor_index(primary: &Path) -> Result<Option<Vec<u8>>> {
         // The listing is only used once the prefix proves it belongs to this
         // checkout root, so both read-only queries can run at once.
         let (location, output) = std::thread::scope(|scope| {
@@ -620,15 +648,31 @@ pub(super) mod direct {
         } else {
             r"^core\.(autocrlf|eol|safecrlf|sparsecheckout|symlinks)$"
         };
-        let config = git_command(worktree)
-            .args([
-                "config",
-                "--null",
-                "--type=bool-or-str",
-                "--get-regexp",
-                settings,
-            ])
-            .output()?;
+        // Both reads are independent, so their Git processes run at once.
+        let (config, replacements) = std::thread::scope(|scope| {
+            let replacements = scope.spawn(|| {
+                git(
+                    worktree,
+                    &[
+                        "for-each-ref",
+                        "--count=1",
+                        "--format=%(refname)",
+                        "refs/replace",
+                    ],
+                )
+            });
+            let config = git_command(worktree)
+                .args([
+                    "config",
+                    "--null",
+                    "--type=bool-or-str",
+                    "--get-regexp",
+                    settings,
+                ])
+                .output();
+            (config, crate::workspace::joined(replacements))
+        });
+        let config = config?;
         if !matches!(config.status.code(), Some(0 | 1)) {
             return Ok(Err("Git checkout configuration"));
         }
@@ -670,18 +714,7 @@ pub(super) mod direct {
         if recurse {
             return Ok(Err("submodules"));
         }
-        if !git(
-            worktree,
-            &[
-                "for-each-ref",
-                "--count=1",
-                "--format=%(refname)",
-                "refs/replace",
-            ],
-        )?
-        .stdout
-        .is_empty()
-        {
+        if !replacements?.stdout.is_empty() {
             return Ok(Err("Git replacement objects"));
         }
         Ok(Ok(Config {

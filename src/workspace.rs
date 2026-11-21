@@ -252,6 +252,8 @@ fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
                 "Its checkout was published before it stopped, but the graft is not ready; do not work in it until the retry."
             }
         };
+        // Best effort: the reply is still accurate if the flush fails.
+        let _ = registry::flush_reservation(p, &r);
         return Err(api::fault(
             "spawn_incomplete",
             format!("Creating the graft stopped: {error:#}"),

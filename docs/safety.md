@@ -36,6 +36,8 @@ When reusing a mixed pack, Graft edits an unlinked copy, has Git index its conte
 | Name or path is occupied | Restore fails as `already_exists`. Inspect the collision and preserve the existing data before retrying. |
 | `archive_damaged` | The archive at `details.archive_path` is missing or was changed by hand. Restore leaves it exactly as found. Copy what you need from it, or put back the missing Git files and retry. |
 
+When `add` reports a graft, its record, Git objects and branch are on disk and survive a power loss. On macOS the steps before that are ordered with write barriers and flushed once, when the graft is marked active; a power loss earlier leaves part of an unfinished creation, in order, which a retry of the same request archives or replaces. Like `git checkout`, Graft does not flush the files it checks out or clones, or the index it writes. A file cut short by a power loss shows up as modified in `git status`, because its size no longer matches the one the index records, the same as for a file Git checked out.
+
 Archives and recovery records have no automatic expiry and can use disk. Deleting the original repository or Graft's recovery state can prevent recovery. Maintain independent backups for disk failure and accidental deletion.
 
 The first merge prepares its history store privately before publishing it. After an interruption Graft can reclaim first-store scratch whose recorded identity and contents still match. It preserves unrecognized or changed scratch and reports its path on a later merge. Interrupted merge-planning directories can also be left for inspection.

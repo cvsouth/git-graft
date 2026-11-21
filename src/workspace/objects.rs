@@ -330,6 +330,10 @@ fn repository_path(repo: &Path, path: &str) -> Result<PathBuf> {
 }
 
 fn write_settings(root: &Path, settings: &[(String, String)]) -> Result<()> {
+    if settings.is_empty() {
+        return Ok(());
+    }
+    // One direct write replaces a Git process per setting.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if config_batch::append(root, settings)? {
         return Ok(());
@@ -503,6 +507,12 @@ fn finish_head(
     let mut head = transfer_git(root);
     if let Some(objects) = objects {
         head.env("GIT_OBJECT_DIRECTORY", objects);
+    }
+    // On macOS, Git's writeback-only fsync skips a device cache flush for
+    // this one ref. The ref is still written back before finish flushes the
+    // graft's device. Elsewhere Git keeps its full fsync.
+    if cfg!(target_os = "macos") {
+        head.args(["-c", "core.fsyncMethod=writeout-only"]);
     }
     head.args(["update-ref", "--no-deref", reference, base]);
     // The primary's settings do not depend on the workspace HEAD.

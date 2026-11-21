@@ -2062,6 +2062,15 @@ mod tests {
         fs::write(repo.join("filtered"), b"filtered\n").unwrap();
         command(&repo, &["add", "."]);
         command(&repo, &["commit", "-qm", "checkout filter"]);
+        // The edit below keeps the file's size. Git builds that compare whole
+        // seconds would miss it in the second the fixture was written.
+        fs::File::options()
+            .write(true)
+            .open(repo.join("sub/file"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(5))
+            .unwrap();
+        command(&repo, &["update-index", "--refresh"]);
         let oid = command(&repo, &["rev-parse", "HEAD"]);
         let workspace = temp.path().join("local");
         independent(&repo, &workspace);

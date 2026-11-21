@@ -494,8 +494,29 @@ fn lock_options(path: &Path) -> Result<OpenOptions> {
     options.read(true).write(true).create(true).truncate(false);
     Ok(options)
 }
+/// Write `path` atomically and durably: it survives a power loss once this
+/// returns, and so does every write ordered before it.
 pub(crate) fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     write_atomic(path, bytes, false)
+}
+
+/// Write `path` atomically, ordered before every later write but not yet
+/// flushed from the device's cache. A power loss can lose it only together
+/// with everything written after it; the next [`atomic`] write makes it
+/// durable. Systems without Apple's write barrier sync it fully.
+pub(crate) fn atomic_ordered(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic(path, bytes, true)
+}
+
+/// Order everything written to `file`, a file or directory, before every
+/// later write, as [`atomic_ordered`] does. Elsewhere this is a full sync.
+#[cfg(unix)]
+pub(crate) fn order(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if apple_sync(file, libc::F_BARRIERFSYNC)? {
+        return Ok(());
+    }
+    file.sync_all()
 }
 
 pub(crate) fn publish_marked_directory(
@@ -518,7 +539,7 @@ pub(crate) fn publish_marked_directory(
     Ok(())
 }
 
-fn write_atomic(path: &Path, bytes: &[u8], _flush_at_directory_publication: bool) -> Result<()> {
+fn write_atomic(path: &Path, bytes: &[u8], ordered_only: bool) -> Result<()> {
     let parent = path.parent().context("missing state directory")?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(bytes)?;
@@ -526,9 +547,9 @@ fn write_atomic(path: &Path, bytes: &[u8], _flush_at_directory_publication: bool
     if apple_sync(tmp.as_file(), libc::F_BARRIERFSYNC)? {
         let file = tmp.persist(path)?;
         let directory = File::open(parent)?;
-        // Order the marker's directory entry before publishing the stage.
-        // Its sibling rename and parent flush complete the same-device write.
-        if _flush_at_directory_publication && apple_sync(&directory, libc::F_BARRIERFSYNC)? {
+        // Order the directory entry before later writes. A later full flush
+        // of the same device makes it durable.
+        if ordered_only && apple_sync(&directory, libc::F_BARRIERFSYNC)? {
             return Ok(());
         }
         if !apple_sync(&directory, libc::F_FULLFSYNC)? {
@@ -537,6 +558,8 @@ fn write_atomic(path: &Path, bytes: &[u8], _flush_at_directory_publication: bool
         }
         return Ok(());
     }
+    // Without a write barrier, ordering a write takes a full sync.
+    let _ = ordered_only;
     tmp.as_file().sync_all()?;
     tmp.persist(path)?;
     #[cfg(unix)]
