@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- A graft mirrors its primary's line endings. A primary file is reused when Git's own line-ending conversion of it, the one `git status` compares and `git add` stores, gives exactly the committed blob, verified by hashing the converted bytes or, for a file equal to its blob, by Git's index stat test. With `core.autocrlf=true`, an LF primary's text files are now cloned instead of written in full. Paths with a filter, `ident` or a working-tree encoding still come from Git, and so does any file `git add` would refuse under `core.safecrlf=true`.
+- `doctor` reports `file_sharing.shared` from cloning support alone; line-ending settings no longer stop sharing.
+
+### Fixed
+
+- `text=auto` with `core.autocrlf=true` no longer makes every file of a new graft come from Git.
+- Files Git writes during a cloned checkout record their stat data, so the first `git status` in a graft reads no file contents.
+
 ## [0.1.0] - 2026-11-21
 
 First public release.

@@ -142,7 +142,7 @@ git-graft runs on macOS, Linux and Windows. Disk sharing needs a filesystem that
 
 ## How it works
 
-`git graft add` creates a standalone Git repository next to your checkout and asks the filesystem to clone its files instead of writing them. The clones share data blocks with your checkout until you edit them. Before reusing a file, git-graft proves it holds exactly the bytes `git checkout` would write, using Git's own index check or a hash, and leaves anything it cannot prove to Git. It also records each file's metadata in the new index, so the first `git status` reads no file contents.
+`git graft add` creates a standalone Git repository next to your checkout and asks the filesystem to clone its files instead of writing them. The clones share data blocks with your checkout until you edit them. A graft mirrors your checkout: before reusing a file, git-graft proves that Git's own line-ending conversion of it, the one `git status` and `git add` apply, gives exactly the committed content, using Git's own index check or a hash of the converted bytes. The graft keeps your checkout's line endings, and Git in the graft agrees every file is unchanged. Files with a filter, `ident` or a working-tree encoding, and anything git-graft cannot prove, come from Git. It also records each file's metadata in the new index, so the first `git status` reads no file contents.
 
 Creating a graft never changes your checkout, and never copies untracked or ignored files into the graft. Merging reports conflicts before it changes anything, and `merge`, `remove` and `prune` archive a graft instead of deleting it. See [safety and recovery](docs/safety.md) for the details.
 

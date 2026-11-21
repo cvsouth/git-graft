@@ -10,7 +10,12 @@ On a compatible volume, a regular tracked file gets its own writable file identi
 
 If the selected commit itself tracks a symlink, Git's normal checkout rules apply. A trusted npm layer can also contain relative symlinks such as a package's command in `node_modules/.bin`. The layer checks that these links resolve inside the installation.
 
-On macOS and Linux, local and tip grafts can share verified files when Git checks them out with LF endings. This includes repositories using `core.autocrlf=input` or `* text=auto` with native LF output. With `core.autocrlf=true`, files without line-ending attributes are also shared when the primary checkout holds the CRLF bytes Git writes and its index vouches for them; Graft reads those blobs once to predict each checkout's size. Paths with explicit CRLF settings, filters or working-tree encoding go through Git.
+On macOS and Linux, local and tip grafts mirror the primary checkout. A tracked primary file is shared when Git's built-in line-ending conversion of it, the clean step `git status` compares and `git add` stores, gives exactly the selected commit's blob under the graft's `core.autocrlf`, `core.eol`, `core.safecrlf` and `text`, `crlf` and `eol` attributes. The graft therefore has the primary's line endings, LF or CRLF, even where a fresh `git checkout` would write the other, and `git status` in it is clean. This holds with any `core.autocrlf` value and with `text=auto`. Git checks out instead:
+
+- paths with a `filter`, `ident` or `working-tree-encoding` attribute, whatever their bytes;
+- files Git would not clean to their blob, such as an edit, a lone CR or NUL under automatic detection, or a CRLF blob that `text` would convert;
+- under `core.safecrlf=true`, files `git add` would refuse because checkout would not restore their line endings;
+- under a plain `text` attribute, files whose CRLFs only Git's conversion removes when `core.autocrlf=false`, because `git check-attr` prints that attribute like the literal string `text=set`, which Git ignores.
 
 With local or tip history, a checkout can share ordinary files alongside a submodule. The private Git index records the selected submodule commit. Its directory starts empty, even when the primary has initialized the submodule and edited its files. Enabling recursive submodule checkout in the graft’s effective Git configuration delegates checkout to Git.
 
