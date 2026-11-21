@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { assertSeparateRegularFiles, objectResult, type Context, type Scenario } from './harness.ts';
 import { assertNoRecord, packRecords } from './pack-records.ts';
+import { killedAdd } from './process-faults.ts';
 
 const exec = promisify(execFile);
 
@@ -309,15 +310,21 @@ exec "$GRAFT_TEST_GIT" "$@"
       const args = ['incomplete', '--lease', lease];
       ctx.cli(['remove', ...args, '--discard']);
       assert(!existsSync(path));
+      // Restore keeps the unfinished archive as it is and builds the graft
+      // afresh in its place, now that the export can complete.
       const restored = ctx.cli(['restore', ...args]);
       assert.equal(restored.path, path);
-      assert.equal(read(path, 'my-recovery-note'), 'retain this file\n');
-      // A file Graft did not write keeps the creation from being rebuilt. It
-      // stays pending, and its index lock keeps Git from committing it.
-      assert.equal(restored.status, 'pending');
-      assert.equal(typeof objectResult(restored.incomplete).reason, 'string');
-      assert(!existsSync(join(path, '.git', 'index')));
-      assert(existsSync(join(path, '.git', 'index.lock')));
+      assert.equal(restored.status, 'active');
+      assert.notEqual(restored.lease, lease);
+      const archived = objectResult(restored.unfinished_archive);
+      assert.equal(archived.lease, lease);
+      assert.equal(read(String(archived.archive_path), 'my-recovery-note'), 'retain this file\n');
+      assert(!existsSync(join(path, 'my-recovery-note')));
+      assert.equal(read(path, 'selected'), 'content missing from the export\n');
+      assert(!existsSync(join(path, '.git', 'index.lock')));
+      assert.equal(ctx.git(['status', '--porcelain'], path), '');
+      // Restoring it again returns the same graft.
+      assert.equal(ctx.cli(['restore', ...args]).lease, restored.lease);
       assert.equal(read(ctx.repo, 'selected'), 'content missing from the export\n');
       assert.equal(ctx.git(['rev-parse', 'HEAD']), tip);
       assert.equal(ctx.git(['status', '--porcelain']), '');
@@ -726,4 +733,6 @@ exec "$GRAFT_TEST_GIT" "$@"
       ctx.git(['fsck', '--full'], sibling.path);
     },
   },
+  // Local history has no isolated snapshot, so it has no prepare step.
+  ...(['initialize', 'checkout', 'published'] as const).map(window => killedAdd('local', window)),
 ];

@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -145,6 +145,192 @@ function restore(ctx: Context, name: string, lease: string): string {
   const restored = ctx.cli(['restore', name, '--lease', lease]);
   assert.equal(typeof restored.path, 'string');
   return String(restored.path);
+}
+
+/** Where a killed `add` stops: the step of graft creation it was inside. */
+export type AddWindow = 'initialize' | 'prepare' | 'checkout' | 'published';
+
+/** The Git command in the new graft that each window holds, before or after it runs. */
+const windowCommands: Record<Exclude<AddWindow, 'checkout'>, (base: string) => { args: string; after: boolean }> = {
+  // Right after `git init`, before any object or file arrives.
+  initialize: () => ({ args: 'init --quiet --template=', after: true }),
+  // After the isolated snapshot staged its tree inside .git, before it is moved in.
+  prepare: base => ({ args: `read-tree ${base}`, after: true }),
+  // After the index is published, when finish checks the Git location.
+  published: () => ({ args: '--git-dir=.git rev-parse --show-object-format --show-toplevel', after: false }),
+};
+
+/** A file an agent could have left in the graft, as bytes or a symlink target. */
+type Kept = { bytes: Buffer } | { link: string };
+
+function keep(root: string): Map<string, Kept> {
+  const files = new Map<string, Kept>([
+    ['tracked.txt', { bytes: Buffer.from('edited by the agent\n') }],
+    ['notes/untracked.txt', { bytes: Buffer.from('an untracked note\n') }],
+    ['ignored/build.log', { bytes: Buffer.from('ignored build output\n') }],
+    // Only the line endings differ from the commit, and a clean filter
+    // strips them: Git would call this file unchanged.
+    ['crlf.txt', { bytes: Buffer.from('line one\r\nline two\r\n') }],
+    ['link', { link: 'tracked.txt' }],
+  ]);
+  for (const [path, kept] of files) {
+    const file = join(root, path);
+    mkdirSync(dirname(file), { recursive: true });
+    rmSync(file, { force: true });
+    if ('link' in kept) symlinkSync(kept.link, file);
+    else writeFileSync(file, kept.bytes);
+  }
+  const attributes = join(root, '.git', 'info', 'attributes');
+  mkdirSync(dirname(attributes), { recursive: true });
+  writeFileSync(attributes, 'crlf.txt filter=strip-cr\n');
+  return files;
+}
+
+function assertKept(root: string, files: Map<string, Kept>): void {
+  for (const [path, kept] of files) {
+    const file = join(root, path);
+    if ('link' in kept) {
+      assert(lstatSync(file).isSymbolicLink(), `${path} is no longer a symlink`);
+      assert.equal(readlinkSync(file), kept.link);
+    } else {
+      assert.deepEqual(readFileSync(file), kept.bytes, `${path} changed`);
+    }
+  }
+}
+
+/** A freshly built graft: the base commit, every tracked file, nothing else and no lock. */
+function assertComplete(ctx: Context, path: string, base: string, tracked: string[]): void {
+  assert.equal(ctx.git(['rev-parse', 'HEAD'], path), base);
+  const listed = ctx.git(['ls-files', '-z'], path).split('\0').filter(Boolean);
+  assert.deepEqual(listed.toSorted(), tracked.toSorted());
+  for (const file of listed) assert(existsSync(join(path, file)), `the graft is missing ${file}`);
+  assert.equal(ctx.git(['status', '--porcelain', '--untracked-files=all'], path), '');
+  assert(!existsSync(join(path, '.git', 'index.lock')), 'the graft kept an index lock');
+  ctx.git(['fsck', '--full'], path);
+}
+
+/**
+ * Kill an `add` and every process it started inside one creation window,
+ * as a crash would. The test then writes an agent's work into the leftover
+ * attempt. A retry must archive that attempt byte for byte, build a complete
+ * graft, and restore must find the archive by the lease the retry reported.
+ */
+export function killedAdd(history: 'local' | 'isolated', window: AddWindow): Scenario {
+  return {
+    name: `an add killed in its ${window} step with ${history} history is archived whole and rebuilt`,
+    async run(ctx) {
+      if (process.platform === 'win32') ctx.unavailable('the fault hooks are POSIX shell scripts');
+      if (window === 'prepare' && !objectResult(ctx.cli(['doctor']).source_storage).native_clone) {
+        ctx.unavailable('isolated snapshots need a cloning file system');
+      }
+      const gate = new Gate(ctx, 'add');
+      const config = ctx.env.GIT_CONFIG_GLOBAL!;
+      writeFileSync(config, '[core]\n\tautocrlf = false\n[filter "strip-cr"]\n\tclean = tr -d \'\\\\r\'\n\tsmudge = cat\n');
+      write(ctx.repo, 'crlf.txt', 'line one\nline two\n');
+      const tracked = ['.gitignore', 'crlf.txt', 'tracked.txt'];
+      const env = { ...ctx.env };
+      if (window === 'checkout') {
+        // A smudge filter holds the checkout part way through its files.
+        const filter = join(ctx.root, 'hold-filter.sh');
+        writeFileSync(filter, ['#!/bin/sh', gate.shell(), 'exec cat', ''].join('\n'), { mode: 0o755 });
+        writeFileSync(config, `[filter "hold"]\n\tsmudge = '${filter}'\n\tclean = cat\n`, { flag: 'a' });
+        write(ctx.repo, '.gitattributes', '*.dat filter=hold\n');
+        write(ctx.repo, 'payload.dat', 'filtered payload\n');
+        tracked.push('.gitattributes', 'payload.dat');
+      }
+      const base = commit(ctx, ctx.repo, 'Files a killed add checks out');
+      const path = join(ctx.repo + '.graft', 'interrupted');
+      if (window !== 'checkout') {
+        // A Git wrapper first on PATH holds one command the add runs in the graft.
+        const { args, after } = windowCommands[window](base);
+        const git = `'${ctx.command('sh', ['-c', 'command -v git']).stdout.trim()}'`;
+        const bin = join(ctx.root, 'hold-git');
+        mkdirSync(bin);
+        writeFileSync(join(bin, 'git'), [
+          '#!/bin/sh',
+          'hold=',
+          `case " $* " in *" -C ${path} "*"${args} "*) hold=1 ;; esac`,
+          `[ -n "$hold" ] || exec ${git} "$@"`,
+          after ? `${git} "$@" || exit` : ':',
+          gate.shell(),
+          after ? 'exit 0' : `exec ${git} "$@"`,
+          '',
+        ].join('\n'), { mode: 0o755 });
+        env.PATH = bin + ':' + ctx.env.PATH;
+      }
+      const index = readFileSync(join(ctx.repo, '.git', 'index'));
+      const id = randomUUID();
+      gate.arm();
+      // Its own process group, so Git, the filter and the wrapper die with it.
+      const child = spawn(ctx.bin, ['--repo', ctx.repo, '--json', 'add', 'interrupted', '--history', history, '--request-id', id],
+        { cwd: ctx.repo, env, stdio: 'ignore', detached: true });
+      const exited = new Promise(resolve => child.once('exit', resolve));
+      try {
+        await waitFor(() => existsSync(gate.reached) || child.exitCode !== null, `the ${window} step`);
+        assert(existsSync(gate.reached), `add finished before its ${window} step`);
+        process.kill(-child.pid!, 'SIGKILL');
+        await exited;
+      } finally {
+        gate.open();
+        if (child.exitCode === null && child.signalCode === null) process.kill(-child.pid!, 'SIGKILL');
+        await exited;
+      }
+      // The primary is untouched by the interrupted add.
+      assert.equal(ctx.git(['rev-parse', 'HEAD']), base);
+      assert.deepEqual(readFileSync(join(ctx.repo, '.git', 'index')), index);
+      assert.equal(ctx.git(['status', '--porcelain']), '');
+      // Until its index is published, the attempt holds Graft's index lock,
+      // so Git cannot commit the files it lacks as deletions.
+      const pending = graftStatus(ctx, 'interrupted');
+      assert.equal(pending?.status, 'pending', JSON.stringify(pending));
+      assert.equal(pending?.path, path);
+      const lock = join(path, '.git', 'index.lock');
+      if (window === 'published') assert(!existsSync(lock), 'a published index kept its lock');
+      else assert.equal(readFileSync(lock, 'utf8'), 'git-graft creation\n');
+
+      // An agent's work in the leftover attempt survives everything below.
+      const files = keep(path);
+      assert.equal(ctx.fail(['add', 'interrupted', '--request-id', randomUUID()]).code, 'already_exists');
+      const retried = await graft(ctx, ['add', 'interrupted', '--history', history, '--request-id', id]);
+      assert(retried.ok, JSON.stringify(retried.json));
+      assert.equal(retried.json.path, path);
+      assert.equal(retried.json.lease, id);
+      assert.equal(retried.json.status, 'active');
+      assertComplete(ctx, path, base, tracked);
+      assert(Array.isArray(retried.json.archived_attempts));
+      assert.equal(retried.json.archived_attempts.length, 1);
+      const attempt = objectResult(retried.json.archived_attempts[0]);
+      const archive = String(attempt.archive_path);
+      const lease = String(attempt.lease);
+      assert.notEqual(lease, id);
+      assertKept(archive, files);
+      // Replaying the finished request reports the same graft and archive.
+      const replay = ctx.cli(['add', 'interrupted', '--history', history, '--request-id', id]);
+      assert.deepEqual(replay.archived_attempts, retried.json.archived_attempts);
+
+      // Restoring the archive names the graft built in its place, twice over.
+      for (let round = 0; round < 2; round++) {
+        const restored = ctx.cli(['restore', 'interrupted', '--lease', lease]);
+        assert.equal(restored.lease, id);
+        assert.equal(restored.path, path);
+        assert.equal(objectResult(restored.unfinished_archive).archive_path, archive);
+      }
+      // Once that graft is archived too, restore builds a new one, and the
+      // leftover attempt's archive is still exactly as it was.
+      ctx.cli(['remove', 'interrupted', '--lease', id, '--discard']);
+      const rebuilt = ctx.cli(['restore', 'interrupted', '--lease', lease]);
+      assert.equal(rebuilt.path, path);
+      assert.notEqual(rebuilt.lease, id);
+      assert.notEqual(rebuilt.lease, lease);
+      assert.equal(objectResult(rebuilt.unfinished_archive).lease, lease);
+      assertComplete(ctx, path, base, tracked);
+      assertKept(archive, files);
+      // The rebuilt graft is usable: Git can write its index and commit.
+      write(path, 'after.txt', 'work after recovery\n');
+      ctx.git(['add', 'after.txt'], path);
+      ctx.git(['commit', '-qm', 'Work after recovery'], path);
+    },
+  };
 }
 
 /** A minimal MCP client: initialize, then call tools over stdio. */
@@ -554,16 +740,12 @@ export const cases: Scenario[] = [
       }
       // Retrying the same request completes the graft; another request cannot take the name.
       assert.equal(ctx.fail(['add', 'interrupted', '--request-id', randomUUID()]).code, 'already_exists');
+      // The retry archives the interrupted attempt whole and builds afresh.
       const retried = await graft(ctx, ['add', 'interrupted', '--history', history, '--request-id', id]);
-      let path: string;
-      if (retried.ok) {
-        path = String(retried.json.path);
-      } else {
-        // An unfinishable creation can be archived and restored with its lease.
-        assert.equal(retried.json.code, 'spawn_incomplete', JSON.stringify(retried.json));
-        ctx.cli(['remove', 'interrupted', '--lease', id, '--discard']);
-        path = restore(ctx, 'interrupted', id);
-      }
+      assert(retried.ok, JSON.stringify(retried.json));
+      const path = String(retried.json.path);
+      assert.equal(path, reserved);
+      assert(Array.isArray(retried.json.archived_attempts) && retried.json.archived_attempts.length === 1);
       // Recovery ends in a complete checkout: every tracked file is present
       // and matches HEAD. A missing file would be committed as a deletion.
       assert.equal(ctx.git(['rev-parse', 'HEAD'], path), base);
@@ -573,7 +755,7 @@ export const cases: Scenario[] = [
       for (const file of tracked) assert(existsSync(join(path, file)), `recovered graft is missing ${file}`);
       assert.equal(ctx.git(['status', '--porcelain', '--untracked-files=all'], path), '');
       ctx.git(['fsck', '--full'], path);
-      // Recovery reclaims the index lock the interrupted creation held.
+      // The rebuilt graft has no index lock.
       assert(!existsSync(join(path, '.git', 'index.lock')), 'recovery left the index lock');
       // The recovered graft is usable: Git can write its index and commit.
       write(path, 'after.txt', 'work after recovery\n');
@@ -581,4 +763,5 @@ export const cases: Scenario[] = [
       ctx.git(['commit', '-qm', 'Work after recovery'], path);
     },
   })),
+  ...(['initialize', 'prepare', 'checkout', 'published'] as const).map(window => killedAdd('isolated', window)),
 ];
