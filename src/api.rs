@@ -24,8 +24,9 @@ pub struct Spawn {
     #[arg(long, default_value = "HEAD")]
     #[serde(default = "head")]
     pub base: String,
-    /// Omit for normal work in a trusted clone. Uses the project's graft.history setting, or local by default.
-    /// Local reuses eligible Git object files, including objects from other branches and staged or dangling blobs.
+    /// Which Git objects the graft can read. Omit for normal work.
+    ///
+    /// Defaults to the project's graft.history setting, or local. Local reuses eligible Git object files, including objects from other branches and staged or dangling blobs.
     /// Choose isolated when only objects reachable from the selected commit should be readable.
     /// Choose tip when the checkout needs only the starting commit and its files.
     #[arg(long, value_enum)]
@@ -132,6 +133,7 @@ pub struct Owned {
 pub struct Exec {
     /// Name of the graft.
     pub name: String,
+    /// Lease returned when the graft was created.
     #[arg(long, env = "GIT_GRAFT_LEASE", hide_env_values = true)]
     pub lease: String,
     /// Registered manager ID; use for wrappers or when the program name differs.

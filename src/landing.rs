@@ -85,10 +85,13 @@ fn is_ancestor(repo: &Path, older: &str, newer: &str) -> Result<bool> {
     }
 }
 
-fn dirty(path: &Path) -> Result<bool> {
+/// Status lines of the uncommitted changes in `path`, ignoring ignored files.
+fn uncommitted(path: &Path) -> Result<Vec<String>> {
     Ok(git::changes(path)?
-        .iter()
-        .any(|change| change.status != "!!"))
+        .into_iter()
+        .filter(|change| change.status != "!!")
+        .map(|change| format!("{} {}", change.status, change.path))
+        .collect())
 }
 
 fn partially_staged(paths: impl IntoIterator<Item = impl AsRef<[u8]>>) -> anyhow::Error {
@@ -432,11 +435,16 @@ pub(crate) fn prepare_with_import(
     let reference = branch_ref(repo, &target)?;
     let old = branch_tip(repo, &reference)?;
     git::check_idle(workspace)?;
-    if dirty(workspace)? {
-        let message = options
-            .commit
-            .as_deref()
-            .context("graft has uncommitted changes. Commit them first or pass --commit")?;
+    let changes = uncommitted(workspace)?;
+    if !changes.is_empty() {
+        let Some(message) = options.commit.as_deref() else {
+            // Name what Git reports, so the caller can see what to commit.
+            return Err(fault(
+                "operation_failed",
+                "graft has uncommitted changes. Commit them first or pass --commit",
+                json!({"changes": changes.iter().take(20).collect::<Vec<_>>(), "count": changes.len()}),
+            ));
+        };
         if message.trim().is_empty() {
             bail!("--commit requires a nonempty commit message");
         }
@@ -449,7 +457,7 @@ pub(crate) fn prepare_with_import(
             return Err(git_failure("commit workspace changes", &output));
         }
         git::check_idle(workspace)?;
-        if dirty(workspace)? {
+        if !uncommitted(workspace)?.is_empty() {
             bail!("graft still has uncommitted changes after commit");
         }
     }

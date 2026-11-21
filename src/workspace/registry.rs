@@ -209,7 +209,8 @@ pub struct Summary {
     pub storage: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
-    /// Why prune could not check this graft. It was left as it is.
+    /// Why prune could not check this graft, or could not verify that its
+    /// checkout is the one it created. It was left as it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// For prune, the archived unfinished attempts of the graft's request.
@@ -362,7 +363,21 @@ impl Drop for WorkspaceLock {
 fn lock_in(state: &Path, name: &str) -> Result<WorkspaceLock> {
     let path = state.join("locks");
     dir(&path)?;
-    try_lock(open_lock(&path.join(name))?, name)
+    try_lock(open_exclusive(&path.join(name), name)?, name)
+}
+
+/// Open a graft lock for exclusive use. On Windows a file lock ends when the
+/// process that took it exits, even while a process it started still holds
+/// the file open. So there the lock is also opened without sharing: while any
+/// process holds it, such as one left running by `exec`, the graft is busy.
+fn open_exclusive(path: &Path, name: &str) -> Result<File> {
+    #[cfg(windows)]
+    return crate::registry::open_lock_unshared(path)?.ok_or_else(|| busy(name));
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        open_lock(path)
+    }
 }
 
 /// Serialize workspace subprocesses with lifecycle operations, without
@@ -381,7 +396,19 @@ pub(super) fn exec_lock(p: &Project, name: &str) -> Result<File> {
     validate_name(name)?;
     let path = state_dir(p, false)?.join("locks");
     dir(&path)?;
-    let file = open_lock(&path.join(name))?;
+    let file = match open_lock(&path.join(name)) {
+        Ok(file) => file,
+        // A lifecycle operation holds the lock without sharing.
+        #[cfg(windows)]
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(crate::registry::is_sharing_violation) =>
+        {
+            return Err(busy(name));
+        }
+        Err(error) => return Err(error),
+    };
     match file.try_lock_shared() {
         Ok(()) => Ok(file),
         Err(fs::TryLockError::WouldBlock) => Err(busy(name)),
@@ -2269,10 +2296,7 @@ fn open_existing_lock(p: &Project, name: &str) -> Result<WorkspaceLock> {
         metadata.is_file() && !is_reparse_point(&metadata),
         "graft lock is not an ordinary file"
     );
-    try_lock(
-        fs::OpenOptions::new().read(true).write(true).open(lock)?,
-        name,
-    )
+    try_lock(open_exclusive(&lock, name)?, name)
 }
 
 /// Archive eligible expired workspaces. Archives, foreign paths and refs are
@@ -2286,7 +2310,10 @@ pub fn prune(p: &Project, apply: bool) -> Result<Vec<Summary>> {
             continue;
         }
         let mut entry = match prune_one(p, &mut r, apply) {
-            Ok((reason, available)) => summary(&r, available, Some(reason)),
+            Ok((reason, available, error)) => Summary {
+                error,
+                ..summary(&r, available, Some(reason))
+            },
             Err(error) => Summary {
                 error: Some(format!("{error:#}")),
                 ..summary(&r, false, Some("error"))
@@ -2298,25 +2325,31 @@ pub fn prune(p: &Project, apply: bool) -> Result<Vec<Summary>> {
     Ok(result)
 }
 
-/// The prune reason for one expired graft, and whether it is available.
-fn prune_one(p: &Project, r: &mut Record, apply: bool) -> Result<(&'static str, bool)> {
+/// The prune reason for one expired graft, whether it is available, and why
+/// its checkout could not be verified when it is missing or replaced.
+fn prune_one(
+    p: &Project,
+    r: &mut Record,
+    apply: bool,
+) -> Result<(&'static str, bool, Option<String>)> {
     if apply && r.retiring_to() == Some(Status::Dropped) {
         let _lock = open_existing_lock(p, &r.name)?;
         return match resume(p, r) {
-            Ok(()) => Ok(("archived", false)),
-            Err(error) if is_nested_git_error(&error) => Ok(("nested_git_metadata", false)),
+            Ok(()) => Ok(("archived", false, None)),
+            Err(error) if is_nested_git_error(&error) => Ok(("nested_git_metadata", false, None)),
             Err(error) => Err(error),
         };
     }
     let endpoint =
         registered_path(p, &r.name, &r.path).and_then(|()| verify_endpoint(p, r, &r.path));
     let available = endpoint.is_ok();
+    let unverified = endpoint.as_ref().err().map(|error| format!("{error:#}"));
     let reason = if r.locked.is_some() {
         "locked"
     } else if r.plan.is_some() || r.transition.is_some() || r.status == Status::Pending {
         "transition_in_progress"
     } else if !available {
-        "missing_or_replaced"
+        return Ok(("missing_or_replaced", false, unverified));
     } else {
         match open_existing_lock(p, &r.name) {
             Ok(_lock) => {
@@ -2346,7 +2379,7 @@ fn prune_one(p: &Project, r: &mut Record, apply: bool) -> Result<(&'static str, 
             Err(error) => return Err(error),
         }
     };
-    Ok((reason, available && !r.status.retired()))
+    Ok((reason, available && !r.status.retired(), None))
 }
 
 #[cfg(test)]

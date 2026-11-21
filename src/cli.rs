@@ -9,6 +9,11 @@ use crate::{api, workspace};
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
     /// Create a graft: a lightweight, independent copy of the repository.
+    #[command(after_help = "\
+Examples:
+  git graft add fix-parser                     From the current HEAD, on branch graft/fix-parser
+  git graft add hotfix --base v1.2.0           From another commit or tag
+  git graft add docs --sparse docs             Check out only the docs directory")]
     Add(api::Spawn),
     /// List active and recoverable grafts.
     List,
@@ -17,16 +22,45 @@ pub enum Cmd {
     /// Check Git support and whether grafts can share files.
     Doctor,
     /// Run a program inside a graft.
+    #[command(after_help = "\
+Examples:
+  git graft exec fix-parser --lease <lease> -- npm test
+  git graft exec fix-parser --lease <lease> -- cargo build --release")]
     Exec(api::Exec),
     /// Install and reuse dependencies.
     Deps(Deps),
     /// Merge a graft's commits into a local branch, then archive the graft.
+    #[command(after_help = "\
+Examples:
+  git graft merge fix-parser --lease <lease>                   Into main
+  git graft merge fix-parser --lease <lease> --into release    Into another local branch
+  git graft merge fix-parser --lease <lease> --commit \"Fix\"    Commit pending edits first
+  git graft merge fix-parser --lease <recovery_lease> --undo   Reverse the merge
+
+A conflict changes nothing and keeps the graft. To resolve it, run in the graft:
+  git fetch --no-tags <primary checkout> refs/heads/main && git merge FETCH_HEAD
+then fix, commit and retry the merge with the same lease.")]
     Merge(api::Land),
     /// Archive a graft and its files. Refuses if it has unmerged work unless --discard is given.
+    #[command(after_help = "\
+Examples:
+  git graft remove fix-parser --lease <lease>             A graft whose work is merged
+  git graft remove fix-parser --lease <lease> --discard   Archive unmerged work too
+
+Save the returned recovery_lease: `git graft restore` needs it.")]
     Remove(api::DropWorkspace),
     /// Archive every expired graft. Previews unless --apply is given.
+    #[command(after_help = "\
+Examples:
+  git graft prune           List what would be archived, and why others are kept
+  git graft prune --apply   Archive them")]
     Prune(api::Gc),
     /// Reopen an archived graft.
+    #[command(after_help = "\
+Example:
+  git graft restore fix-parser --lease <recovery_lease>
+
+Use `git graft list` to see recoverable grafts. Restore returns a new lease.")]
     Restore(api::Owned),
     /// Protect a graft from moves, pruning and cleanup.
     Lock {
@@ -70,6 +104,10 @@ enum DepsCommand {
     /// Save, restore or remove a graft's installed dependencies.
     Layer(LayerArgs),
     /// Share the primary checkout's installed dependencies with future grafts.
+    #[command(after_help = "\
+Example:
+  npm ci
+  git graft deps share --key node24   Grafts created afterwards get node_modules")]
     Share(api::SeedLayer),
     /// Register package managers so grafts reuse their caches and installs.
     Manager(ManagerArgs),
