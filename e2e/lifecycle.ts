@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { leaveIndexedCheckoutJournal } from './checkout-journal.ts';
-import { objectResult, type Scenario } from './harness.ts';
+import { objectResult, parseExact, type Scenario } from './harness.ts';
 
 type Context = Parameters<Scenario['run']>[0];
 
@@ -32,7 +32,8 @@ function names(value: unknown): unknown[] {
 function expire(ctx: Context, id: unknown): void {
   assert(typeof id === 'string');
   const file = join(ctx.repo, '.git', 'graft', 'workspaces', 'records', `${id}.json`);
-  writeFileSync(file, JSON.stringify({ ...object(JSON.parse(readFileSync(file, 'utf8'))), heartbeat: 0 }));
+  // Records hold 64-bit file IDs, which plain JSON.parse would round on NTFS.
+  writeFileSync(file, JSON.stringify({ ...object(parseExact(readFileSync(file, 'utf8'))), heartbeat: 0 }));
 }
 /** Every ref, the stash, the index and every file status of a checkout. */
 function work(ctx: Context, path: string): string {
@@ -554,7 +555,7 @@ export const cases: Scenario[] = [
       const other = ctx.spawn('other');
       assert(typeof foreign.result.id === 'string');
       const file = join(ctx.repo, '.git', 'graft', 'workspaces', 'records', `${foreign.result.id}.json`);
-      const record = object(JSON.parse(readFileSync(file, 'utf8')));
+      const record = object(parseExact(readFileSync(file, 'utf8')));
       writeFileSync(file, JSON.stringify({ ...record, project: join(ctx.root, 'another primary') }));
       const edited = readFileSync(file);
       // Only a primary whose records all name one other path counts as moved.
