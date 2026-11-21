@@ -38,6 +38,25 @@ mod native;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod verify;
 pub(crate) use local::{materialize_local, materialize_planned};
+
+/// Content of the index lock a graft creation holds until it publishes the
+/// checkout's index. Git's own index locks are empty or hold an index, which
+/// starts with `DIRC`, so a lock with these bytes was created by Graft.
+pub(crate) const CREATION_LOCK: &[u8] = b"git-graft creation\n";
+
+/// Reserve a new workspace's index with Git's lock protocol and mark the lock
+/// as Graft's. Dropping the returned path releases it. A killed creation
+/// leaves it behind, so Git refuses to write an index for the missing files.
+fn reserve_index(lock: &Path) -> Result<tempfile::TempPath> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock)
+        .context("reserve workspace Git index")?;
+    let reserved = tempfile::TempPath::try_from_path(lock)?;
+    file.write_all(CREATION_LOCK)?;
+    Ok(reserved)
+}
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use native::Root as NoFollowRoot;
 
@@ -849,12 +868,7 @@ impl Prepared {
         let lock = git_dir.join("index.lock");
         // Use Git's lock protocol while publishing into a newly initialized
         // repository. The index must never overwrite one created by Git.
-        let _lock = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-            .context("reserve workspace Git index")?;
-        let lock = tempfile::TempPath::try_from_path(lock)?;
+        let lock = reserve_index(&lock)?;
         ensure!(
             matches!(fs::symlink_metadata(&destination), Err(error) if error.kind() == io::ErrorKind::NotFound),
             "workspace Git index already exists"

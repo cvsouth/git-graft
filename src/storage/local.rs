@@ -170,13 +170,7 @@ impl<'a> LocalCheckout<'a> {
     fn reserve(worktree: &'a Path, proof_objects: Option<&'a Path>) -> Result<Self> {
         ensure_empty(worktree)?;
         let admin = worktree.join(".git");
-        let index_lock = admin.join("index.lock");
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&index_lock)
-            .context("reserve workspace Git index")?;
-        let index_lock = tempfile::TempPath::try_from_path(index_lock)?;
+        let index_lock = reserve_index(&admin.join("index.lock"))?;
         ensure!(
             matches!(fs::symlink_metadata(admin.join("index")), Err(error) if error.kind() == io::ErrorKind::NotFound),
             "workspace Git index already exists"
