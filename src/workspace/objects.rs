@@ -508,17 +508,13 @@ fn finish_head(
     if let Some(objects) = objects {
         head.env("GIT_OBJECT_DIRECTORY", objects);
     }
-    // Git's writeback-only fsync skips a device cache flush for this one ref.
-    // The ref is still written back before the record write that finishes
-    // the graft, and that write flushes the device.
-    head.args([
-        "-c",
-        "core.fsyncMethod=writeout-only",
-        "update-ref",
-        "--no-deref",
-        reference,
-        base,
-    ]);
+    // On macOS, Git's writeback-only fsync skips a device cache flush for
+    // this one ref. The ref is still written back before finish flushes the
+    // graft's device. Elsewhere Git keeps its full fsync.
+    if cfg!(target_os = "macos") {
+        head.args(["-c", "core.fsyncMethod=writeout-only"]);
+    }
+    head.args(["update-ref", "--no-deref", reference, base]);
     // The primary's settings do not depend on the workspace HEAD.
     let (updated, source) = std::thread::scope(|scope| {
         let source = scope.spawn(|| read_primary_config(primary));
