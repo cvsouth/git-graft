@@ -321,11 +321,14 @@ fn create(
             };
             materialize(&r.path, &p.state, oid, c.sparse, origin)?
         }
-        _ => json!({"backend":"empty","files":0,"logical_bytes":0}),
+        _ => {
+            // An unborn or --no-checkout graft has no index to publish, so it
+            // releases the reservation here. A checkout releases it only by
+            // publishing its index.
+            storage::release_index(&r.path.join(".git"))?;
+            json!({"backend":"empty","files":0,"logical_bytes":0})
+        }
     };
-    // A checkout published its index and released the reservation; an
-    // unborn or --no-checkout graft has no index to publish.
-    storage::release_index(&r.path.join(".git"))?;
     checkout["objects"] = objects;
     crate::trace::mark("checkout");
     if c.base.is_some() && !c.no_checkout && c.sparse.is_empty() && !c.no_deps {
