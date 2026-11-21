@@ -1418,6 +1418,16 @@ pub(super) fn order_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Fully flush the device holding `path` if `other` is on another device.
+/// Barriers order writes within one device only, so a creation step that
+/// another device's next write depends on is flushed instead.
+fn flush_if_elsewhere(path: &Path, other: &Path) -> Result<()> {
+    if file_id(path)?.volume != file_id(other)?.volume {
+        sync_directory(path)?;
+    }
+    Ok(())
+}
+
 fn same_filesystem(source: &Path, destination: &Path) -> Result<bool> {
     let parent = destination.parent().context("destination has no parent")?;
     Ok(file_id(source)?.volume == file_id(parent)?.volume)
@@ -1763,11 +1773,16 @@ pub(super) fn reserve_locked(
         superseded_by: None,
     };
     let result = (|| {
+        // The stage precedes its record, the record the move, and the move
+        // the cleared transition, also when the records are on another device.
+        flush_if_elsewhere(&root, &directory)?;
         order_record(&directory, &r)?;
         crate::trace::mark("reserve: write placement");
+        flush_if_elsewhere(&directory, &root)?;
         // The private stage was just created with only our marker and lock.
         relocate(p, &r, &from, &r.path, true)?;
         crate::trace::mark("reserve: relocate");
+        flush_if_elsewhere(&root, &directory)?;
         r.transition = None;
         order_record(&directory, &r)
     })();
@@ -1851,6 +1866,8 @@ pub fn finish(p: &Project, r: &mut Record) -> Result<()> {
         true,
     )?;
     verify_git_location(&live.path, detached)?;
+    // The record's durable write below flushes only its own device.
+    flush_if_elsewhere(&live.path.join(".git"), &directory)?;
     live.initialized = true;
     live.status = Status::Active;
     live.heartbeat = now();
