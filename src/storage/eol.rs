@@ -209,7 +209,7 @@ impl Rule {
     };
 
     /// Bytes Git never converts, such as a symbolic link's target.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     pub(super) const BINARY: Self = Self {
         actions: 1 << Action::Binary as u8,
         safe_crlf: false,

@@ -1,5 +1,5 @@
 //! Direct CoW reuse from a trusted local checkout. Git still owns the tree and
-//! index, and supplies files whose checkout bytes cannot come from the donor.
+//! index, and supplies every file the donor cannot be proven to provide.
 use super::*;
 use std::path::PathBuf;
 

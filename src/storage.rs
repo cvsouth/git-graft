@@ -1806,7 +1806,7 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn local_shares_auto_crlf_checkouts_proven_by_size() {
+    fn local_shares_auto_crlf_checkouts_by_hashing_their_clean_bytes() {
         let (temp, repo, _) = fixture();
         // Each committed blob and the bytes Git checks out for it.
         let samples: &[(&str, &[u8], &[u8])] = &[
@@ -1944,8 +1944,9 @@ mod tests {
 
     /// The primary's uncommitted `.gitattributes` smudges a file that Git
     /// expands to CRLF for the selected commit. `ident` and the filter each
-    /// add as many bytes as the blob has LFs, so the primary's stat-clean file has exactly the
-    /// expanded size, yet holds different bytes.
+    /// add as many bytes as the blob has LFs, so the primary's stat-clean
+    /// file has exactly the expanded size, yet Git's line-ending clean of it
+    /// does not give the blob, so hashing refuses it.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn local_does_not_reuse_expanded_files_the_primary_smudged() {
