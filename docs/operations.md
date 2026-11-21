@@ -85,7 +85,13 @@ If `merge --commit` is killed while it stages the graft, it leaves the graft's `
 
 For a disconnected `add`, retry with the same client-generated, cryptographically random UUIDv4 `request_id` and the same options. The request ID acts as the graft lease; keep it secret and share it only with trusted local tools.
 
-If `add` stops before it finishes, for example because it was killed during the checkout, it reports `spawn_incomplete` or leaves a graft with `"status": "pending"`. Until the checkout's index is published, Graft keeps the graft's `.git/index.lock`, so Git cannot commit the files that are not checked out yet as deletions. Do not delete that lock. Retry the same request: Graft reclaims the interrupted attempt and builds the graft again. It removes checkout files only when Git confirms each one is tracked and unchanged from the base commit. If any file differs or is untracked, the attempt is kept and reported as `spawn_incomplete`; archive it with `remove --discard`. Restoring an archived, unfinished creation rebuilds it the same way. When it cannot, `restore` returns the graft still pending and guarded, with an `incomplete` object that says why.
+### Interrupted add
+
+If `add` stops before it finishes, for example because it was killed during the checkout, it reports `spawn_incomplete` or leaves a graft with `"status": "pending"`. Until the checkout's index is published, the unfinished graft holds `.git/index.lock`, which Graft writes when it reserves the graft, so Git cannot commit the files that are not checked out yet as deletions. Do not delete that lock or work in a pending graft.
+
+Retry the same request. Graft deletes nothing: it archives the whole unfinished attempt under a new lease, then builds the graft again at the same name and path. The reply lists each archived attempt in `archived_attempts`, with its `archive_path` and the `lease` that restores it. Copy anything you need from `archive_path`; its files are kept byte for byte, including untracked, ignored and edited files. A retry while the first attempt is still running waits for it and returns its graft.
+
+`restore NAME --lease TOKEN` with an archived attempt's lease, or with the lease of a pending graft you archived with `remove --discard`, keeps that archive untouched and builds a new graft from the add's recorded options. The reply's `unfinished_archive` names the archive and its lease. Restoring the same lease again returns the same new graft while it is live. Run `restore` from the same place as the `add`: an `add` run inside a graft may start from a commit only that graft holds.
 
 ## When two tasks edit the same file
 
@@ -126,6 +132,8 @@ These codes and fields tell you that Graft kept something instead of deleting or
 | `primary_moved` | Every record names one other primary path, so the primary was moved or copied. `details.recorded_primary` is that path. Nothing is read or written. | Move the primary back to `recorded_primary`. Do not edit or move the record files. |
 | `already_exists` | `restore` found another graft using the name, or a file or directory at the graft's path. | Merge or remove the other graft, or move the existing path aside after saving its data, then retry. |
 | `archive_damaged` | The archive at `details.archive_path` is missing or was changed by hand. Restore leaves it exactly as found. | Copy what you need from it, or put back the missing Git files and retry. |
+| `spawn_incomplete` | `add` stopped before the graft was built. `details.path` is the pending graft, which holds its index lock so Git cannot commit it. | Retry the same request. See [interrupted add](#interrupted-add). |
+| `archived_attempts`, `unfinished_archive` | `add` and `restore` fields naming archives of unfinished creations, each with `archive_path` and the `lease` that restores it. | Copy what you need from `archive_path`. |
 | `checkout_recovery_required` | A checkout update of the primary was interrupted. `details.paths` lists files that need attention. | Retry the same merge or undo with the same lease. See [interrupted checkout update](#interrupted-checkout-update). |
 | `checkout_update_set_aside` | An interrupted checkout update can no longer finish because its branch moved or is no longer checked out. The journal stays at `details.recovery_path`. | Check `git status` in the primary, then retry the merge. |
 | `git_busy` | A Git lock or an unreadable index in the graft or primary is held by a command Graft did not start, or cannot prove has exited. | Wait for the Git command to finish. Remove a lock only once no Git command is running. |

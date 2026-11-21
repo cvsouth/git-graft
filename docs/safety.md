@@ -27,6 +27,7 @@ When reusing a mixed pack, Graft edits an unlinked copy, has Git index its conte
 | `checkout_update_set_aside` | The branch moved or is no longer checked out after the update stopped. Graft changed no further file, and files the stopped update wrote stay as they are; check `git status` in the primary and retry the merge. |
 | `primary_moved` | Every record names one other primary path, so the primary was moved or copied. Graft reads and writes nothing; move the primary back to `details.recorded_primary`. |
 | Merge receipt with `"removed": false` | The graft gained commits after the merge applied and stays active. Merge it again to land them. |
+| `spawn_incomplete` or a `pending` graft | Retry the same `add` request. Graft archives the unfinished attempt whole, rebuilds the graft and lists the archive in `archived_attempts`; see [interrupted add](operations.md#interrupted-add). |
 | Name or path is occupied | Restore fails as `already_exists`. Inspect the collision and preserve the existing data before retrying. |
 | `archive_damaged` | The archive at `details.archive_path` is missing or was changed by hand. Restore leaves it exactly as found. Copy what you need from it, or put back the missing Git files and retry. |
 
