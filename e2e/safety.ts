@@ -749,7 +749,8 @@ export const cases: Scenario[] = [
         assert.equal(retried.ok, true, JSON.stringify(retried.json));
         return retried.json;
       };
-      const moved = join(dirname(ws.path), 'held-moved');
+      // Inside the graft root a graft lives only at its own name, so move it beside the primary.
+      const moved = join(ctx.root, 'held-moved');
       await attempt(['move', 'held', moved, '--lease', ws.lease], file);
       assert.equal(readFileSync(join(moved, 'held.txt'), 'utf8'), 'open in an editor\n');
       await attempt(['remove', 'held', '--lease', ws.lease, '--discard'], join(moved, 'held.txt'));
