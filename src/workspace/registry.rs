@@ -1985,8 +1985,11 @@ fn prune_eligibility(r: &Record, detached: Option<usize>) -> Result<Option<&'sta
 
 /// Every way the graft's refs differ from how it was created: commits on its
 /// branch or a moved HEAD, other branches, tags, a stash or any other ref.
-/// Each is work that a merge never took, described for the person.
-fn unmerged_refs(r: &Record) -> Result<Vec<String>> {
+/// Each is work that a merge never took, described for the person. New
+/// commits on the graft's own branch or detached HEAD also carry their tip,
+/// since another route (Git, another graft) may already have merged them;
+/// a stash, a tag or another branch is always the person's to keep.
+fn unmerged_refs(r: &Record) -> Result<Vec<(String, Option<String>)>> {
     let path = &r.path;
     let expected = r
         .branch
@@ -1995,10 +1998,13 @@ fn unmerged_refs(r: &Record) -> Result<Vec<String>> {
     let mut found = Vec::new();
     let head = git::symbolic_ref(path, "HEAD")?;
     if head != expected {
-        found.push(match &head {
-            Some(other) => format!("HEAD is on {other}"),
-            None => "HEAD is detached".to_owned(),
-        });
+        found.push((
+            match &head {
+                Some(other) => format!("HEAD is on {other}"),
+                None => "HEAD is detached".to_owned(),
+            },
+            None,
+        ));
     }
     let refs = git::text(path, &["for-each-ref", "--format=%(refname) %(objectname)"])?;
     let mut has_branch = false;
@@ -2007,31 +2013,52 @@ fn unmerged_refs(r: &Record) -> Result<Vec<String>> {
         if Some(name) == expected.as_deref() {
             has_branch = true;
             if r.base.as_deref() != Some(oid) {
-                found.push(format!("commits on branch {}", short_ref(name)));
+                let commits = format!("commits on branch {}", short_ref(name));
+                found.push((commits, Some(oid.to_owned())));
             }
         } else if name == "refs/stash" {
-            found.push("a stash".to_owned());
+            found.push(("a stash".to_owned(), None));
         } else if let Some(tag) = name.strip_prefix("refs/tags/") {
-            found.push(format!("tag {tag}"));
+            found.push((format!("tag {tag}"), None));
         } else if let Some(branch) = name.strip_prefix("refs/heads/") {
-            found.push(format!("branch {branch}"));
+            found.push((format!("branch {branch}"), None));
         } else {
-            found.push(format!("ref {name}"));
+            found.push((format!("ref {name}"), None));
         }
     }
     match (&expected, &r.base) {
         (Some(branch), Some(_)) if !has_branch => {
-            found.push(format!("branch {} was deleted", short_ref(branch)));
+            found.push((format!("branch {} was deleted", short_ref(branch)), None));
         }
         _ => {}
     }
     if let Some(base) = &r.base
         && head.is_none()
-        && git::oid(path, "HEAD")? != *base
     {
-        found.push("commits on the detached HEAD".to_owned());
+        let tip = git::oid(path, "HEAD")?;
+        if tip != *base {
+            found.push(("commits on the detached HEAD".to_owned(), Some(tip)));
+        }
     }
     Ok(found)
+}
+
+/// Whether `oid` is a commit already reachable from a local branch of the
+/// primary checkout, so its history is kept there even if this graft goes.
+/// A commit the primary does not have, or any error, counts as not merged.
+fn in_primary_branches(primary: &Path, oid: &str) -> bool {
+    git::text(
+        primary,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "--contains",
+            oid,
+            "refs/heads",
+        ],
+    )
+    .is_ok_and(|branch| !branch.trim().is_empty())
 }
 
 fn short_ref(name: &str) -> &str {
@@ -2039,9 +2066,18 @@ fn short_ref(name: &str) -> &str {
 }
 
 /// `remove` without `--discard` archives only a graft whose refs are as
-/// they were created. Otherwise it names the work it found.
-pub fn require_merged(r: &Record) -> Result<()> {
-    let found = unmerged_refs(r)?;
+/// they were created, or whose new commits a branch of the primary already
+/// contains (merged through Git or another graft). A stash, a deleted branch
+/// or a moved HEAD always counts. Otherwise it names the work it found.
+pub fn require_merged(r: &Record, primary: &Path) -> Result<()> {
+    let found: Vec<String> = unmerged_refs(r)?
+        .into_iter()
+        .filter(|(_, oid)| {
+            !oid.as_deref()
+                .is_some_and(|oid| in_primary_branches(primary, oid))
+        })
+        .map(|(description, _)| description)
+        .collect();
     if found.is_empty() {
         return Ok(());
     }
@@ -2369,12 +2405,37 @@ mod tests {
             ("detached", "HEAD is detached, commits on the detached HEAD"),
         ] {
             let r = load(p, name)?;
-            let error = require_merged(&r).unwrap_err();
+            let error = require_merged(&r, &p.repo).unwrap_err();
             assert_eq!(code(&error), "unmerged_work");
             assert!(format!("{error:#}").contains(found), "{name}: {error:#}");
             assert!(!format!("{error:#}").contains(&r.lease));
         }
-        require_merged(&load(p, "busy")?)?;
+        require_merged(&load(p, "busy")?, &p.repo)?;
+        Ok(())
+    }
+
+    #[test]
+    fn remove_accepts_commits_a_primary_branch_already_contains() -> Result<()> {
+        let f = Fixture::new()?;
+        let p = &f.project;
+        let r = f.expired_at_base("merged-elsewhere")?;
+        fs::write(r.path.join("tracked"), "merged by Git\n")?;
+        git::bytes(&r.path, &["commit", "-qam", "merged by Git"])?;
+        let error = require_merged(&r, &p.repo).unwrap_err();
+        assert_eq!(code(&error), "unmerged_work");
+        // Merging through plain Git puts the commits in a primary branch.
+        let branch = r.branch.clone().context("graft branch")?;
+        let source = r.path.to_str().context("graft path")?;
+        git::bytes(
+            &p.repo,
+            &["fetch", "-q", source, &format!("{branch}:merged-elsewhere")],
+        )?;
+        require_merged(&r, &p.repo)?;
+        // A stash still needs the person, whatever the primary contains.
+        fs::write(r.path.join("tracked"), "stashed edit\n")?;
+        git::bytes(&r.path, &["stash", "push", "-q"])?;
+        let error = require_merged(&r, &p.repo).unwrap_err();
+        assert_eq!(code(&error), "unmerged_work");
         Ok(())
     }
 

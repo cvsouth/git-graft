@@ -511,7 +511,7 @@ fn drop_workspace(p: &Project, opts: &api::DropWorkspace) -> Result<Value> {
                 "partial graft requires --discard to archive"
             );
             clean(&r.path, false)?;
-            registry::require_merged(&r)?;
+            registry::require_merged(&r, &p.repo)?;
         }
     }
     retire(p, &r.name, &r.lease, Status::Dropped)
