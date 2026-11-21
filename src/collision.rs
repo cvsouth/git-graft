@@ -1,12 +1,13 @@
-//! Detect checkout paths that the filesystem resolves to an ignored entry.
+//! Detect checkout paths that the filesystem resolves to an ignored entry or
+//! to a person's uncommitted edit.
 //!
 //! Comparing path bytes cannot follow every filesystem's folding rules: APFS
 //! and NTFS fold case beyond ASCII, and APFS also treats NFC and NFD spellings
 //! as the same name. Instead of reimplementing those rules, ask the filesystem
 //! which directory entry each incoming path resolves to and compare file
-//! identities with the ignored entries Git reported.
+//! identities with the entries Git reported.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -25,35 +26,95 @@ pub(crate) fn ignored_collision<'a>(
     ignored: &[&[u8]],
     changed: &[&'a [u8]],
 ) -> Result<Option<&'a [u8]>> {
+    let ignored: Vec<_> = ignored
+        .iter()
+        .map(|path| path.strip_suffix(b"/").unwrap_or(path))
+        .collect();
+    Ok(resolved_collisions(root, &ignored, changed, true)?
+        .first()
+        .map(|(_, changed)| *changed))
+}
+
+/// The edited paths an update would write over: each edited path that is a
+/// changed path, lies inside one or holds one, compared both as Git path
+/// bytes and as the files the filesystem resolves them to. Byte comparison
+/// covers an edit that removed its file; the filesystem covers a case-only or
+/// Unicode spelling of an existing file. Returned in `edited` order.
+pub(crate) fn overlapping<'e>(
+    root: &Path,
+    edited: &[&'e [u8]],
+    changed: &[&[u8]],
+) -> Result<Vec<&'e [u8]>> {
+    if edited.is_empty() || changed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let changes: BTreeSet<&[u8]> = changed.iter().copied().collect();
+    let mut found = BTreeSet::new();
+    for (index, path) in edited.iter().enumerate() {
+        let mut inside = path.to_vec();
+        inside.push(b'/');
+        let holds = changes
+            .range(&inside[..]..)
+            .next()
+            .is_some_and(|change| change.starts_with(&inside));
+        if changes.contains(path) || holds || prefixes(path).any(|p| changes.contains(p)) {
+            found.insert(index);
+        }
+    }
+    for (index, _) in resolved_collisions(root, edited, changed, false)? {
+        found.insert(index);
+    }
+    Ok(found.into_iter().map(|index| edited[index]).collect())
+}
+
+/// Pairs of an entry's index and a changed path where the filesystem resolves the
+/// changed path onto the entry, onto a path inside it, or onto a directory
+/// holding it. Entries that do not exist on disk never match. With `first`,
+/// stop at the first pair.
+fn resolved_collisions<'c>(
+    root: &Path,
+    entries: &[&[u8]],
+    changed: &[&'c [u8]],
+    first: bool,
+) -> Result<Vec<(usize, &'c [u8])>> {
     let mut cache = HashMap::new();
-    let mut entries = HashSet::new();
-    let mut holders = HashSet::new();
-    for path in ignored {
-        let path = path.strip_suffix(b"/").unwrap_or(path);
+    // The entries each file identity names, and the entries inside each
+    // directory identity.
+    let mut named: HashMap<Identity, Vec<usize>> = HashMap::new();
+    let mut holding: HashMap<Identity, Vec<usize>> = HashMap::new();
+    for (index, path) in entries.iter().enumerate() {
         if let Some(identity) = identity(root, path, &mut cache)? {
-            entries.insert(identity);
+            named.entry(identity).or_default().push(index);
         }
         for prefix in prefixes(path) {
             if let Some(identity) = identity(root, prefix, &mut cache)? {
-                holders.insert(identity);
+                holding.entry(identity).or_default().push(index);
             }
         }
     }
-    if entries.is_empty() {
-        return Ok(None);
+    let mut found = Vec::new();
+    if named.is_empty() {
+        return Ok(found);
     }
     for path in changed {
-        let exact = identity(root, path, &mut cache)?;
-        if exact.is_some_and(|id| entries.contains(&id) || holders.contains(&id)) {
-            return Ok(Some(path));
+        let mut matches: Vec<usize> = Vec::new();
+        if let Some(id) = identity(root, path, &mut cache)? {
+            matches.extend(named.get(&id).into_iter().flatten());
+            matches.extend(holding.get(&id).into_iter().flatten());
         }
         for prefix in prefixes(path) {
-            if identity(root, prefix, &mut cache)?.is_some_and(|id| entries.contains(&id)) {
-                return Ok(Some(path));
+            if let Some(id) = identity(root, prefix, &mut cache)? {
+                matches.extend(named.get(&id).into_iter().flatten());
+            }
+        }
+        for entry in matches {
+            found.push((entry, *path));
+            if first {
+                return Ok(found);
             }
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// The proper ancestors of a relative path, shortest first.
@@ -162,6 +223,50 @@ mod tests {
         assert_eq!(find(b"src")?, Some(&b"src"[..]));
         assert_eq!(find(b"src/main.rs")?, None);
         assert_eq!(find(b"new/file")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn edits_overlap_a_change_at_inside_or_around_its_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        fs::create_dir_all(root.join("dir"))?;
+        fs::write(root.join("dir/mine"), "untracked\n")?;
+        fs::write(root.join("edited.txt"), "edited\n")?;
+        fs::write(root.join("beside.txt"), "edited\n")?;
+        let changed: &[&[u8]] = &[b"edited.txt", b"dir", b"gone.txt", b"tree/leaf"];
+        let edited: &[&[u8]] = &[
+            b"beside.txt",
+            b"dir/mine",
+            b"edited.txt",
+            // Deleted files exist only as Git paths.
+            b"gone.txt",
+            b"tree",
+            b"treehouse",
+        ];
+        assert_eq!(
+            overlapping(root, edited, changed)?,
+            [&b"dir/mine"[..], b"edited.txt", b"gone.txt", b"tree"]
+        );
+        assert!(overlapping(root, &[], changed)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn edits_overlap_a_spelling_the_filesystem_folds_onto_them() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        // Decomposed (NFD) uppercase, edited by the person.
+        let edited = "CAFE\u{301}.txt";
+        fs::write(root.join(edited), "mine\n")?;
+        // Precomposed (NFC) lowercase, added by the merge.
+        let incoming = "caf\u{e9}.txt";
+        let found = overlapping(root, &[edited.as_bytes()], &[incoming.as_bytes()])?;
+        let same = root.join(incoming).exists();
+        assert_eq!(found.is_empty(), !same);
+        if folds_unicode_case(root)? && cfg!(target_os = "macos") {
+            assert_eq!(found, [edited.as_bytes()]);
+        }
         Ok(())
     }
 

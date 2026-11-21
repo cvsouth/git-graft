@@ -1,5 +1,10 @@
 //! Native index ownership and the durable transition for a checked-out branch.
 //!
+//! As with `git merge`, an update goes ahead around the person's uncommitted
+//! edits as long as none touches a path it changes, and leaves them exactly
+//! as they were. Otherwise it refuses with `destination_has_local_changes`,
+//! naming the overlapping paths, before any file is written.
+//!
 //! An update of the checked-out branch is journaled in three phases.
 //! `Prepared` has changed nothing. `Updating` means native `read-tree` may
 //! have rewritten some files. `Indexed` means the files and index hold the
@@ -457,6 +462,52 @@ impl Update {
         Ok(())
     }
 
+    /// Refuse, before any file is written, when the person's uncommitted
+    /// edits touch a path the update changes. Edits are staged and unstaged
+    /// changes and untracked files; ignored files are `protect_ignored`'s.
+    /// Edits to other paths stay exactly as they are: the two-tree
+    /// `read-tree` keeps every index entry and file the update does not
+    /// change, and the private index starts as a copy of the person's.
+    ///
+    /// Git's own two-tree check also refuses to replace a modified file or an
+    /// untracked one, but only with an untyped message, and it accepts a
+    /// staged version that happens to equal the merged one, a modified
+    /// submodule and an edit its whole-second timestamps hide. Unresolved
+    /// conflicts and hidden index flags were refused by `check_idle`.
+    fn refuse_overlapping_edits(&self, path: &Path, objects: Option<&Path>) -> Result<()> {
+        let edits = git::edits(path)?;
+        if edits.is_empty() {
+            return Ok(());
+        }
+        let edited: Vec<&[u8]> = edits.iter().map(|edit| &edit.name[..]).collect();
+        let changes = self.changes(path, objects)?;
+        let changed: Vec<&[u8]> = changes.iter().map(|change| &change.path[..]).collect();
+        let refused: Vec<Vec<u8>> = crate::collision::overlapping(path, &edited, &changed)?
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect();
+        if refused.is_empty() {
+            return Ok(());
+        }
+        let plan = &self.record.plan;
+        let names: Vec<_> = refused
+            .iter()
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect();
+        Err(fault(
+            "destination_has_local_changes",
+            format!(
+                "Uncommitted changes in {} touch paths that updating {} to {} would change: {}. Graft changed nothing. Commit these changes or move them aside, then retry; changes to other paths can stay",
+                path.display(),
+                plan.target,
+                plan.new,
+                listed(&refused)
+            ),
+            json!({"target":plan.target,"previous":plan.old,"commit":plan.new,
+                "checkout":path,"paths":names}),
+        ))
+    }
+
     fn protect_ignored(&self, path: &Path, objects: Option<&Path>) -> Result<()> {
         // List ignored files against the private index, which already tracks
         // any path a resumed update wrote before its interruption.
@@ -663,11 +714,19 @@ impl Update {
                 return Err(git_failure("build recovery index", &output));
             }
         }
+        self.refresh(path, objects)
+    }
+
+    /// Refresh the private index's stat data from the files on disk. Git's
+    /// two-tree update trusts stat data alone, so a file that was touched but
+    /// still holds its staged content would otherwise count as modified. An
+    /// entry whose file differs keeps its old stat data and stays modified.
+    fn refresh(&mut self, path: &Path, objects: Option<&Path>) -> Result<()> {
         let mut command = self.index_command(path, objects)?;
         command.args(["update-index", "-q", "--refresh"]);
         let output = self.run_private(command, None)?;
         if !output.status.success() {
-            return Err(git_failure("refresh recovery index", &output));
+            return Err(git_failure("refresh checkout index", &output));
         }
         Ok(())
     }
@@ -823,20 +882,23 @@ impl Update {
             // update from a private index that matches the files.
             self.rebuild(path, admin, objects, true)?;
         } else {
-            ensure!(
-                super::uncommitted(path)?.is_empty(),
-                "destination checkout has local changes: {}",
-                path.display()
-            );
+            self.refuse_overlapping_edits(path, objects)?;
             if let Some(current) = &current {
                 registry::atomic(&before_path, current)?;
             }
             self.seed(current.as_deref())?;
+            self.refresh(path, objects)?;
         }
+        let fresh = !self.has_mutated_checkout();
         self.protect_ignored(path, objects)?;
         self.two_tree(path, objects, true, true)?;
         publish()?;
         self.protect_ignored(path, objects)?;
+        if fresh {
+            // Publishing can take a while. Check again for an edit made since,
+            // so that Git's own check before it writes is not the only one.
+            self.refuse_overlapping_edits(path, objects)?;
+        }
         self.set_phase(Phase::Updating)?;
         self.two_tree(path, objects, true, false)?;
         let next = registry::regular(&next_path)?;
@@ -985,6 +1047,7 @@ mod tests {
             ("a.txt", "a\n"),
             ("b.txt", "b\n"),
             ("gone.txt", "gone\n"),
+            ("other.txt", "other\n"),
             ("swap", "file\n"),
             ("unrelated.txt", "unrelated\n"),
         ] {
@@ -1061,6 +1124,374 @@ mod tests {
         assert_eq!(read(p, "ignored/later")?, "later ignored\n");
         let staged = git::text(&p.repo, &["diff", "--cached", "--name-only"])?;
         assert_eq!(staged, "staged.txt");
+        Ok(())
+    }
+
+    /// The primary's index bytes and the content of every file by path.
+    type Snapshot = (Vec<u8>, BTreeMap<PathBuf, Vec<u8>>);
+
+    /// Every file and the index bytes of the primary, to show that a
+    /// refused update changed nothing.
+    fn snapshot(p: &Project) -> Result<Snapshot> {
+        fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) -> Result<()> {
+            for entry in fs::read_dir(dir)? {
+                let path = entry?.path();
+                let metadata = fs::symlink_metadata(&path)?;
+                if path.file_name().is_some_and(|name| name == ".git") {
+                    continue;
+                }
+                let relative = path.strip_prefix(root)?.to_path_buf();
+                if metadata.is_dir() {
+                    files.insert(relative, b"<dir>".to_vec());
+                    walk(root, &path, files)?;
+                } else if metadata.is_symlink() {
+                    let target = fs::read_link(&path)?;
+                    files.insert(relative, target.to_string_lossy().as_bytes().to_vec());
+                } else {
+                    files.insert(relative, fs::read(&path)?);
+                }
+            }
+            Ok(())
+        }
+        let mut files = BTreeMap::new();
+        walk(&p.repo, &p.repo, &mut files)?;
+        Ok((fs::read(p.common.join("index"))?, files))
+    }
+
+    /// Apply `plan` expecting `destination_has_local_changes` naming
+    /// `paths`, and check that nothing in the primary changed.
+    fn assert_refused(p: &Project, plan: &Plan, paths: &[&str]) -> Result<()> {
+        let before = snapshot(p)?;
+        let error = apply(p, plan, || Ok(())).unwrap_err();
+        let reported = crate::api::error_json(&error);
+        assert_eq!(
+            reported["code"], "destination_has_local_changes",
+            "{reported}"
+        );
+        assert_eq!(reported["details"]["paths"], json!(paths), "{reported}");
+        assert_eq!(reported["details"]["target"], json!(plan.target));
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.old);
+        assert!(snapshot(p)? == before, "a refused update changed files");
+        assert!(Update::load(&p.common)?.is_none());
+        assert!(!p.common.join("index.lock").exists());
+        Ok(())
+    }
+
+    /// Edits to paths the merge does not change, of every kind a person
+    /// leaves: unstaged, staged, staged with more unstaged on top, a staged
+    /// deletion, untracked files and Windows line endings.
+    fn edit_unrelated(p: &Project) -> Result<()> {
+        let repo = &p.repo;
+        fs::write(repo.join("unrelated.txt"), "staged line\r\n")?;
+        git::bytes(repo, &["add", "unrelated.txt"])?;
+        fs::write(
+            repo.join("unrelated.txt"),
+            b"staged line\r\nunstaged \xff line\n",
+        )?;
+        fs::write(repo.join("staged.txt"), "staged new file\n")?;
+        git::bytes(repo, &["add", "staged.txt"])?;
+        git::bytes(repo, &["rm", "-q", "other.txt"])?;
+        fs::create_dir(repo.join("notes"))?;
+        fs::write(repo.join("notes").join("draft.md"), "untracked draft\n")?;
+        fs::write(repo.join("untracked.txt"), "untracked\n")?;
+        Ok(())
+    }
+
+    fn assert_unrelated_kept(p: &Project) -> Result<()> {
+        let repo = &p.repo;
+        assert_eq!(
+            fs::read(repo.join("unrelated.txt"))?,
+            b"staged line\r\nunstaged \xff line\n"
+        );
+        assert_eq!(
+            git::bytes(repo, &["cat-file", "blob", ":unrelated.txt"])?,
+            b"staged line\r\n"
+        );
+        assert_eq!(read(p, "staged.txt")?, "staged new file\n");
+        assert!(!repo.join("other.txt").exists());
+        assert_eq!(read(p, "notes/draft.md")?, "untracked draft\n");
+        assert_eq!(read(p, "untracked.txt")?, "untracked\n");
+        assert_eq!(read(p, "ignored/keep")?, "ignored data\n");
+        let staged = git::text(repo, &["diff", "--cached", "--name-status", "--no-renames"])?;
+        assert_eq!(
+            staged, "D\tother.txt\nA\tstaged.txt\nM\tunrelated.txt",
+            "staged changes must stay staged"
+        );
+        let unstaged = git::text(repo, &["diff", "--name-only"])?;
+        assert_eq!(unstaged, "unrelated.txt");
+        Ok(())
+    }
+
+    #[test]
+    fn a_merge_keeps_unrelated_edits_byte_for_byte_and_staged_changes_staged() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        edit_unrelated(&p)?;
+        apply(&p, &plan, || Ok(()))?;
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.new);
+        assert_eq!(read(&p, "a.txt")?, "A\n");
+        assert_eq!(read(&p, "b.txt")?, "B\n");
+        assert_eq!(read(&p, "added.txt")?, "added\n");
+        assert_eq!(read(&p, "swap/inner")?, "inner\n");
+        assert!(!p.repo.join("gone.txt").exists());
+        assert_unrelated_kept(&p)?;
+        assert!(Update::load(&p.common)?.is_none());
+        assert!(!p.common.join("index.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn an_undo_keeps_unrelated_edits() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        apply(&p, &plan, || Ok(()))?;
+        let repo = &p.repo;
+        let previous = git::text(repo, &["rev-parse", &format!("{}^{{tree}}", plan.old)])?;
+        let reversal = git::text(
+            repo,
+            &["commit-tree", &previous, "-p", &plan.new, "-m", "undo"],
+        )?;
+        let undo = Plan {
+            target: plan.target.clone(),
+            old: plan.new.clone(),
+            new: reversal.clone(),
+            tip: plan.new.clone(),
+        };
+        fs::write(repo.join("b.txt"), "edited after the merge\n")?;
+        assert_refused(&p, &undo, &["b.txt"])?;
+        fs::write(repo.join("b.txt"), "B\n")?;
+
+        edit_unrelated(&p)?;
+        apply(&p, &undo, || Ok(()))?;
+        assert_eq!(git::oid(repo, "HEAD")?, reversal);
+        assert_eq!(read(&p, "a.txt")?, "a\n");
+        assert_eq!(read(&p, "gone.txt")?, "gone\n");
+        assert_eq!(read(&p, "swap")?, "file\n");
+        assert!(!repo.join("added.txt").exists());
+        assert_unrelated_kept(&p)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_retry_after_a_kill_before_any_write_keeps_unrelated_edits() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        // A kill in the Prepared phase leaves the journal and its index lock.
+        let killed = || -> Result<()> {
+            let update = Update::begin(&p.common, &plan)?;
+            std::mem::forget(update.acquire_index(&p.common, false)?);
+            Ok(())
+        };
+        edit_unrelated(&p)?;
+        fs::write(p.repo.join("b.txt"), "my own edit\n")?;
+        killed()?;
+        assert_refused(&p, &plan, &["b.txt"])?;
+
+        fs::write(p.repo.join("b.txt"), "b\n")?;
+        killed()?;
+        apply(&p, &plan, || Ok(()))?;
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.new);
+        assert_eq!(read(&p, "b.txt")?, "B\n");
+        assert_unrelated_kept(&p)?;
+        assert!(Update::load(&p.common)?.is_none());
+        assert!(!p.common.join("index.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn every_overlapping_edit_is_refused_with_its_paths() -> Result<()> {
+        type Edit = fn(&Path) -> Result<()>;
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut cases: Vec<(&str, Edit, &[&str])> = vec![
+            (
+                "unstaged",
+                |repo| Ok(fs::write(repo.join("b.txt"), "mine\n")?),
+                &["b.txt"],
+            ),
+            (
+                "staged only",
+                |repo| {
+                    fs::write(repo.join("a.txt"), "staged\n")?;
+                    git::bytes(repo, &["add", "a.txt"])?;
+                    Ok(())
+                },
+                &["a.txt"],
+            ),
+            (
+                "staged as the merged version",
+                |repo| {
+                    fs::write(repo.join("a.txt"), "A\n")?;
+                    git::bytes(repo, &["add", "a.txt"])?;
+                    fs::write(repo.join("a.txt"), "A\nunstaged\n")?;
+                    Ok(())
+                },
+                &["a.txt"],
+            ),
+            (
+                "unstaged deletion",
+                |repo| Ok(fs::remove_file(repo.join("b.txt"))?),
+                &["b.txt"],
+            ),
+            (
+                "untracked file where the merge adds one",
+                |repo| Ok(fs::write(repo.join("added.txt"), "mine\n")?),
+                &["added.txt"],
+            ),
+            (
+                "rename of a changed file",
+                |repo| {
+                    git::bytes(repo, &["mv", "b.txt", "moved.txt"])?;
+                    Ok(())
+                },
+                &["b.txt"],
+            ),
+            (
+                "file replaced by a directory",
+                |repo| {
+                    fs::remove_file(repo.join("b.txt"))?;
+                    fs::create_dir(repo.join("b.txt"))?;
+                    fs::write(repo.join("b.txt").join("inside"), "mine\n")?;
+                    Ok(())
+                },
+                &["b.txt", "b.txt/inside"],
+            ),
+            (
+                "untracked file inside a path that becomes a directory",
+                |repo| {
+                    fs::remove_file(repo.join("swap"))?;
+                    fs::create_dir(repo.join("swap"))?;
+                    fs::write(repo.join("swap").join("mine"), "mine\n")?;
+                    Ok(())
+                },
+                &["swap", "swap/mine"],
+            ),
+        ];
+        #[cfg(unix)]
+        cases.push((
+            "file replaced by a symlink",
+            |repo| {
+                fs::remove_file(repo.join("b.txt"))?;
+                std::os::unix::fs::symlink("unrelated.txt", repo.join("b.txt"))?;
+                Ok(())
+            },
+            &["b.txt"],
+        ));
+        for (name, edit, paths) in cases {
+            let (_temp, p, _lock, plan) = partial_fixture()?;
+            edit(&p.repo).with_context(|| format!("set up {name}"))?;
+            assert_refused(&p, &plan, paths).with_context(|| format!("case {name}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_case_only_spelling_of_an_added_file_is_refused_where_names_fold() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        fs::write(p.repo.join("ADDED.txt"), "mine\n")?;
+        if p.repo.join("added.txt").exists() {
+            assert_refused(&p, &plan, &["ADDED.txt"])?;
+        } else {
+            apply(&p, &plan, || Ok(()))?;
+            assert_eq!(read(&p, "ADDED.txt")?, "mine\n");
+            assert_eq!(read(&p, "added.txt")?, "added\n");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_edit_made_while_the_merge_publishes_is_refused_before_any_write() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        let index = fs::read(p.common.join("index"))?;
+        let error = apply(&p, &plan, || {
+            fs::write(p.repo.join("b.txt"), "edited during the merge\n")?;
+            Ok(())
+        })
+        .unwrap_err();
+        let reported = crate::api::error_json(&error);
+        assert_eq!(reported["code"], "destination_has_local_changes");
+        assert_eq!(reported["details"]["paths"], json!(["b.txt"]));
+        assert_eq!(read(&p, "b.txt")?, "edited during the merge\n");
+        assert_eq!(read(&p, "a.txt")?, "a\n");
+        assert!(!p.repo.join("added.txt").exists());
+        assert_eq!(fs::read(p.common.join("index"))?, index);
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.old);
+        assert!(Update::load(&p.common)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_modified_submodule_blocks_only_a_merge_that_moves_it() -> Result<()> {
+        let (_temp, p, _lock, _plan) = fixture("files")?;
+        let repo = &p.repo;
+        // A nested repository the primary tracks as a gitlink.
+        let sub = repo.join("sub");
+        fs::create_dir(&sub)?;
+        git::bytes(&sub, &["init", "-q", "--template=", "-b", "main"])?;
+        for (key, value) in [
+            ("user.name", "Checkout Fixture"),
+            ("user.email", "checkout@example.invalid"),
+            ("commit.gpgsign", "false"),
+        ] {
+            git::bytes(&sub, &["config", key, value])?;
+        }
+        fs::write(sub.join("lib.txt"), "one\n")?;
+        git::bytes(&sub, &["add", "lib.txt"])?;
+        git::bytes(&sub, &["commit", "-qm", "one"])?;
+        let first = git::oid(&sub, "HEAD")?;
+        fs::write(sub.join("lib.txt"), "two\n")?;
+        git::bytes(&sub, &["commit", "-qam", "two"])?;
+        let second = git::oid(&sub, "HEAD")?;
+        git::bytes(&sub, &["switch", "-q", "--detach", &first])?;
+        git::bytes(
+            repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{first},sub"),
+            ],
+        )?;
+        git::bytes(repo, &["commit", "-qm", "track sub"])?;
+        let tracked = git::oid(repo, "HEAD")?;
+        git::bytes(
+            repo,
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{second},sub"),
+            ],
+        )?;
+        git::bytes(repo, &["commit", "-qm", "move sub"])?;
+        let moved = git::oid(repo, "HEAD")?;
+        git::bytes(repo, &["reset", "-q", &tracked])?;
+        fs::write(sub.join("lib.txt"), "local edit\n")?;
+
+        let bump = Plan {
+            target: "main".into(),
+            old: tracked.clone(),
+            tip: moved.clone(),
+            new: moved.clone(),
+        };
+        assert_refused(&p, &bump, &["sub"])?;
+        assert_eq!(fs::read_to_string(sub.join("lib.txt"))?, "local edit\n");
+
+        // A merge that leaves the gitlink alone goes ahead around it.
+        git::bytes(repo, &["switch", "-qc", "beside", &tracked])?;
+        fs::write(repo.join("beside.txt"), "beside\n")?;
+        git::bytes(repo, &["add", "beside.txt"])?;
+        git::bytes(repo, &["commit", "-qm", "beside"])?;
+        let beside = git::oid(repo, "HEAD")?;
+        git::bytes(repo, &["switch", "-q", "main"])?;
+        apply(
+            &p,
+            &Plan {
+                target: "main".into(),
+                old: tracked,
+                tip: beside.clone(),
+                new: beside.clone(),
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(git::oid(repo, "HEAD")?, beside);
+        assert_eq!(fs::read_to_string(sub.join("lib.txt"))?, "local edit\n");
+        assert_eq!(git::oid(&sub, "HEAD")?, first);
         Ok(())
     }
 
@@ -1149,12 +1580,12 @@ mod tests {
         };
         drop(interrupt(&p, &plan)?);
         edit_primary(&p)?;
-        // The interrupted update is reversed first. The new merge then sees
-        // the person's edits and, as for any merge, leaves them alone.
-        let error = apply(&p, &other, || Ok(())).unwrap_err();
-        assert!(format!("{error:#}").contains("local changes"), "{error:#}");
+        // The interrupted update is reversed first. The new merge then
+        // applies around the person's edits, none of which it changes.
+        apply(&p, &other, || Ok(()))?;
         assert!(Update::load(&p.common)?.is_none());
-        assert_eq!(git::oid(repo, "HEAD")?, plan.old);
+        assert_eq!(git::oid(repo, "HEAD")?, second);
+        assert_eq!(read(&p, "second.txt")?, "second\n");
         assert_eq!(read(&p, "a.txt")?, "a\n");
         assert_eq!(read(&p, "b.txt")?, "b\n");
         assert_eq!(read(&p, "gone.txt")?, "gone\n");
@@ -1163,16 +1594,6 @@ mod tests {
         assert_primary_edits_kept(&p)?;
         let changed = git::text(repo, &["diff", "--name-only"])?;
         assert_eq!(changed, "unrelated.txt");
-
-        git::bytes(repo, &["rm", "-q", "--cached", "staged.txt"])?;
-        for name in ["staged.txt", "untracked.txt"] {
-            fs::remove_file(repo.join(name))?;
-        }
-        fs::write(repo.join("unrelated.txt"), "unrelated\n")?;
-        apply(&p, &other, || Ok(()))?;
-        assert_eq!(git::oid(repo, "HEAD")?, second);
-        assert_eq!(read(&p, "second.txt")?, "second\n");
-        assert_eq!(read(&p, "ignored/later")?, "later ignored\n");
         Ok(())
     }
 

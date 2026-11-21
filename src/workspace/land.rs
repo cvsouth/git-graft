@@ -889,26 +889,13 @@ mod tests {
             &["config", "branch.main.mergeOptions", "--abort"],
         );
 
+        // An edit to a path the merge leaves alone stays through it, so
+        // only the untracked file in the incoming path is refused.
         write(&fixture.p.repo, "base.txt", "keep tracked edit\n");
-        assert!(
-            apply(&fixture.p, &plan)
-                .unwrap_err()
-                .to_string()
-                .contains("local changes")
-        );
-        assert_eq!(
-            fs::read_to_string(fixture.p.repo.join("base.txt")).unwrap(),
-            "keep tracked edit\n"
-        );
-        write(&fixture.p.repo, "base.txt", "base\n");
-
         write(&fixture.p.repo, "collision.txt", "keep untracked file\n");
-        assert!(
-            apply(&fixture.p, &plan)
-                .unwrap_err()
-                .to_string()
-                .contains("local changes")
-        );
+        let error = crate::api::error_json(&apply(&fixture.p, &plan).unwrap_err());
+        assert_eq!(error["code"], "destination_has_local_changes", "{error}");
+        assert_eq!(error["details"]["paths"], json!(["collision.txt"]));
         write(
             &fixture.p.repo,
             ".git/info/exclude",
@@ -931,6 +918,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(fixture.p.repo.join("noncollision.txt")).unwrap(),
             "keep untracked file\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.p.repo.join("base.txt")).unwrap(),
+            "keep tracked edit\n"
         );
         assert_eq!(
             fs::read_to_string(fixture.p.repo.join("collision.txt")).unwrap(),
