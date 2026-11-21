@@ -84,7 +84,7 @@ fn materialize<F: FnOnce() -> Result<()>>(
     oid: &str,
     sparse: &[String],
     primary: &Path,
-    mut metadata: CheckoutMetadata<'_>,
+    metadata: CheckoutMetadata<'_>,
     ready: F,
 ) -> Result<Value> {
     // Blob sizes only depend on object IDs, and the primary's index listing
@@ -92,6 +92,7 @@ fn materialize<F: FnOnce() -> Result<()>>(
     // both while the workspace index is prepared.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     return std::thread::scope(|scope| {
+        let mut metadata = metadata;
         let known = metadata.sizes.take();
         let early = Early {
             sizes: metadata.index.map(|manifest| {

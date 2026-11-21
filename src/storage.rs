@@ -24,10 +24,11 @@ mod index_stat;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use index_stat::subsecond_changes;
 
-/// Whether an open file carries no flags or user extended attributes.
+/// Whether the entry at `path`, whose stat flags are `flags`, carries no
+/// flags or user extended attributes. The path is not followed.
 #[cfg(target_os = "macos")]
-pub(crate) fn plain_file(file: &std::fs::File, metadata: &std::fs::Metadata) -> bool {
-    native::plain(file, metadata).unwrap_or(false)
+pub(crate) fn plain_path(path: &std::ffi::CStr, flags: u32) -> bool {
+    native::plain_at(path, flags).unwrap_or(false)
 }
 mod local;
 mod tip_index;

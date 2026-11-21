@@ -547,21 +547,11 @@ pub(super) fn plain(file: &File, metadata: &Metadata) -> io::Result<bool> {
         if metadata.st_flags() != 0 {
             return Ok(false);
         }
-        // APFS copies xattrs and forks. macOS assigns the protected
-        // provenance attribute itself. Reject any user-controlled metadata.
         let mut names = [0; 128];
         let length = unsafe {
             libc::flistxattr(file.as_raw_fd(), names.as_mut_ptr().cast(), names.len(), 0)
         };
-        if length < 0 {
-            let error = io::Error::last_os_error();
-            return if error.raw_os_error() == Some(libc::ERANGE) {
-                Ok(false)
-            } else {
-                Err(error)
-            };
-        }
-        Ok(length == 0 || names.get(..length as usize) == Some(b"com.apple.provenance\0"))
+        plain_attributes(length, &names)
     }
     #[cfg(target_os = "linux")]
     {
@@ -569,6 +559,41 @@ pub(super) fn plain(file: &File, metadata: &Metadata) -> io::Result<bool> {
         let _ = (file, metadata);
         Ok(true)
     }
+}
+
+/// Whether the file at `path`, not followed, with stat flags `flags`,
+/// carries no flags or user extended attributes, without opening it.
+#[cfg(target_os = "macos")]
+pub(super) fn plain_at(path: &CStr, flags: u32) -> io::Result<bool> {
+    if flags != 0 {
+        return Ok(false);
+    }
+    let mut names = [0; 128];
+    let length = unsafe {
+        libc::listxattr(
+            path.as_ptr(),
+            names.as_mut_ptr().cast(),
+            names.len(),
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    plain_attributes(length, &names)
+}
+
+/// Judge a listing of `length` bytes of extended attribute names.
+#[cfg(target_os = "macos")]
+fn plain_attributes(length: isize, names: &[u8]) -> io::Result<bool> {
+    // APFS copies xattrs and forks. macOS assigns the protected
+    // provenance attribute itself. Reject any user-controlled metadata.
+    if length < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ERANGE) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(length == 0 || names.get(..length as usize) == Some(b"com.apple.provenance\0"))
 }
 
 fn unlink_at(parent: &File, name: &CStr) -> io::Result<()> {

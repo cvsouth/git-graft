@@ -520,19 +520,28 @@ impl Source {
             source.stamp()? == listing.stamp && names.iter().eq(listing.entries.keys()),
             "Git object directory changed during cloning"
         );
+        // Opening each fresh clone costs more than the clone itself, so the
+        // checks read its stat and attribute names by path. A clone has no
+        // data to write back: its blocks are the donor's, and APFS commits
+        // the cloned entries' metadata with the directory synced below.
         let mut totals = Totals::default();
+        let mut path = target.as_os_str().as_bytes().to_vec();
+        path.push(b'/');
+        let prefix = path.len();
         for (filename, entry) in &listing.entries {
-            let file = cloned.open(filename, libc::O_RDONLY | libc::O_NONBLOCK)?;
-            let metadata = file.metadata()?;
+            let info = cloned.stat(filename)?;
+            let stamp = Stamp::from_stat(info);
+            path.truncate(prefix);
+            path.extend_from_slice(filename.as_bytes());
+            let path = CString::new(path.as_slice())?;
             ensure!(
-                metadata.is_file()
-                    && metadata.len() == entry.size
-                    && (metadata.dev(), metadata.ino()) != (entry.device, entry.inode)
-                    && metadata.nlink() == 1
-                    && crate::storage::plain_file(&file, &metadata),
+                stamp.regular()
+                    && stamp.size == entry.size
+                    && (stamp.device, stamp.inode) != (entry.device, entry.inode)
+                    && info.st_nlink == 1
+                    && crate::storage::plain_path(&path, info.st_flags),
                 "Git object changed during cloning"
             );
-            sync_snapshot_entry(&file)?;
             totals.add(Kind::Loose, filename, entry.size);
         }
         sync_snapshot_entry(&cloned.0)?;
@@ -719,25 +728,26 @@ impl Directory {
     }
 
     fn entry(&self, name: &OsStr) -> io::Result<Option<Stamp>> {
+        match self.stat(name) {
+            Ok(info) => Ok(Some(Stamp::from_stat(info))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Stat `name` without following a symbolic link.
+    fn stat(&self, name: &OsStr) -> io::Result<libc::stat> {
         let name = CString::new(name.as_bytes())?;
         let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe {
+        os_result(unsafe {
             libc::fstatat(
                 self.0.as_raw_fd(),
                 name.as_ptr(),
                 info.as_mut_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
             )
-        } == 0
-        {
-            return Ok(Some(Stamp::from_stat(unsafe { info.assume_init() })));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            Ok(None)
-        } else {
-            Err(error)
-        }
+        })?;
+        Ok(unsafe { info.assume_init() })
     }
 
     fn required_regular(&self, name: &OsStr) -> Result<Stamp> {
