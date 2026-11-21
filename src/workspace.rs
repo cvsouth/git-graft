@@ -284,7 +284,7 @@ struct Creation<'a> {
 
 /// Build the reserved graft `r` and mark it active. The caller holds the
 /// graft's workspace lock. A `resumed` creation first reclaims what an
-/// interrupted attempt left, when it never published a checkout. If building
+/// interrupted attempt left; see [`creation::restart`]. If building
 /// stops, the graft keeps an index lock so Git cannot use it while it is
 /// incomplete.
 fn create(
@@ -299,8 +299,8 @@ fn create(
     registry::verify(p, r)?;
     crate::trace::mark("verify reservation");
     let built = (|| -> Result<()> {
-        if resumed && creation::progress(&r.path)? == creation::Progress::Unpublished {
-            creation::reclaim(&r.path)?;
+        if resumed {
+            creation::restart(&r.path, c.base)?;
         }
         let (objects, prepared_checkout) = objects::initialize(
             source, &r.path, &p.state, c.base, c.branch, c.history, proof,
@@ -354,9 +354,10 @@ fn incomplete(r: &Record, message: String, recovery: &str) -> anyhow::Error {
 }
 
 /// Restore an archived graft. A creation archived before it finished is
-/// finished here when it never published a checkout. When it stopped partway
-/// through writing checkout files, it stays guarded and is reported as
-/// incomplete, so it can be archived again.
+/// built again when what it left can be reclaimed: no index was published,
+/// and every checkout file still matches its commit. Otherwise it is restored
+/// as it was, still pending and guarded by Graft's index lock, and the
+/// reply's `incomplete` says why and how to archive it again.
 fn restore(p: &Project, name: &str, lease: &str) -> Result<Value> {
     let restored = registry::restore(p, name, lease)?;
     if restored.status != Status::Pending {
@@ -364,41 +365,37 @@ fn restore(p: &Project, name: &str, lease: &str) -> Result<Value> {
     }
     let _lock = registry::workspace_lock(p, name)?;
     let mut r = registry::authenticate(p, name, &restored.lease)?;
+    registry::verify(p, &r)?;
     if r.status != Status::Pending {
-        registry::verify(p, &r)?;
         return Ok(with_lease(&r));
     }
-    registry::verify(p, &r)?;
-    let archive_again = "Run remove with --discard and this lease to archive it again.";
-    let unfinished = |r: &Record, why: &str| {
-        creation::guard(&r.path)?;
-        Err(incomplete(
-            r,
-            format!("The restored graft's creation never finished: {why}"),
-            archive_again,
-        ))
-    };
-    match creation::progress(&r.path)? {
-        creation::Progress::Published => {
-            // Git published the checkout before the creation stopped.
-            creation::release(&r.path)?;
-            return Ok(with_lease(&r));
-        }
-        creation::Progress::Partial => {
-            return unfinished(&r, "its checkout stopped partway, so it was kept");
-        }
-        creation::Progress::Unpublished => {}
+    if creation::progress(&r.path)? == creation::Progress::Published {
+        // Git published the checkout before the creation stopped.
+        creation::release(&r.path)?;
+        return Ok(with_lease(&r));
     }
+    if let Err(error) = finish_restored(p, &mut r) {
+        creation::guard(&r.path)?;
+        let mut value = with_lease(&r);
+        value["incomplete"] = json!({
+            "reason": format!("The graft's creation never finished: {error:#}"),
+            "recovery": "Graft keeps the graft's index lock, so Git cannot commit its missing files as deletions. Run remove with --discard and this lease to archive it again.",
+        });
+        return Ok(value);
+    }
+    Ok(with_lease(&r))
+}
+
+/// Build a restored creation again from its recorded add options.
+fn finish_restored(p: &Project, r: &mut Record) -> Result<()> {
     let mut request = r.request.clone();
-    let Some(options) = request.as_object_mut() else {
-        return unfinished(&r, "its add options were not recorded");
-    };
+    let options = request
+        .as_object_mut()
+        .context("its add options were not recorded")?;
     options.remove("project_local_history");
     options.remove("project_history");
-    let args: Spawn = match serde_json::from_value(request) {
-        Ok(args) => args,
-        Err(_) => return unfinished(&r, "its add options could not be read"),
-    };
+    let args: Spawn =
+        serde_json::from_value(request).context("its add options could not be read")?;
     let history = args.history.unwrap_or_else(|| recorded_history(&r.request));
     let (base, branch) = (r.base.clone(), r.branch.clone());
     let creation = Creation {
@@ -410,16 +407,8 @@ fn restore(p: &Project, name: &str, lease: &str) -> Result<Value> {
         no_deps: args.no_deps,
         locked: args.lock.then(|| args.reason.clone().unwrap_or_default()),
     };
-    let built = objects::preflight(&p.repo)
-        .and_then(|source| create(p, &p.repo, &source, &mut r, &creation, None, true));
-    if let Err(error) = built {
-        return Err(incomplete(
-            &r,
-            format!("Finishing the restored graft stopped: {error:#}"),
-            archive_again,
-        ));
-    }
-    Ok(with_lease(&r))
+    let source = objects::preflight(&p.repo)?;
+    create(p, &p.repo, &source, r, &creation, None, true)
 }
 
 fn clean(path: &Path, allow_ignored: bool) -> Result<()> {
