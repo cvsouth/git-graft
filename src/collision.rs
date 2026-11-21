@@ -39,7 +39,8 @@ pub(crate) fn ignored_collision<'a>(
 /// changed path, lies inside one or holds one, compared both as Git path
 /// bytes and as the files the filesystem resolves them to. Byte comparison
 /// covers an edit that removed its file; the filesystem covers a case-only or
-/// Unicode spelling of an existing file. Returned in `edited` order.
+/// Unicode spelling of an existing file. An edited path may end in `/`, as
+/// Git names an untracked nested repository. Returned in `edited` order.
 pub(crate) fn overlapping<'e>(
     root: &Path,
     edited: &[&'e [u8]],
@@ -49,8 +50,12 @@ pub(crate) fn overlapping<'e>(
         return Ok(Vec::new());
     }
     let changes: BTreeSet<&[u8]> = changed.iter().copied().collect();
+    let paths: Vec<&[u8]> = edited
+        .iter()
+        .map(|path| path.strip_suffix(b"/").unwrap_or(path))
+        .collect();
     let mut found = BTreeSet::new();
-    for (index, path) in edited.iter().enumerate() {
+    for (index, path) in paths.iter().enumerate() {
         let mut inside = path.to_vec();
         inside.push(b'/');
         let holds = changes
@@ -61,7 +66,7 @@ pub(crate) fn overlapping<'e>(
             found.insert(index);
         }
     }
-    for (index, _) in resolved_collisions(root, edited, changed, false)? {
+    for (index, _) in resolved_collisions(root, &paths, changed, false)? {
         found.insert(index);
     }
     Ok(found.into_iter().map(|index| edited[index]).collect())
@@ -243,12 +248,21 @@ mod tests {
             b"gone.txt",
             b"tree",
             b"treehouse",
+            // An untracked nested repository, as Git names it.
+            b"nested/",
         ];
+        let changed = [changed, &[b"nested/file"]].concat();
         assert_eq!(
-            overlapping(root, edited, changed)?,
-            [&b"dir/mine"[..], b"edited.txt", b"gone.txt", b"tree"]
+            overlapping(root, edited, &changed)?,
+            [
+                &b"dir/mine"[..],
+                b"edited.txt",
+                b"gone.txt",
+                b"tree",
+                b"nested/"
+            ]
         );
-        assert!(overlapping(root, &[], changed)?.is_empty());
+        assert!(overlapping(root, &[], &changed)?.is_empty());
         Ok(())
     }
 
