@@ -357,14 +357,59 @@ fn create(
     Ok(())
 }
 
-fn clean(path: &Path, allow_ignored: bool) -> Result<()> {
+/// Which command checks that a graft holds no unrecorded work.
+#[derive(Clone, Copy)]
+enum Retiring {
+    Merge,
+    Remove,
+}
+
+/// Most changed paths a `local_changes` refusal names.
+const LISTED_CHANGES: usize = 200;
+
+/// Refuse to archive a graft whose files hold work Git has not recorded:
+/// staged, unstaged and untracked changes and, unless `allow_ignored`,
+/// ignored files. The refusal is `local_changes`, naming each path with its
+/// status, and touches nothing. `remove --discard` would archive every one of
+/// these files with the rest of the graft, so `discard_archives` is always
+/// true: Graft never deletes them.
+fn clean(path: &Path, allow_ignored: bool, retiring: Retiring) -> Result<()> {
     git::check_idle(path)?;
-    let changes = git::changes(path)?;
-    ensure!(
-        changes.iter().all(|c| allow_ignored && c.status == "!!"),
-        "graft has local changes or ignored files; its files and index have been retained"
-    );
-    Ok(())
+    let found: Vec<_> = git::changes(path)?
+        .into_iter()
+        .filter(|change| !(allow_ignored && change.status == "!!"))
+        .collect();
+    if found.is_empty() {
+        return Ok(());
+    }
+    let paths: Vec<_> = found
+        .iter()
+        .take(LISTED_CHANGES)
+        .map(|change| {
+            let status = match change.status.as_str() {
+                "??" => "untracked",
+                "!!" => "ignored",
+                _ => "modified",
+            };
+            json!({"path": change.path, "status": status})
+        })
+        .collect();
+    let remedy = match retiring {
+        Retiring::Merge => {
+            "Commit them in the graft and retry the merge. Its files and index have been retained"
+        }
+        Retiring::Remove => {
+            "Commit or merge them, or archive the graft with them using remove --discard and keep the recovery lease. Its files and index have been retained"
+        }
+    };
+    Err(api::fault(
+        "local_changes",
+        format!(
+            "The graft has {} local changes or ignored files. {remedy}",
+            found.len()
+        ),
+        json!({"paths": paths, "count": found.len(), "discard_archives": true}),
+    ))
 }
 
 /// What an archive did. A merge receipt says every commit of the graft was
@@ -487,7 +532,7 @@ fn land_workspace(p: &Project, opts: &api::Land) -> Result<Value> {
         plan
     };
     let apply = || -> Result<()> {
-        clean(&r.path, opts.discard_ignored)?;
+        clean(&r.path, opts.discard_ignored, Retiring::Merge)?;
         ensure!(
             git::oid(&r.path, "HEAD")? == plan.tip,
             "graft HEAD changed during merge"
@@ -508,7 +553,7 @@ fn land_workspace(p: &Project, opts: &api::Land) -> Result<Value> {
     if git::oid(&r.path, "HEAD")? != plan.tip {
         return keep_advanced(p, r);
     }
-    clean(&r.path, opts.discard_ignored)?;
+    clean(&r.path, opts.discard_ignored, Retiring::Merge)?;
     retire(p, &r.name, &r.lease, Status::Landed)
 }
 
@@ -572,7 +617,7 @@ fn drop_workspace(p: &Project, opts: &api::DropWorkspace) -> Result<Value> {
                 r.status == Status::Active,
                 "partial graft requires --discard to archive"
             );
-            clean(&r.path, false)?;
+            clean(&r.path, false, Retiring::Remove)?;
             registry::require_merged(&r, &p.repo)?;
         }
     }
@@ -817,5 +862,63 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             runtime.install(&a.manager, &a.packages, a.offline, attached)
         }
         _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_changes_name_each_path_with_its_status() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path();
+        git::bytes(repo, &["init", "-q", "--template=", "-b", "main"])?;
+        for (key, value) in [
+            ("user.name", "Clean Fixture"),
+            ("user.email", "clean@example.invalid"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", "disabled-hooks"),
+        ] {
+            git::bytes(repo, &["config", key, value])?;
+        }
+        std::fs::write(repo.join(".gitignore"), "build/\n")?;
+        std::fs::write(repo.join("tracked.txt"), "tracked\n")?;
+        git::bytes(repo, &["add", "-A"])?;
+        git::bytes(repo, &["commit", "-qm", "base"])?;
+        clean(repo, false, Retiring::Remove)?;
+
+        std::fs::write(repo.join("tracked.txt"), "edited\n")?;
+        std::fs::write(repo.join("notes.txt"), "untracked\n")?;
+        std::fs::create_dir(repo.join("build"))?;
+        std::fs::write(repo.join("build").join("out"), "ignored\n")?;
+        let error = api::error_json(&clean(repo, false, Retiring::Remove).unwrap_err());
+        assert_eq!(error["code"], "local_changes", "{error}");
+        assert_eq!(
+            error["details"],
+            json!({"paths": [
+                {"path": "tracked.txt", "status": "modified"},
+                {"path": "notes.txt", "status": "untracked"},
+                {"path": "build/", "status": "ignored"},
+            ], "count": 3, "discard_archives": true})
+        );
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("remove --discard")),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt"))?,
+            "edited\n"
+        );
+
+        // A merge allowed to archive ignored files still names the others.
+        let error = api::error_json(&clean(repo, true, Retiring::Merge).unwrap_err());
+        assert_eq!(error["details"]["count"], 2, "{error}");
+        std::fs::write(repo.join("tracked.txt"), "tracked\n")?;
+        std::fs::remove_file(repo.join("notes.txt"))?;
+        clean(repo, true, Retiring::Merge)?;
+        Ok(())
     }
 }
