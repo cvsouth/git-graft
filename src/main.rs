@@ -22,10 +22,32 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 
+/// The workflow, leases and output format, shown after the command list so
+/// a person or an agent can start from `git graft --help` alone.
+const OVERVIEW: &str = "\
+Workflow:
+  git graft add fix-parser                               Create a graft; prints its path and lease
+  cd ../<repo>.graft/fix-parser                          Edit, test and commit with ordinary Git
+  git graft merge fix-parser --lease <lease>             Merge into main and archive the graft
+  git graft restore fix-parser --lease <recovery_lease>  Reopen an archived graft
+
+Leases:
+  `add` returns a lease, a secret that proves the graft is yours. Commands that
+  change a graft need it, through --lease or the GIT_GRAFT_LEASE environment
+  variable. Archiving returns a recovery_lease; `restore` takes it and returns a
+  new lease. Keep leases out of logs.
+
+Output:
+  Every command prints JSON. A failure exits non-zero and prints a JSON error
+  whose \"code\" field names the problem, such as unmerged_work or workspace_busy.
+
+Run `git graft <command> --help` for a command's options and examples.";
+
 #[derive(Parser)]
 #[command(
     version,
-    about = "Run many coding agents on one repository without filling your disk. A faster, lighter replacement for git worktree."
+    about = "Run many coding agents on one repository without filling your disk. A faster, lighter replacement for git worktree.",
+    after_help = OVERVIEW
 )]
 struct Cli {
     /// Repository checkout (or a subdirectory of it) whose grafts to manage.
@@ -120,6 +142,12 @@ mod tests {
         man.render_description_section(&mut page)?;
         man.render_options_section(&mut page)?;
         let roff = |text: &str| text.replace('\\', "\\\\").replace('-', "\\-");
+        // The same overview `git-graft --help` prints, kept preformatted.
+        writeln!(page, ".SH OVERVIEW\n.nf")?;
+        for line in super::OVERVIEW.lines() {
+            writeln!(page, "{}", roff(line).replace('\'', "\\(aq"))?;
+        }
+        writeln!(page, ".fi")?;
         writeln!(page, ".SH COMMANDS")?;
         for sub in command.get_subcommands().filter(|sub| !sub.is_hide_set()) {
             let about = sub.get_about().map(ToString::to_string).unwrap_or_default();
@@ -132,7 +160,7 @@ mod tests {
         }
         writeln!(
             page,
-            ".PP\nRun \\fBgit graft\\fR \\fICOMMAND\\fR \\fB\\-\\-help\\fR for a command's options."
+            ".PP\nRun \\fBgit graft\\fR \\fICOMMAND\\fR \\fB\\-\\-help\\fR for a command's options and examples."
         )?;
         writeln!(
             page,
