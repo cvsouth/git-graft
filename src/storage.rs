@@ -34,6 +34,8 @@ mod tip_index;
 pub(crate) use tip_index::TipIndex;
 pub(crate) use tip_index::object_digest;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+mod eol;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod native;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod verify;
@@ -734,26 +736,73 @@ fn conversion_reason(checkout: &mut Checkout<'_>) -> Result<Option<&'static str>
     ) else {
         return Ok(Some("cannot inspect committed attributes"));
     };
-    if conversions.contains(&Conversion::Git) {
+    if conversions.iter().any(|conversion| conversion.git) {
         return Ok(Some("path-dependent checkout conversion"));
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        checkout.may_convert_eol |= conversions
-            .iter()
-            .any(|c| matches!(c, Conversion::Text | Conversion::Eol | Conversion::Lf));
+        checkout.may_convert_eol |= conversions.iter().any(Conversion::line_endings);
     }
     Ok(None)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Conversion {
-    Raw,
-    Text,
-    Eol,
-    // Explicit LF suppresses checkout CRLF expansion, including text=auto.
+/// A `text`, `crlf` or `eol` attribute value as `git check-attr` prints it.
+/// Git gives meaning only to these values; any other string is undefined.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Attribute {
+    #[default]
+    Unspecified,
+    /// Set, or the literal string `set`, which check-attr prints alike.
+    Set,
+    /// Unset, or the literal string `unset`.
+    Unset,
+    Input,
+    Auto,
     Lf,
-    Git,
+    Crlf,
+}
+
+impl Attribute {
+    fn parse(value: &[u8]) -> Self {
+        match value {
+            b"set" => Self::Set,
+            b"unset" => Self::Unset,
+            b"input" => Self::Input,
+            b"auto" => Self::Auto,
+            b"lf" => Self::Lf,
+            b"crlf" => Self::Crlf,
+            _ => Self::Unspecified,
+        }
+    }
+}
+
+/// The checkout conversion attributes of one path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Conversion {
+    /// A `filter`, `ident` or `working-tree-encoding` attribute applies, in
+    /// any state, so only Git can convert the path.
+    git: bool,
+    text: Attribute,
+    crlf: Attribute,
+    eol: Attribute,
+}
+
+impl Conversion {
+    fn set(&mut self, name: &[u8], value: &[u8]) {
+        match name {
+            b"filter" | b"ident" | b"working-tree-encoding" => self.git = true,
+            b"text" => self.text = Attribute::parse(value),
+            b"crlf" => self.crlf = Attribute::parse(value),
+            b"eol" => self.eol = Attribute::parse(value),
+            _ => {}
+        }
+    }
+
+    /// Whether a line-ending attribute applies.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn line_endings(&self) -> bool {
+        [self.text, self.crlf, self.eol] != [Attribute::Unspecified; 3]
+    }
 }
 
 /// Where `git check-attr` reads `.gitattributes` files from.
@@ -764,10 +813,6 @@ enum AttributeSource<'a> {
     /// The command's index.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     Index,
-    /// The command's own checkout: its working tree's files, falling back to
-    /// its index as Git's own clean and status do.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    Worktree,
 }
 
 // --all omits absent attributes, so a filter literally named "unspecified"
@@ -788,17 +833,13 @@ fn checkout_conversions<'a>(
         AttributeSource::Index => {
             command.arg("--cached");
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        AttributeSource::Worktree => {
-            command.env_remove("GIT_ATTR_SOURCE");
-        }
     }
     let output = crate::git::bounded_stdout(
         command.stdin(Stdio::from(path_input(files.clone())?)),
         16 * 1024 * 1024,
     )?;
     if output.is_empty() {
-        return Ok(vec![Conversion::Raw; files.count()]);
+        return Ok(vec![Conversion::default(); files.count()]);
     }
     let mut paths = std::collections::HashMap::new();
     let mut fields = output
@@ -808,22 +849,13 @@ fn checkout_conversions<'a>(
     while let Some(path) = fields.next() {
         let attr = fields.next().context("missing checkout attribute")?;
         let value = fields.next().context("missing checkout attribute value")?;
-        let conversion = match attr {
-            b"filter" | b"ident" | b"working-tree-encoding" => Conversion::Git,
-            b"eol" if value == b"lf" => Conversion::Lf,
-            b"text" | b"crlf" => Conversion::Text,
-            b"eol" => Conversion::Eol,
-            _ => continue,
-        };
-        let current = paths.entry(path).or_insert(Conversion::Raw);
-        *current = conversion.max(*current);
+        paths
+            .entry(path)
+            .or_insert_with(Conversion::default)
+            .set(attr, value);
     }
     let conversions = files
-        .map(|entry| {
-            paths
-                .remove(entry.name.as_slice())
-                .unwrap_or(Conversion::Raw)
-        })
+        .map(|entry| paths.remove(entry.name.as_slice()).unwrap_or_default())
         .collect();
     ensure!(paths.is_empty(), "unexpected path in checkout attributes");
     Ok(conversions)
@@ -1497,32 +1529,14 @@ pub fn doctor(state: &Path) -> Result<Value> {
     )
 }
 
-/// Whether new grafts of `checkout` can share its files' data blocks, and if not,
-/// why and how to fix it. A filesystem without cloning or a setting that makes Git
-/// rewrite line endings at checkout means every file is written in full.
-/// `core.autocrlf=true` does not: files the primary checked out under it are
-/// shared once their CRLF bytes are proven (see `local::direct::Written`).
-pub fn file_sharing(checkout: &Path, native_clone: bool) -> Value {
-    if !native_clone {
-        return json!({"shared": false, "reason": "the filesystem cannot clone files"});
-    }
-    let setting = |key: &str| {
-        crate::git::text(checkout, &["config", "--get", key])
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase())
-    };
-    let autocrlf = setting("core.autocrlf");
-    let rewrites = match autocrlf.as_deref() {
-        Some("true" | "input") => None,
-        _ => (setting("core.eol").as_deref() == Some("crlf")).then_some("core.eol=crlf"),
-    };
-    match rewrites {
-        Some(setting) => json!({
-            "shared": false,
-            "reason": format!("{setting} makes Git rewrite line endings at checkout"),
-            "fix": "git config --global core.autocrlf input",
-        }),
-        None => json!({"shared": true}),
+/// Whether new grafts can share the primary's file data blocks, and if not, why.
+/// Line-ending settings no longer stop sharing: a graft mirrors the primary's
+/// line endings wherever Git's clean of a file gives its blob (see `eol`).
+pub fn file_sharing(native_clone: bool) -> Value {
+    if native_clone {
+        json!({"shared": true})
+    } else {
+        json!({"shared": false, "reason": "the filesystem cannot clone files"})
     }
 }
 
@@ -1544,18 +1558,9 @@ mod tests {
     }
 
     #[test]
-    fn file_sharing_reports_line_ending_rewrites() {
-        let (_temp, repo, _) = fixture();
-        assert_eq!(file_sharing(&repo, false)["shared"], false);
-        command(&repo, &["config", "core.autocrlf", "input"]);
-        assert_eq!(file_sharing(&repo, true)["shared"], true);
-        command(&repo, &["config", "core.autocrlf", "true"]);
-        assert_eq!(file_sharing(&repo, true)["shared"], true);
-        command(&repo, &["config", "core.autocrlf", "false"]);
-        command(&repo, &["config", "core.eol", "crlf"]);
-        let report = file_sharing(&repo, true);
-        assert_eq!(report["shared"], false);
-        assert_eq!(report["fix"], "git config --global core.autocrlf input");
+    fn file_sharing_depends_only_on_cloning() {
+        assert_eq!(file_sharing(false)["shared"], false);
+        assert_eq!(file_sharing(true)["shared"], true);
     }
 
     #[test]
@@ -1566,7 +1571,7 @@ mod tests {
         command(&workspace, &["init", "-q"]);
         fs::write(workspace.join(".git/HEAD"), format!("{oid}\n")).unwrap();
         // Force the native path regardless of filesystem cloning support.
-        command(&workspace, &["config", "core.autocrlf", "true"]);
+        command(&workspace, &["config", "core.sparseCheckout", "true"]);
         let mut calls = 0;
         let result = materialize_planned(
             &workspace,
@@ -1869,11 +1874,11 @@ mod tests {
     }
 
     /// A file rewritten with LF endings and staged again is clean to Git
-    /// under autocrlf=true, and its bytes hash to the blob, but Git's
-    /// checkout writes CRLF.
+    /// under autocrlf=true, so the graft mirrors it although Git's own
+    /// checkout would write CRLF, and its first status reads no contents.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn local_does_not_reuse_clean_lf_files_git_would_expand() {
+    fn local_mirrors_clean_lf_files_git_would_expand() {
         let (temp, repo, _) = fixture();
         fs::create_dir(repo.join("docs")).unwrap();
         for index in 0..10 {
@@ -1907,24 +1912,33 @@ mod tests {
         assert_eq!(fs::read(donor.join("sub/file")).unwrap(), b"committed\n");
         let result =
             materialize_local(&workspace, &temp.path().join("state"), &oid, &[], &donor).unwrap();
-        assert_eq!(
-            fs::read(workspace.join("sub/file")).unwrap(),
-            b"committed\r\n"
-        );
-        assert_eq!(fs::read(workspace.join("docs/3.txt")).unwrap(), b"3\r\n");
+        let shared = probe(&donor, &workspace).unwrap();
+        let mirrored = |name: &str, git: &[u8]| {
+            let bytes = fs::read(workspace.join(name)).unwrap();
+            if shared {
+                assert_eq!(bytes, fs::read(donor.join(name)).unwrap(), "{name}");
+            } else {
+                assert_eq!(bytes, git, "{name}");
+            }
+        };
+        mirrored("sub/file", b"committed\r\n");
         for index in 0..10 {
             let name = format!("docs/{index}.txt");
-            let expected = format!("{index}\r\n");
-            assert_eq!(
-                fs::read(workspace.join(&name)).unwrap(),
-                expected.as_bytes()
-            );
+            mirrored(&name, format!("{index}\r\n").as_bytes());
         }
+        // With stat data recorded and nothing racy, the first status finds
+        // every entry clean by stat alone and has nothing to write back.
+        let index = fs::read(workspace.join(".git/index")).unwrap();
         assert_eq!(command(&workspace, &["status", "--porcelain"]), "");
-        if probe(&donor, &workspace).unwrap() {
-            // script and nine documents; Git writes sub/file and docs/3.txt.
-            assert_eq!(result["primary_reused_files"], 10, "{result}");
-            assert_eq!(result["private_files"], 2, "{result}");
+        assert_eq!(fs::read(workspace.join(".git/index")).unwrap(), index);
+        if shared {
+            assert_eq!(result["primary_reused_files"], 12, "{result}");
+            assert_eq!(result["private_files"], 0, "{result}");
+            assert_eq!(
+                command(&workspace, &["diff", "--stat"]),
+                "",
+                "the graft agrees the LF files hold their blobs"
+            );
         }
     }
 
@@ -1987,7 +2001,7 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn local_shares_matching_text_and_preserves_native_line_endings() {
+    fn local_mirrors_line_endings_the_primary_checked_out() {
         let (temp, repo, _) = fixture();
         fs::write(
             repo.join(".gitattributes"),
@@ -2000,11 +2014,12 @@ mod tests {
         command(&repo, &["commit", "-qm", "text checkout settings"]);
         let oid = command(&repo, &["rev-parse", "HEAD"]);
         for (autocrlf, eol, raw_files) in [
-            ("InPuT", "crlf", 4),
-            ("false", "native", 4),
-            ("false", "CRLF", 2),
-            // Only .gitattributes and mixed have no line-ending attribute.
-            ("true", "lf", 2),
+            ("InPuT", "crlf", 5),
+            ("false", "native", 5),
+            // check-attr prints a plain `text` like the string `text=set`,
+            // which Git ignores, so sub/file's CRLF is left to Git.
+            ("false", "CRLF", 4),
+            ("true", "lf", 5),
         ] {
             let donor = temp.path().join(format!("donor-{autocrlf}-{eol}"));
             let workspace = temp.path().join(format!("workspace-{autocrlf}-{eol}"));

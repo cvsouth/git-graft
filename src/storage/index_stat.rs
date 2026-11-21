@@ -254,13 +254,6 @@ fn patch(bytes: &mut [u8], installed: &HashMap<Vec<u8>, Installed>) -> Result<us
 /// staged blob. Anything unusual leaves a file to be hashed instead.
 pub(super) struct Trusted {
     entries: HashMap<Vec<u8>, ([u8; STAT], String)>,
-    /// Blob sizes. A checkout conversion (CRLF, `ident`, LFS and similar)
-    /// changes the size, so a file whose size differs from its blob's was not
-    /// written as raw bytes, even when Git's stat test calls it clean.
-    sizes: HashMap<String, u64>,
-    /// Checkout sizes of blobs Git expands from LF to CRLF under
-    /// `core.autocrlf=true`, for the paths [`Self::holds`] is told to expand.
-    expanded: HashMap<String, u64>,
     /// The index file's modification time; entries at or after it are racy.
     written: (i64, i64),
 }
@@ -272,7 +265,7 @@ impl Trusted {
     /// Read `index`, or `None` when it is absent, split, unverifiable or
     /// changed while being read.
     #[cfg(unix)]
-    pub(super) fn read(index: &Path, width: usize, sizes: HashMap<String, u64>) -> Option<Self> {
+    pub(super) fn read(index: &Path, width: usize) -> Option<Self> {
         use std::{io::Read, os::unix::fs::MetadataExt};
         let mut file = fs::File::open(index).ok()?;
         let before = file.metadata().ok()?;
@@ -322,26 +315,19 @@ impl Trusted {
         }
         Some(Self {
             entries,
-            sizes,
-            expanded: HashMap::new(),
             written: (after.mtime(), after.mtime_nsec()),
         })
     }
 
-    /// Record the CRLF checkout sizes of blobs Git expands at checkout. See
-    /// `direct::Written` in `local.rs` for why a stat-clean file of exactly
-    /// that size holds Git's expanded bytes.
-    #[cfg(unix)]
-    pub(super) fn expand(&mut self, sizes: HashMap<String, u64>) {
-        self.expanded = sizes;
-    }
-
     /// Whether the donor file at `name`, with stat data `stat` of a file
-    /// `size` bytes long, still holds the bytes Git checks out for the staged
-    /// `blob` in Git mode `mode`, by Git's own stat test. `crlf` says Git
-    /// expands this path's LFs to CRLF, so the file must have the expanded
-    /// size recorded by [`Self::expand`]; otherwise it must be as large as the
-    /// blob.
+    /// `size` bytes long, still holds exactly the staged `blob` in Git mode
+    /// `mode` of `blob_size` bytes, by Git's own stat test.
+    ///
+    /// Git's line-ending conversions only add or remove CRs and change the
+    /// size whenever they change the bytes, so a file Git calls clean that is
+    /// as large as its blob is the blob itself. Other conversions (`ident`,
+    /// LFS and similar) usually change the size too; a file whose size
+    /// differs from its blob's is never proven here.
     pub(super) fn holds(
         &self,
         name: &[u8],
@@ -349,15 +335,10 @@ impl Trusted {
         mode: u32,
         stat: &Stat,
         size: u64,
-        crlf: bool,
+        blob_size: Option<u64>,
     ) -> bool {
         let Some((recorded, oid)) = self.entries.get(name) else {
             return false;
-        };
-        let expected = if crlf {
-            self.expanded.get(blob)
-        } else {
-            self.sizes.get(blob)
         };
         let field =
             |at: usize| u32::from_be_bytes(recorded[at..at + 4].try_into().unwrap_or([0; 4]));
@@ -366,7 +347,7 @@ impl Trusted {
         let mtime = (i64::from(field(8)), i64::from(field(12)));
         oid == blob
             && field(24) == mode
-            && expected == Some(&size)
+            && blob_size == Some(size)
             && size <= u64::from(u32::MAX)
             // Every stat field except the mode, which Git owns, must match.
             && recorded[..24] == current[..24]
@@ -389,7 +370,7 @@ pub(crate) fn subsecond_changes(git_dir: &Path, worktree: &Path) -> Vec<(Vec<u8>
     let index = git_dir.join("index");
     let Some(recorded) = [20, 32]
         .into_iter()
-        .find_map(|width| Trusted::read(&index, width, HashMap::new()))
+        .find_map(|width| Trusted::read(&index, width))
     else {
         return Vec::new();
     };
@@ -581,10 +562,9 @@ mod tests {
                 .to_owned()
         };
         let (a, b) = (blob("a.txt"), blob("b.txt"));
-        let sizes: HashMap<_, _> = [(a.clone(), 6), (b.clone(), 6)].into();
         let index = repo.join(".git/index");
-        let trusted = Trusted::read(&index, 20, sizes.clone()).unwrap();
-        let check_as = |trusted: &Trusted, name: &str, oid: &str, crlf: bool| {
+        let trusted = Trusted::read(&index, 20).unwrap();
+        let check_as = |trusted: &Trusted, name: &str, oid: &str, size: u64| {
             let path = repo.join(name);
             let metadata = fs::symlink_metadata(&path).unwrap();
             trusted.holds(
@@ -593,22 +573,11 @@ mod tests {
                 0o100644,
                 &Stat::from_metadata(&metadata),
                 metadata.len(),
-                crlf,
+                Some(size),
             )
         };
-        let check = |trusted: &Trusted, name: &str, oid: &str| check_as(trusted, name, oid, false);
+        let check = |trusted: &Trusted, name: &str, oid: &str| check_as(trusted, name, oid, 6);
         assert!(check(&trusted, "a.txt", &a));
-        // A path Git expands to CRLF must have the expanded size instead.
-        assert!(!check_as(&trusted, "a.txt", &a, true), "no expanded size");
-        let mut expanded = Trusted::read(&index, 20, sizes.clone()).unwrap();
-        expanded.expand([(a.clone(), 6)].into());
-        assert!(check_as(&expanded, "a.txt", &a, true));
-        expanded.expand([(a.clone(), 7)].into());
-        assert!(
-            !check_as(&expanded, "a.txt", &a, true),
-            "LF file, CRLF size"
-        );
-        assert!(check(&expanded, "a.txt", &a), "raw paths keep blob sizes");
         assert!(!check(&trusted, "a.txt", &b), "a different blob");
         // A same-size edit that restores the old modification time.
         let before = fs::metadata(repo.join("b.txt"))
@@ -624,11 +593,10 @@ mod tests {
             .unwrap();
         assert!(!check(&trusted, "b.txt", &b));
         // A stat-clean file whose size differs from its blob was converted.
-        let converted = Trusted::read(&index, 20, [(a.clone(), 7)].into()).unwrap();
-        assert!(!check(&converted, "a.txt", &a));
+        assert!(!check_as(&trusted, "a.txt", &a, 7));
         // Assume-unchanged entries are never trusted.
         git(&repo, &["update-index", "--assume-unchanged", "a.txt"]);
-        let assumed = Trusted::read(&index, 20, sizes).unwrap();
+        let assumed = Trusted::read(&index, 20).unwrap();
         assert!(!check(&assumed, "a.txt", &a));
     }
 

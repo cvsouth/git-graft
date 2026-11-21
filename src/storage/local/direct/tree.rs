@@ -8,15 +8,15 @@
 //! afterwards; a clone that picked up a concurrently created entry is discarded
 //! and its files take the per-file path. Every cloned entry is then verified
 //! before its stat data is recorded: a regular file by Git's own stat test on
-//! an unchanged donor or by hashing its bytes, a link by hashing its target.
-//! A file Git expands to CRLF is proven only by the stat test at its expanded
-//! size, never by hashing. An entry that fails verification is removed and
-//! left for Git to check out.
-use super::{link_matches, verified_blob};
+//! an unchanged donor where Git's clean leaves a file equal to its blob
+//! unchanged, otherwise by hashing what Git's line-ending clean of it stores;
+//! a link by hashing its target. An entry that fails verification is removed
+//! and left for Git to check out.
+use super::{Proof, link_matches};
 use crate::storage::{
     Counts, Entry,
     cache::Stamp,
-    index_stat,
+    eol, index_stat,
     native::{self, Root},
 };
 use anyhow::{Context, Result};
@@ -50,15 +50,14 @@ pub(super) struct Cloned<'a> {
 /// What a checkout may install by directory clone.
 #[derive(Clone, Copy)]
 pub(super) struct Policy<'t> {
-    /// Stat data from the primary's index, trusted as `git status` trusts it.
-    pub(super) trusted: Option<&'t index_stat::Trusted>,
-    /// Per entry, whether Git expands its LFs to CRLF at checkout.
-    pub(super) crlf: &'t [bool],
+    /// How donor files are proven to hold their blobs.
+    pub(super) proof: Proof<'t>,
+    /// Per entry, when Git's line-ending clean of a donor stores its blob.
+    pub(super) rules: &'t [eol::Rule],
     /// Git checks symbolic links out as links.
     pub(super) links: bool,
     /// Permission bits Git gives a new non-executable file.
     pub(super) mode: u32,
-    pub(super) sha256: bool,
     /// Workers may cache open ancestor directories.
     pub(super) reuse_ancestors: bool,
 }
@@ -281,7 +280,7 @@ pub(super) fn clone_directories<'a>(
                         let checked = Checked {
                             entry: &files[index],
                             before: item.before[at].as_ref(),
-                            crlf: policy.crlf[index],
+                            rule: policy.rules[index],
                         };
                         let outcome = verify(&checked, &donor, &destination, policy, &mut buffer)?;
                         Ok((clone, index, outcome))
@@ -435,8 +434,8 @@ fn clone_one(
 struct Checked<'a> {
     entry: &'a Entry,
     before: Option<&'a libc::stat>,
-    /// Git expands the entry's LFs to CRLF, so only stat data can prove it.
-    crlf: bool,
+    /// When Git's line-ending clean of the donor stores the entry's blob.
+    rule: eol::Rule,
 }
 
 enum Outcome {
@@ -461,7 +460,7 @@ fn verify(
         let Ok(target) = destination.link(file_path) else {
             return Ok(Outcome::Broken);
         };
-        if !link_matches(target.as_bytes(), &entry.blob, policy.sha256) {
+        if !link_matches(target.as_bytes(), &entry.blob) {
             destination.discard(file_path)?;
             return Ok(Outcome::Missing);
         }
@@ -473,15 +472,13 @@ fn verify(
     };
     // Git writes a file with no flags or user extended attributes. A donor
     // whose stat Git itself trusts, unchanged across the clone, needs no
-    // hashing. A blob's hash cannot prove the CRLF bytes Git expands it to.
-    let crlf = checked.crlf;
+    // hashing where Git's clean leaves a file equal to its blob unchanged.
+    let (rule, proof) = (checked.rule, policy.proof);
     let verified = native::plain(&file, &metadata).unwrap_or(false)
         && (checked.before.is_some_and(|before| {
-            trusted_donor(donor, file_path, before, entry, policy.trusted, crlf)
-                || (!crlf
-                    && donor_unchanged(donor, file_path, before, entry, buffer, policy.sha256))
-        }) || (!crlf
-            && verified_blob(&mut file, &metadata, buffer, &entry.blob, policy.sha256)));
+            trusted_donor(donor, file_path, before, entry, proof, rule)
+                || donor_unchanged(donor, file_path, before, entry, proof, rule, buffer)
+        }) || proof.hashed(&mut file, &metadata, entry, rule, buffer));
     if !verified {
         destination.discard(file_path)?;
         return Ok(Outcome::Missing);
@@ -500,29 +497,20 @@ fn verify(
 }
 
 /// Whether the donor kept the stat it had before the clone and Git's index
-/// vouches for that stat holding the bytes Git checks out for the staged blob.
+/// vouches for that stat holding the entry's blob.
 fn trusted_donor(
     donor: &Root,
     path: &Path,
     before: &libc::stat,
     entry: &Entry,
-    trusted: Option<&index_stat::Trusted>,
-    crlf: bool,
+    proof: Proof<'_>,
+    rule: eol::Rule,
 ) -> bool {
-    let Some(trusted) = trusted else {
-        return false;
-    };
     let stat = index_stat::Stat::from_libc(before);
-    trusted.holds(
-        &entry.name,
-        &entry.blob,
-        entry.mode,
-        &stat,
-        before.st_size as u64,
-        crlf,
-    ) && donor
-        .regular_stat(path)
-        .is_ok_and(|now| index_stat::Stat::from_libc(&now) == stat && now.st_mode == before.st_mode)
+    proof.stat_proven(entry, rule, &stat, before.st_size as u64)
+        && donor.regular_stat(path).is_ok_and(|now| {
+            index_stat::Stat::from_libc(&now) == stat && now.st_mode == before.st_mode
+        })
 }
 
 /// Hash the donor's bytes, accepting them only if the donor kept the stamp it
@@ -532,15 +520,16 @@ fn donor_unchanged(
     path: &Path,
     before: &libc::stat,
     entry: &Entry,
+    proof: Proof<'_>,
+    rule: eol::Rule,
     buffer: &mut [u8; 64 * 1024],
-    sha256: bool,
 ) -> bool {
     let Ok((mut file, metadata)) = donor.regular_metadata(path) else {
         return false;
     };
     let stamp = Stamp::from(&metadata);
     stamp.matches_stat(before)
-        && verified_blob(&mut file, &metadata, buffer, &entry.blob, sha256)
+        && proof.hashed(&mut file, &metadata, entry, rule, buffer)
         && file.metadata().is_ok_and(|now| Stamp::from(&now) == stamp)
 }
 
@@ -644,13 +633,15 @@ mod tests {
         let candidates = vec![true; rows.len()];
         let donor = Root::open(&donor_path)?;
         let destination = Root::open(&destination_path)?;
-        let crlf = vec![false; rows.len()];
+        let rules = vec![eol::Rule::BINARY; rows.len()];
         let policy = Policy {
-            trusted: None,
-            crlf: &crlf,
+            proof: Proof {
+                trusted: None,
+                sizes: None,
+            },
+            rules: &rules,
             links: true,
             mode: 0o755,
-            sha256: false,
             reuse_ancestors: false,
         };
         let cloned = clone_directories(&rows, &candidates, &donor, &destination, policy)?;
