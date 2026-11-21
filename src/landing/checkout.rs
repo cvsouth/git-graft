@@ -824,7 +824,7 @@ impl Update {
             self.rebuild(path, admin, objects, true)?;
         } else {
             ensure!(
-                !super::dirty(path)?,
+                super::uncommitted(path)?.is_empty(),
                 "destination checkout has local changes: {}",
                 path.display()
             );
