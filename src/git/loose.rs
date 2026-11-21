@@ -45,11 +45,7 @@ pub(crate) fn blob_sizes(
             .collect();
         workers
             .into_iter()
-            .flat_map(|worker| {
-                // A worker that panicked proves nothing.
-                worker.join().unwrap_or_else(|_| vec![None; chunk])
-            })
-            .take(blobs.len())
+            .flat_map(crate::workspace::joined)
             .collect()
     })
 }
