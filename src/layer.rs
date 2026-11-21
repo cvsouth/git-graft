@@ -598,6 +598,17 @@ fn source_contents(checkout: &Path) -> Result<String> {
     )
 }
 
+/// Whether the checkout's `node_modules` still holds exactly the files that
+/// `restore_layer` verified and attached: the `contents` digest that the
+/// attach receipt recorded. Any other state, including one that cannot be
+/// read, is not unchanged.
+pub(crate) fn attached_unchanged(checkout: &Path, contents: &str) -> bool {
+    let modules = checkout.join("node_modules");
+    valid_digest(contents)
+        && registry::check_owned_tree(&modules).is_ok()
+        && inspect(&modules, None, check_metadata).is_ok_and(|actual| actual == contents)
+}
+
 fn stage_tree(
     source: &Path,
     staging: &Path,

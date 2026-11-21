@@ -468,6 +468,9 @@ pub fn inherit_shared(checkout: &Path, state: &Path, primary: &Path) -> Result<O
         Ok(mut receipt) => {
             receipt["status"] = json!("attached");
             receipt["manager"] = json!("npm");
+            // What `restore_layer` verified, so a later `remove` or `merge`
+            // can tell this install from one the graft has since changed.
+            receipt["contents"] = provenance["contents"].clone();
             Ok(Some(receipt))
         }
         Err(error) => match error.downcast_ref::<Fault>().map(|fault| fault.code) {
