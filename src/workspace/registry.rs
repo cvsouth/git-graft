@@ -355,7 +355,21 @@ impl Drop for WorkspaceLock {
 fn lock_in(state: &Path, name: &str) -> Result<WorkspaceLock> {
     let path = state.join("locks");
     dir(&path)?;
-    try_lock(open_lock(&path.join(name))?, name)
+    try_lock(open_exclusive(&path.join(name), name)?, name)
+}
+
+/// Open a graft lock for exclusive use. On Windows a file lock ends when the
+/// process that took it exits, even while a process it started still holds
+/// the file open. So there the lock is also opened without sharing: while any
+/// process holds it, such as one left running by `exec`, the graft is busy.
+fn open_exclusive(path: &Path, name: &str) -> Result<File> {
+    #[cfg(windows)]
+    return crate::registry::open_lock_unshared(path)?.ok_or_else(|| busy(name));
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        open_lock(path)
+    }
 }
 
 /// Serialize workspace subprocesses with lifecycle operations, without
@@ -374,7 +388,19 @@ pub(super) fn exec_lock(p: &Project, name: &str) -> Result<File> {
     validate_name(name)?;
     let path = state_dir(p, false)?.join("locks");
     dir(&path)?;
-    let file = open_lock(&path.join(name))?;
+    let file = match open_lock(&path.join(name)) {
+        Ok(file) => file,
+        // A lifecycle operation holds the lock without sharing.
+        #[cfg(windows)]
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(crate::registry::is_sharing_violation) =>
+        {
+            return Err(busy(name));
+        }
+        Err(error) => return Err(error),
+    };
     match file.try_lock_shared() {
         Ok(()) => Ok(file),
         Err(fs::TryLockError::WouldBlock) => Err(busy(name)),
@@ -2108,10 +2134,7 @@ fn open_existing_lock(p: &Project, name: &str) -> Result<WorkspaceLock> {
         metadata.is_file() && !is_reparse_point(&metadata),
         "graft lock is not an ordinary file"
     );
-    try_lock(
-        fs::OpenOptions::new().read(true).write(true).open(lock)?,
-        name,
-    )
+    try_lock(open_exclusive(&lock, name)?, name)
 }
 
 /// Archive eligible expired workspaces. Archives, foreign paths and refs are

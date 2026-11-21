@@ -457,6 +457,32 @@ pub fn exists(path: &Path) -> Result<bool> {
     }
 }
 pub(crate) fn open_lock(path: &Path) -> Result<File> {
+    Ok(lock_options(path)?.open(path)?)
+}
+
+/// Open the lock at `path` without sharing it, or `None` while any other
+/// handle to it is open, including one a background process inherited.
+#[cfg(windows)]
+pub(crate) fn open_lock_unshared(path: &Path) -> Result<Option<File>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    match lock_options(path)?.share_mode(0).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if is_sharing_violation(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether Windows refused to open a file because another handle to it is
+/// open with incompatible sharing.
+#[cfg(windows)]
+pub(crate) fn is_sharing_violation(error: &io::Error) -> bool {
+    error.raw_os_error()
+        == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION.cast_signed())
+}
+
+/// How every lock file is opened: created if missing, never truncated, and
+/// refused if something other than a regular file is in its place.
+fn lock_options(path: &Path) -> Result<OpenOptions> {
     if exists(path)? {
         let metadata = fs::symlink_metadata(path)?;
         ensure!(
@@ -464,12 +490,9 @@ pub(crate) fn open_lock(path: &Path) -> Result<File> {
             "lock is not a regular file"
         );
     }
-    Ok(OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?)
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    Ok(options)
 }
 pub(crate) fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     write_atomic(path, bytes, false)
