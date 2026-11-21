@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- A merge or undo into the branch checked out in the primary now goes ahead around your uncommitted edits, as `git merge` does, and leaves them exactly as they were: staged changes stay staged and unstaged edits keep their bytes. It refuses only when an edit touches a path the merge changes, with `destination_has_local_changes` listing those paths in `details.paths`. A retry of a merge stopped before it wrote any file follows the same rule, so an unrelated edit no longer keeps it stuck.
+- `remove` and `merge` refuse a graft with uncommitted, untracked or ignored files as `local_changes`, listing each path with its status (`added`, `deleted`, `modified`, `untracked` or `ignored`); on `remove` it notes that `remove --discard` archives them.
 - A graft mirrors its primary's line endings. A primary file is reused when Git's own line-ending conversion of it, the one `git status` compares and `git add` stores, gives exactly the committed blob, verified by hashing the converted bytes or, for a file equal to its blob, by Git's index stat test. With `core.autocrlf=true`, an LF primary's text files are now cloned instead of written in full. Paths with a filter, `ident` or a working-tree encoding still come from Git, and so does any file `git add` would refuse under `core.safecrlf=true`.
 - `doctor` reports `file_sharing.shared` from cloning support alone; line-ending settings no longer stop sharing.
 

@@ -198,7 +198,7 @@ export const cases: Scenario[] = [
     },
   },
   {
-    name: 'initialised submodules stay untouched in the primary and block archiving in a graft',
+    name: 'merges leave edited submodules in the primary untouched and they block archiving in a graft',
     run(ctx) {
       writeFileSync(join(ctx.env.HOME!, 'gitconfig'), '[core]\n\tautocrlf = false\n[protocol "file"]\n\tallow = always\n');
       const library = join(ctx.root, 'library');
@@ -215,20 +215,27 @@ export const cases: Scenario[] = [
       writeFileSync(join(ws.path, 'tracked.txt'), 'outer change\n');
       ctx.git(['commit', '-qam', 'Outer change'], ws.path);
       const tip = ctx.git(['rev-parse', 'HEAD'], ws.path);
-      // Local work inside the primary's submodule blocks the merge.
+      // Local work inside the primary's submodule does not block a merge
+      // that leaves the submodule alone, and the merge never touches it.
       writeFileSync(join(submodule, 'lib.txt'), 'library\nlocal edit\n');
       writeFileSync(join(submodule, 'scratch.txt'), 'untracked in submodule\n');
-      assert.match(String(ctx.fail(['merge', 'outer', '--lease', ws.lease]).message), /local changes/i);
-      assert.equal(readFileSync(join(submodule, 'lib.txt'), 'utf8'), 'library\nlocal edit\n');
-      assert.equal(readFileSync(join(submodule, 'scratch.txt'), 'utf8'), 'untracked in submodule\n');
-      assert.equal(ctx.git(['rev-parse', 'HEAD'], submodule), subHead);
-      ctx.git(['checkout', '-q', '--', '.'], submodule);
-      rmSync(join(submodule, 'scratch.txt'));
-      // A clean merge leaves the submodule checkout and its history alone.
       assert.equal(ctx.cli(['merge', 'outer', '--lease', ws.lease]).commit, tip);
       assert.equal(ctx.git(['rev-parse', 'HEAD'], submodule), subHead);
-      assert.equal(readFileSync(join(submodule, 'lib.txt'), 'utf8'), 'library\n');
-      assert.equal(ctx.git(['status', '--porcelain']), '');
+      assert.equal(readFileSync(join(submodule, 'lib.txt'), 'utf8'), 'library\nlocal edit\n');
+      assert.equal(readFileSync(join(submodule, 'scratch.txt'), 'utf8'), 'untracked in submodule\n');
+      assert.equal(ctx.git(['status', '--porcelain']), ' M vendor/lib');
+      // A merge that moves the submodule is refused while it holds edits.
+      const bump = ctx.spawn('bump');
+      ctx.git(['update-index', '--cacheinfo', `160000,${ctx.git(['commit-tree', '-m', 'moved', ctx.git(['rev-parse', 'HEAD^{tree}'], submodule)], submodule)},vendor/lib`], bump.path);
+      ctx.git(['commit', '-qm', 'Move submodule'], bump.path);
+      const refused = ctx.fail(['merge', 'bump', '--lease', bump.lease]);
+      assert.equal(refused.code, 'destination_has_local_changes', String(refused.message));
+      assert.deepEqual((refused.details as Record<string, unknown>).paths, ['vendor/lib']);
+      assert.equal(ctx.git(['rev-parse', 'HEAD'], submodule), subHead);
+      assert.equal(readFileSync(join(submodule, 'lib.txt'), 'utf8'), 'library\nlocal edit\n');
+      ctx.git(['checkout', '-q', '--', '.'], submodule);
+      rmSync(join(submodule, 'scratch.txt'));
+      ctx.cli(['remove', 'bump', '--lease', bump.lease, '--discard']);
 
       // A submodule initialised inside a graft is refused, never archived partially.
       const inner = ctx.spawn('inner');
@@ -307,7 +314,7 @@ export const cases: Scenario[] = [
       assert.equal(ctx.git(['show', 'HEAD:CASE.txt'], coll.path), 'upper');
       if (ctx.git(['status', '--porcelain'], coll.path) !== '') {
         // One checkout file holds both names. Graft reports that as local work.
-        assert.match(String(ctx.fail(['remove', 'collide', '--lease', coll.lease]).message), /local changes/i);
+        assert.equal(ctx.fail(['remove', 'collide', '--lease', coll.lease]).code, 'local_changes');
         assert.match(String(ctx.fail(['merge', 'collide', '--lease', coll.lease, '--into', 'collide']).message), /uncommitted changes/i);
       }
       assert.equal(ctx.git(['rev-parse', 'collide']), collide);
@@ -360,7 +367,10 @@ export const cases: Scenario[] = [
         const before = ctx.git(['rev-parse', 'HEAD']);
         const merge = ['merge', 'unicode-collision', '--lease', ws.lease];
         if (folds) {
-          assert.match(String(ctx.fail(merge).message), /ignored path would be overwritten/i);
+          const refused = ctx.fail(merge);
+          assert.equal(refused.code, 'destination_has_local_changes', String(refused.message));
+          assert.match(String(refused.message), /Ignored files .* would be overwritten/);
+          assert.deepEqual((refused.details as Record<string, unknown>).paths, ['café/secret.env']);
           assert.equal(ctx.git(['rev-parse', 'HEAD']), before);
           assert.equal(ctx.git(['rev-parse', 'HEAD'], ws.path), tip);
         } else {

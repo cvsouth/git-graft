@@ -39,7 +39,10 @@ Examples:
 
 A conflict changes nothing and keeps the graft. To resolve it, run in the graft:
   git fetch --no-tags <primary checkout> refs/heads/main && git merge FETCH_HEAD
-then fix, commit and retry the merge with the same lease.")]
+then fix, commit and retry the merge with the same lease.
+
+Uncommitted edits in the primary checkout stay as they are. Only edits to
+paths the merge changes stop it, as destination_has_local_changes.")]
     Merge(api::Land),
     /// Archive a graft and its files. Refuses if it has unmerged work unless --discard is given.
     #[command(after_help = "\

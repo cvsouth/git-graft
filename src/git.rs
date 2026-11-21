@@ -288,6 +288,9 @@ pub(crate) fn absolute_git_dir(dir: &Path) -> Result<PathBuf> {
 pub struct Change {
     pub status: String,
     pub path: String,
+    /// The path exactly as Git printed it, which need not be UTF-8.
+    #[serde(skip)]
+    pub name: Vec<u8>,
 }
 /// `-c` overrides that disable every filter driver defined by the
 /// repository's own configuration, including files it includes.
@@ -338,7 +341,19 @@ fn repository_filter_overrides(dir: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Uncommitted changes in `dir`: staged, unstaged, untracked and ignored
+/// paths, with untracked and ignored directories listed once.
 pub fn changes(dir: &Path) -> Result<Vec<Change>> {
+    status(dir, "--untracked-files=normal", "--ignored=matching")
+}
+
+/// Every staged and unstaged change and every untracked file in `dir`, each
+/// untracked file named on its own. Ignored files are left out.
+pub(crate) fn edits(dir: &Path) -> Result<Vec<Change>> {
+    status(dir, "--untracked-files=all", "--ignored=no")
+}
+
+fn status(dir: &Path, untracked: &str, ignored: &str) -> Result<Vec<Change>> {
     // Settings shared by the status and any follow-up hashing.
     let mut overrides = vec![
         "-c".to_owned(),
@@ -353,8 +368,8 @@ pub fn changes(dir: &Path) -> Result<Vec<Change>> {
         "status",
         "--porcelain=v1",
         "-z",
-        "--untracked-files=normal",
-        "--ignored=matching",
+        untracked,
+        ignored,
         "--no-renames",
         "--ignore-submodules=none",
     ]);
@@ -367,6 +382,7 @@ pub fn changes(dir: &Path) -> Result<Vec<Change>> {
             Ok(Change {
                 status: std::str::from_utf8(&r[..2])?.into(),
                 path: String::from_utf8_lossy(&r[3..]).into_owned(),
+                name: r[3..].to_vec(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -431,6 +447,7 @@ fn subsecond_edits(dir: &Path, overrides: &[String], reported: &[Change]) -> Res
         .map(|((name, _), _)| Change {
             status: " M".into(),
             path: String::from_utf8_lossy(&name).into_owned(),
+            name,
         })
         .collect())
 }

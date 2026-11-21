@@ -25,6 +25,8 @@ Graft never deletes or overwrites work to finish a command. These results mean i
 - `record_damaged` or a `damaged_records` list: a record file is unreadable. Other grafts still work. Ask the user to repair it; do not touch the file.
 - `primary_moved`: the primary was moved or copied. Ask the user to move it back to `details.recorded_primary`.
 - `already_exists` or `archive_damaged` on restore: the name or path is taken, or the archive was changed by hand. Report it to the user; restore changed nothing.
+- `destination_has_local_changes`: the user's uncommitted edits in the primary touch paths the merge or undo changes (`details.paths`). Nothing changed. Ask the user to commit or move those edits, then retry. Their edits to other paths never block a merge.
+- `local_changes`: the graft has uncommitted, untracked or ignored files (`details.paths`, each with its `status`). Commit the task's changes and retry, or ask the user before removing with `discard`, which archives them.
 - `checkout_recovery_required`: retry the same merge or undo with the same lease. If it names `paths`, ask the user how to keep those edits.
 - `checkout_update_set_aside`: the destination branch moved after an interrupted update. Ask the user to check `git status` in the primary, then retry the merge.
 - `git_busy` or `workspace_busy`: another Git or Graft command, or a background job started with `graft_exec`, is running. Wait or stop your own background job, then retry.
