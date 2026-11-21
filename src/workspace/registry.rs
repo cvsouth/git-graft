@@ -72,6 +72,10 @@ pub struct Record {
     /// already landed an earlier tip: its later commits were never merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unmerged_head: Option<String>,
+    /// For an unfinished creation that a retry or restore archived, the lease
+    /// of the graft built in its place. This record's own lease restores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
 }
 
 impl Record {
@@ -498,6 +502,12 @@ fn validate_record(r: &Record) -> Result<()> {
         },
         "invalid workspace lifecycle state"
     );
+    if let Some(lease) = &r.superseded_by {
+        ensure!(
+            canonical_uuid(lease)? != r.lease,
+            "invalid superseding workspace lease"
+        );
+    }
     let mut leases = HashSet::new();
     for prior in &r.previous {
         validate_path(&prior.path)?;
@@ -598,10 +608,14 @@ impl DamagedRecord {
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .unwrap_or(Value::Null);
         let text = |value: &Value| value.as_str().map(str::to_owned);
-        let mut leases: Vec<String> = [&value["lease"], &value["transition"]["lease"]]
-            .into_iter()
-            .filter_map(text)
-            .collect();
+        let mut leases: Vec<String> = [
+            &value["lease"],
+            &value["transition"]["lease"],
+            &value["superseded_by"],
+        ]
+        .into_iter()
+        .filter_map(text)
+        .collect();
         if let Some(previous) = value["previous"].as_array() {
             leases.extend(previous.iter().filter_map(|old| text(&old["lease"])));
         }
@@ -1488,6 +1502,12 @@ fn valid_port(port: u16) -> bool {
     PORTS.contains(&port)
 }
 
+/// Reserve `name` for a new graft and hold its workspace lock, which the
+/// caller keeps until the graft is built. Retrying `request_id` returns its
+/// finished graft. An unfinished one is archived whole with a new lease, then
+/// a fresh reservation takes the same name, path and request ID; see
+/// [`leftovers`].
+#[cfg(test)]
 pub fn reserve(
     p: &Project,
     name: &str,
@@ -1496,6 +1516,33 @@ pub fn reserve(
     branch: Option<&str>,
     request: Value,
 ) -> Result<Record> {
+    reserve_locked(p, name, request_id, base, branch, request).map(|(r, _lock)| r)
+}
+
+/// Whether the live record `r` belongs to this request.
+fn claims(
+    r: &Record,
+    requested: Option<&String>,
+    base: Option<&str>,
+    branch: Option<&str>,
+    request: &Value,
+) -> bool {
+    requested.is_some_and(|lease| *lease == r.lease || r.superseded_by.as_ref() == Some(lease))
+        && r.base.as_deref() == base
+        && r.branch.as_deref() == branch
+        && r.request == *request
+        && !r.status.retired()
+}
+
+/// [`reserve`], returning the workspace lock the build must hold.
+pub(super) fn reserve_locked(
+    p: &Project,
+    name: &str,
+    request_id: Option<&str>,
+    base: Option<&str>,
+    branch: Option<&str>,
+    request: Value,
+) -> Result<(Record, WorkspaceLock)> {
     validate_name(name)?;
     if let Some(base) = base {
         git::checked_oid(base)?;
@@ -1504,29 +1551,61 @@ pub fn reserve(
         .map(Uuid::parse_str)
         .transpose()?
         .map(|id| id.to_string());
+    let in_use = || {
+        fault(
+            "already_exists",
+            "Workspace name is already in use",
+            json!({"name":name}),
+        )
+    };
+    // A name held by another request is reported without waiting for its lock.
     let registry = scan(p)?;
     crate::trace::mark("reserve: read records");
     registry.damaged_name(name)?;
-    let known = &registry.records;
-    if let Some(mut r) = current(known, name).cloned() {
-        if requested.as_ref() == Some(&r.lease)
-            && r.base.as_deref() == base
-            && r.branch.as_deref() == branch
-            && r.request == request
-            && !r.status.retired()
-        {
+    if let Some(r) = registry.current(name)
+        && !claims(r, requested.as_ref(), base, branch, &request)
+    {
+        return Err(in_use());
+    }
+    if !exists(&p.state.join(NAMESPACE))? {
+        validate_fresh_root(p)?;
+    }
+    crate::trace::mark("reserve: validate fresh root");
+    let directory = record_directory(p, true)?;
+    crate::trace::mark("reserve: record directory");
+    let namespace = directory.parent().context("missing workspace namespace")?;
+    let lock = lock_in(namespace, name)?;
+    // Records for this name cannot change while the lock is held.
+    let mut registry = scan(p)?;
+    registry.damaged_name(name)?;
+    if let Some(mut r) = registry.current(name).cloned() {
+        if !claims(&r, requested.as_ref(), base, branch, &request) {
+            return Err(in_use());
+        }
+        if requested.as_ref() == Some(&r.lease) {
             if r.placing() {
                 resume(p, &mut r)?;
             }
             verify_current(p, &r)?;
-            return Ok(r);
+            if r.status == Status::Active {
+                return Ok((r, lock));
+            }
+            // An earlier attempt stopped before it finished. Give it a lease
+            // of its own, so this request's lease can name the new graft.
+            r.superseded_by = Some(std::mem::replace(&mut r.lease, Uuid::new_v4().to_string()));
+            persist(p, &r)?;
         }
-        return Err(fault(
-            "already_exists",
-            "Workspace name is already in use",
-            json!({"name":name}),
-        ));
+        // Archive the whole attempt, so nothing it held is lost.
+        if let Err(error) = begin_retirement(p, &mut r, Status::Dropped, None) {
+            return Err(fault(
+                "spawn_incomplete",
+                format!("The interrupted attempt could not be archived: {error:#}"),
+                json!({"name":r.name,"lease":r.lease,"path":r.path,"recovery":"Inspect the interrupted attempt at path. Run remove with --discard and this lease to archive it, then retry the request."}),
+            ));
+        }
+        registry = scan(p)?;
     }
+    let known = &registry.records;
     if let Some(lease) = &requested {
         let id = Uuid::parse_str(lease)?;
         if id.get_version() != Some(uuid::Version::Random)
@@ -1543,23 +1622,17 @@ pub fn reserve(
                 .iter()
                 .any(|r| r.lease == *lease
                     || r.previous.iter().any(|old| old.lease == *lease)
+                    // Another name's unfinished attempt was retried with it.
+                    || (r.name != name && r.superseded_by.as_ref() == Some(lease))
                     || matches!(&r.transition, Some(Transition::Restore { lease: next, .. }) if next == lease))
                 && !registry.damaged.iter().any(|d| d.leases.contains(lease)),
             "request_id has already been used"
         );
     }
-    if !exists(&p.state.join(NAMESPACE))? {
-        validate_fresh_root(p)?;
-    }
-    crate::trace::mark("reserve: validate fresh root");
-    let directory = record_directory(p, true)?;
-    crate::trace::mark("reserve: record directory");
     let root = workspaces(p, true)?;
     crate::trace::mark("reserve: workspace root");
     let path = root.join(name);
     ensure_unoccupied(&path)?;
-    let namespace = directory.parent().context("missing workspace namespace")?;
-    let _lock = lock_in(namespace, name)?;
     // Assemble the identity before exposing the workspace at its named path.
     let stage = private_stage(&root, PENDING)?;
     let admin = stage.path().join(".git");
@@ -1569,6 +1642,10 @@ pub fn reserve(
         &admin.join(MARKER),
         &serde_json::to_vec(&marker(p, &id, name))?,
     )?;
+    // Hold the index lock from the start, so Git cannot write an index for
+    // missing files at any point before the checkout is published.
+    crate::storage::reserve_index(&admin)?;
+    sync_directory(&admin)?;
     sync_directory(stage.path())?;
     sync_directory(&root)?;
     crate::trace::mark("reserve: stage marker");
@@ -1599,11 +1676,12 @@ pub fn reserve(
         transition: Some(Transition::Place { from: from.clone() }),
         previous: Vec::new(),
         unmerged_head: None,
+        superseded_by: None,
     };
     let result = (|| {
         write_record(&directory, &r)?;
         crate::trace::mark("reserve: write placement");
-        // The private stage was just created with only our .git marker.
+        // The private stage was just created with only our marker and lock.
         relocate(p, &r, &from, &r.path, true)?;
         crate::trace::mark("reserve: relocate");
         r.transition = None;
@@ -1616,7 +1694,100 @@ pub fn reserve(
             json!({"name":r.name,"lease":r.lease,"path":r.path}),
         ));
     }
-    Ok(r)
+    Ok((r, lock))
+}
+
+/// The record a retry of `request_id` concerns: the live graft holding that
+/// lease, or the unfinished attempt it replaced, so the retry reuses the
+/// options and base that attempt reserved.
+pub fn for_request(p: &Project, name: &str, request_id: &str) -> Option<Record> {
+    let registry = scan(p).ok()?;
+    if registry.damaged_name(name).is_err() {
+        return None;
+    }
+    registry
+        .records
+        .iter()
+        .filter(|r| r.name == name)
+        .find(|r| r.lease == request_id && !r.status.retired())
+        .or_else(|| {
+            registry
+                .records
+                .iter()
+                .rev()
+                .find(|r| r.name == name && r.superseded_by.as_deref() == Some(request_id))
+        })
+        .cloned()
+}
+
+/// Archives of unfinished attempts replaced by the graft with `lease`, each
+/// with its archive path and the lease that restores it.
+pub fn leftovers(p: &Project, name: &str, lease: &str) -> Result<Vec<Value>> {
+    Ok(scan(p)?
+        .records
+        .iter()
+        .filter(|r| {
+            r.name == name && r.status.retired() && r.superseded_by.as_deref() == Some(lease)
+        })
+        .map(|r| json!({"archive_path": r.archive, "lease": r.lease}))
+        .collect())
+}
+
+/// When `lease` restores an archived creation that never finished, the
+/// archive and the lease of the graft to build in its place. The archive is
+/// kept as it is; restoring it again returns the same new graft while that
+/// graft is live.
+pub fn unfinished_archive(
+    p: &Project,
+    name: &str,
+    lease: &str,
+) -> Result<Option<(Record, String)>> {
+    validate_name(name)?;
+    let find = |registry: &Registry| {
+        registry
+            .records
+            .iter()
+            .find(|r| {
+                r.name == name
+                    && r.lease == lease
+                    && r.status.retired()
+                    && !r.initialized
+                    && r.transition.is_none()
+            })
+            .cloned()
+    };
+    // Anything else is restored by `restore`, which reports a wrong lease.
+    if find(&scan(p)?).is_none() {
+        return Ok(None);
+    }
+    let _lock = workspace_lock(p, name)?;
+    let registry = scan(p)?;
+    registry.damaged_name(name)?;
+    let known = &registry.records;
+    let Some(mut r) = find(&registry) else {
+        return Ok(None);
+    };
+    ensure!(
+        !r.request.is_null(),
+        "the archive holds an unfinished creation whose add options were not recorded; copy what you need from {}",
+        r.archive.as_deref().unwrap_or(Path::new("")).display()
+    );
+    let used = |lease: &str| {
+        known.iter().any(|k| {
+            (k.lease == lease && k.status.retired())
+                || k.previous.iter().any(|old| old.lease == lease)
+        })
+    };
+    let next = match &r.superseded_by {
+        Some(next) if !used(next) => next.clone(),
+        _ => {
+            let next = Uuid::new_v4().to_string();
+            r.superseded_by = Some(next.clone());
+            persist(p, &r)?;
+            next
+        }
+    };
+    Ok(Some((r, next)))
 }
 
 pub fn finish(p: &Project, r: &mut Record) -> Result<()> {
@@ -2210,6 +2381,8 @@ mod tests {
 
         fn workspace(&self, name: &str) -> Result<Record> {
             let mut record = reserve(&self.project, name, None, None, Some("agent"), Value::Null)?;
+            // Like `add`, release the reservation's index lock once built.
+            crate::storage::release_index(&record.path.join(".git"))?;
             git::bytes(&record.path, &["init", "-q", "--template=", "-b", "agent"])?;
             for (key, value) in [
                 ("user.name", "Registry Fixture"),
@@ -2257,6 +2430,7 @@ mod tests {
                 Value::Null,
             )?;
             let path = record.path.clone();
+            crate::storage::release_index(&path.join(".git"))?;
             git::bytes(&path, &["init", "-q", "--template=", "-b", "agent"])?;
             for (key, value) in [
                 ("user.name", "Registry Fixture"),
@@ -2804,48 +2978,69 @@ mod tests {
         let p = &f.project;
         let lease = Uuid::new_v4().to_string();
         let request = json!({"request_id":lease,"name":"pending"});
-        let r = reserve(
-            p,
-            "pending",
-            Some(&lease),
-            None,
-            Some("agent"),
-            request.clone(),
-        )?;
-        assert_eq!(r.status, Status::Pending);
-        assert_eq!(
-            reserve(
-                p,
-                "pending",
-                Some(&lease),
-                None,
-                Some("agent"),
-                request.clone()
-            )?
-            .id,
-            r.id
-        );
-        assert!(reserve(p, "pending", Some(&lease), None, Some("other"), request).is_err());
-        assert!(reserve(p, "pending", Some(&lease), None, Some("agent"), Value::Null).is_err());
+        let reserve_again = |branch: &str, request: Value| {
+            reserve(p, "pending", Some(&lease), None, Some(branch), request)
+        };
+        let first = reserve_again("agent", request.clone())?;
+        assert_eq!(first.status, Status::Pending);
+        let marked = fs::read(first.path.join(".git/index.lock"))?;
+        assert_eq!(marked, crate::storage::CREATION_LOCK);
+        fs::write(first.path.join("partial"), "keep it")?;
+        assert!(reserve_again("other", request.clone()).is_err());
+        assert!(reserve_again("agent", Value::Null).is_err());
         assert!(reserve(p, "other", Some(&lease), None, Some("agent"), Value::Null).is_err());
-        fs::write(r.path.join("partial"), "keep it")?;
+        assert_eq!(fs::read_to_string(first.path.join("partial"))?, "keep it");
+
+        // A retry archives the whole unfinished attempt under a new lease,
+        // then reserves the same name and path for the request again.
+        let retried = reserve_again("agent", request.clone())?;
+        assert_ne!(retried.id, first.id);
+        assert_eq!(
+            (retried.lease.as_str(), &retried.path, retried.status),
+            (lease.as_str(), &first.path, Status::Pending)
+        );
+        assert!(!retried.path.join("partial").exists());
+        let left = leftovers(p, "pending", &lease)?;
+        assert_eq!(left.len(), 1, "{left:?}");
+        let kept = left[0]["lease"].as_str().context("leftover lease")?;
+        assert_ne!(kept, lease);
+        let archive = PathBuf::from(left[0]["archive_path"].as_str().context("archive")?);
+        assert_eq!(fs::read_to_string(archive.join("partial"))?, "keep it");
+        assert_eq!(fs::read(archive.join(".git/index.lock"))?, marked);
+        // The archived attempt is restored by building the graft afresh, and
+        // asking again names the same graft while it is live.
+        let (unfinished, next) =
+            unfinished_archive(p, "pending", kept)?.context("unfinished archive")?;
+        assert_eq!(
+            (unfinished.archive.as_ref(), next.as_str()),
+            (Some(&archive), lease.as_str())
+        );
+        assert_eq!(
+            unfinished_archive(p, "pending", kept)?.map(|(_, next)| next),
+            Some(next)
+        );
+        assert!(unfinished_archive(p, "pending", &lease)?.is_none());
+
+        // An explicit archive of the reservation keeps its data and its
+        // registry restore stays pending.
+        fs::write(retried.path.join("partial"), "keep this too")?;
         let retired = {
-            let _lock = workspace_lock(p, &r.name)?;
-            retire(p, &r.name, &lease, Status::Dropped, None)?
+            let _lock = workspace_lock(p, &retried.name)?;
+            retire(p, &retried.name, &lease, Status::Dropped, None)?
         };
         assert_eq!(retired.status, Status::Dropped);
-        let restored = restore(p, &r.name, &lease)?;
-        assert_eq!(restored.id, r.id);
+        let restored = restore(p, &retried.name, &lease)?;
+        assert_eq!(restored.id, retried.id);
         assert_ne!(restored.lease, lease);
         assert_eq!(restored.status, Status::Pending);
         assert_eq!(
             fs::read_to_string(restored.path.join("partial"))?,
-            "keep it"
+            "keep this too"
         );
-        assert!(verify(p, &r).is_err());
+        assert!(verify(p, &retried).is_err());
         let public = serde_json::to_value(list(p)?)?;
         let public = public.as_array().context("expected list")?;
-        assert_eq!(public[0]["path"], json!(r.path));
+        assert_eq!(public[0]["path"], json!(retried.path));
         assert!(public[0].get("worktree_path").is_none());
         assert!(!serde_json::to_string(public)?.contains(&lease));
         assert!(!serde_json::to_string(public)?.contains(&restored.lease));

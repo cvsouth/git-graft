@@ -39,24 +39,73 @@ mod native;
 mod verify;
 pub(crate) use local::{materialize_local, materialize_planned};
 
-/// Content of the index lock a graft creation holds until it publishes the
-/// checkout's index. Git's own index locks are empty or hold an index, which
-/// starts with `DIRC`, so a lock with these bytes was created by Graft.
+/// Content of the index lock a graft creation holds from its reservation
+/// until it publishes the checkout's index. Git's own index locks are empty
+/// or hold an index, which starts with `DIRC`, so these bytes mark Graft's.
 pub(crate) const CREATION_LOCK: &[u8] = b"git-graft creation\n";
 
-/// Reserve a new workspace's index with Git's lock protocol and mark the lock
-/// as Graft's. Dropping the returned path releases it. A killed creation
-/// leaves it behind, so Git refuses to write an index for the missing files.
-fn reserve_index(lock: &Path) -> Result<tempfile::TempPath> {
+/// Create the marked index lock in a new workspace's Git directory. The
+/// reservation writes it beside its marker, so Git refuses to write an index
+/// for the whole creation, including after a kill at any step.
+pub(crate) fn reserve_index(admin: &Path) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(lock)
+        .open(admin.join("index.lock"))
         .context("reserve workspace Git index")?;
-    let reserved = tempfile::TempPath::try_from_path(lock)?;
     file.write_all(CREATION_LOCK)?;
-    Ok(reserved)
+    Ok(())
 }
+
+/// Release the reservation of a creation that publishes no index, such as an
+/// unborn or `--no-checkout` graft. A lock Graft did not create is kept.
+pub(crate) fn release_index(admin: &Path) -> Result<()> {
+    let lock = admin.join("index.lock");
+    if crate::registry::exists(&lock)? && crate::registry::regular(&lock)? == CREATION_LOCK {
+        fs::remove_file(lock)?;
+    }
+    Ok(())
+}
+
+/// The creation's index reservation, held by a checkout until it publishes
+/// the index. It is never released on error: an unfinished graft keeps it,
+/// so Git cannot commit the files it lacks as deletions.
+struct IndexReservation {
+    admin: std::path::PathBuf,
+}
+
+impl IndexReservation {
+    /// Take over the reservation in `admin`, creating it for a workspace that
+    /// was not reserved by the registry. A lock without Graft's marker belongs
+    /// to a Git process and is refused.
+    fn hold(admin: &Path) -> Result<Self> {
+        let lock = admin.join("index.lock");
+        if !crate::registry::exists(&lock)? {
+            reserve_index(admin)?;
+        }
+        ensure!(
+            crate::registry::regular(&lock)? == CREATION_LOCK,
+            "reserve workspace Git index: another process holds {}",
+            lock.display()
+        );
+        ensure!(
+            matches!(fs::symlink_metadata(admin.join("index")), Err(error) if error.kind() == io::ErrorKind::NotFound),
+            "workspace Git index already exists"
+        );
+        Ok(Self {
+            admin: admin.to_path_buf(),
+        })
+    }
+
+    /// Publish `index` as the workspace index, then release the reservation.
+    fn publish(self, index: &Path) -> Result<()> {
+        crate::recovery::rename_exclusive(index, &self.admin.join("index"))
+            .context("publish workspace Git index")?;
+        fs::remove_file(self.admin.join("index.lock")).context("release workspace Git index")?;
+        Ok(())
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use native::Root as NoFollowRoot;
 
@@ -392,12 +441,29 @@ fn native_checkout(
     entries: &[Entry],
     reason: &str,
 ) -> Result<Value> {
+    // Git checks out into a private index while the reservation holds the
+    // workspace's index lock, then the index is published in one rename.
+    let admin = worktree.join(".git");
+    let reservation = IndexReservation::hold(&admin)?;
+    let scratch = tempfile::Builder::new()
+        .prefix(".graft-checkout-")
+        .tempdir_in(&admin)?;
+    let index = scratch.path().join("index");
+    let command = || {
+        let mut command = git_command(worktree);
+        command.env("GIT_INDEX_FILE", &index);
+        command
+    };
     if !sparse.is_empty() {
         let mut args = vec!["sparse-checkout", "set", "--cone", "--"];
         args.extend(sparse.iter().map(String::as_str));
-        git(worktree, &args)?;
+        local::run({
+            let mut set = command();
+            set.args(&args);
+            set
+        })?;
     }
-    let output = parallel_checkout(git_command(worktree))
+    let output = parallel_checkout(command())
         .args(["read-tree", "-m", "-u", oid])
         .output()?;
     ensure!(
@@ -405,6 +471,7 @@ fn native_checkout(
         "Git checkout: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
+    reservation.publish(&index)?;
     let mut result = Receipt::default();
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Ok(root) = native::Root::open(worktree) {
@@ -864,15 +931,9 @@ impl Prepared {
         let worktree = checkout.worktree;
         let git_dir = worktree.join(".git");
         crate::registry::owned_directory(&git_dir)?;
-        let destination = git_dir.join("index");
-        let lock = git_dir.join("index.lock");
-        // Use Git's lock protocol while publishing into a newly initialized
-        // repository. The index must never overwrite one created by Git.
-        let lock = reserve_index(&lock)?;
-        ensure!(
-            matches!(fs::symlink_metadata(&destination), Err(error) if error.kind() == io::ErrorKind::NotFound),
-            "workspace Git index already exists"
-        );
+        // The reservation holds Git's index lock for the whole creation. The
+        // index must never overwrite one created by Git.
+        let reservation = IndexReservation::hold(&git_dir)?;
         for entry in fs::read_dir(self.staging.path().join("tree"))? {
             let entry = entry?;
             crate::recovery::rename_exclusive(&entry.path(), &worktree.join(entry.file_name()))?;
@@ -886,8 +947,7 @@ impl Prepared {
             tree: worktree,
         }
         .run(&["update-index", "--refresh"], None)?;
-        crate::recovery::rename_exclusive(&index, &destination)?;
-        lock.close()?;
+        reservation.publish(&index)?;
         let backend = if cfg!(target_os = "macos") {
             "clonefile"
         } else {
@@ -909,9 +969,11 @@ fn prepare(checkout: &Checkout<'_>, state: &Path, primary: Option<&Path>) -> Res
     let secret = cache::key(state, true)?;
     let mut receipt = Receipt::default();
     let mode = native::creation_mode(worktree)?;
+    // Stage inside the Git directory, so an interrupted creation never leaves
+    // Graft's files among the checkout.
     let staging = tempfile::Builder::new()
         .prefix(".graft-source-")
-        .tempdir_in(worktree)?;
+        .tempdir_in(worktree.join(".git"))?;
     let tree = staging.path().join("tree");
     fs::create_dir(&tree)?;
     let index = staging.path().join("index");
@@ -2313,8 +2375,10 @@ mod tests {
             if !conflict.ends_with("index") {
                 assert!(!workspace.join(".git/index").exists());
             }
+            // A creation that stops keeps its marked reservation, so Git
+            // cannot write an index for the files it lacks.
             if !conflict.ends_with("index.lock") {
-                assert!(!workspace.join(".git/index.lock").exists());
+                assert_eq!(fs::read(workspace.join(".git/index.lock"))?, CREATION_LOCK);
             }
         }
         Ok(())

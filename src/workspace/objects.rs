@@ -365,10 +365,15 @@ fn require_pristine(root: &Path) -> Result<()> {
             entry.file_name() == ".git" && entry.file_type()?.is_dir(),
             "graft is not empty"
         );
+        // A reservation holds only Graft's marker and its marked index lock.
         for admin in fs::read_dir(entry.path())? {
             let admin = admin?;
+            let name = admin.file_name();
             ensure!(
-                admin.file_name() == MARKER && admin.file_type()?.is_file(),
+                admin.file_type()?.is_file()
+                    && (name == MARKER
+                        || name == "index.lock"
+                            && fs::read(admin.path())? == crate::storage::CREATION_LOCK),
                 "workspace Git directory has already been initialized or contains foreign data"
             );
         }

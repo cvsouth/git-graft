@@ -1,5 +1,4 @@
 //! Graft creation, inspection, integration and recoverable retirement.
-mod creation;
 mod land;
 mod objects;
 mod registry;
@@ -124,7 +123,7 @@ fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
     let previous = args
         .request_id
         .as_ref()
-        .and_then(|id| registry::authenticate(p, &args.name, id).ok())
+        .and_then(|id| registry::for_request(p, &args.name, id))
         .filter(|record| !record.request.is_null());
     // Each Git query below costs a process launch. Run the read-only ones
     // concurrently, then report their results in the original order.
@@ -167,7 +166,6 @@ fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
         }
     };
     let mut reserved_base = None;
-    let retry = previous.is_some();
     if let Some(current) = previous {
         ensure!(
             current.request == request,
@@ -175,7 +173,7 @@ fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
         );
         if current.status == Status::Active {
             registry::verify(p, &current)?;
-            return Ok(with_lease(&current));
+            return with_leftovers(p, &current);
         }
         reserved_base = current.base;
     }
@@ -221,7 +219,7 @@ fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
         })
         .and_then(|oid| objects::CheckoutDiscovery::start(origin, oid, local));
     crate::trace::mark("start discovery");
-    let mut r = registry::reserve(
+    let (mut r, _lock) = registry::reserve_locked(
         p,
         &args.name,
         args.request_id.as_deref(),
@@ -231,12 +229,9 @@ fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
     )?;
     if r.status == Status::Active {
         registry::verify(p, &r)?;
-        return Ok(with_lease(&r));
+        return with_leftovers(p, &r);
     }
     crate::trace::mark("reserve");
-    // Hold the graft lock while building, so a retry of this request waits
-    // for this attempt instead of reclaiming the reservation beneath it.
-    let _lock = registry::workspace_lock(p, &r.name)?;
     let creation = Creation {
         history,
         base: base.as_deref(),
@@ -246,14 +241,25 @@ fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
         no_deps: args.no_deps,
         locked: args.lock.then(|| args.reason.unwrap_or_default()),
     };
-    if let Err(error) = create(p, origin, &source, &mut r, &creation, proof, retry) {
-        return Err(incomplete(
-            &r,
+    if let Err(error) = create(p, origin, &source, &mut r, &creation, proof) {
+        return Err(api::fault(
+            "spawn_incomplete",
             format!("Creating the graft stopped: {error:#}"),
-            "Retry the same request to finish the graft, or run remove with --discard to archive it. Until then Graft holds the graft's index lock, so Git cannot commit its missing files as deletions.",
+            json!({"name":r.name,"lease":r.lease,"path":r.path,"recovery":"Retry the same request: Graft archives this attempt whole and builds the graft again. Until then Graft holds the graft's index lock, so Git cannot commit its missing files as deletions."}),
         ));
     }
-    Ok(with_lease(&r))
+    with_leftovers(p, &r)
+}
+
+/// The reply for a finished graft, naming any unfinished earlier attempts of
+/// its request that were archived whole, with the lease that restores each.
+fn with_leftovers(p: &Project, r: &Record) -> Result<Value> {
+    let mut value = with_lease(r);
+    let archived = registry::leftovers(p, &r.name, &r.lease)?;
+    if !archived.is_empty() {
+        value["archived_attempts"] = json!(archived);
+    }
+    Ok(value)
 }
 
 /// The history of a recorded request that relied on the project's policy.
@@ -269,8 +275,8 @@ fn recorded_history(request: &Value) -> api::History {
     }
 }
 
-/// What a reserved graft is built from. A first attempt, a retry of the same
-/// request and a restored, unfinished creation all build from these options.
+/// What a reserved graft is built from: a first attempt, a retry of the same
+/// request, or a restored creation that never finished.
 struct Creation<'a> {
     history: api::History,
     base: Option<&'a str>,
@@ -282,11 +288,9 @@ struct Creation<'a> {
     locked: Option<String>,
 }
 
-/// Build the reserved graft `r` and mark it active. The caller holds the
-/// graft's workspace lock. A `resumed` creation first reclaims what an
-/// interrupted attempt left; see [`creation::restart`]. If building
-/// stops, the graft keeps an index lock so Git cannot use it while it is
-/// incomplete.
+/// Build the freshly reserved graft `r` and mark it active. The caller holds
+/// the graft's workspace lock. The reservation's index lock stays in place
+/// if building stops, so Git cannot use the graft while it is incomplete.
 fn create(
     p: &Project,
     origin: &Path,
@@ -294,121 +298,114 @@ fn create(
     r: &mut Record,
     c: &Creation<'_>,
     proof: Option<objects::CheckoutDiscovery>,
-    resumed: bool,
 ) -> Result<()> {
     registry::verify(p, r)?;
     crate::trace::mark("verify reservation");
-    let built = (|| -> Result<()> {
-        if resumed {
-            creation::restart(&r.path, c.base)?;
+    let (objects, prepared_checkout) = objects::initialize(
+        source, &r.path, &p.state, c.base, c.branch, c.history, proof,
+    )?;
+    crate::trace::mark("initialize objects");
+    let mut checkout = match (prepared_checkout, c.base) {
+        (Some(checkout), _) => checkout,
+        (None, Some(oid)) if !c.no_checkout => {
+            let materialize = if c.history != api::History::Isolated {
+                storage::materialize_local
+            } else {
+                storage::materialize
+            };
+            materialize(&r.path, &p.state, oid, c.sparse, origin)?
         }
-        let (objects, prepared_checkout) = objects::initialize(
-            source, &r.path, &p.state, c.base, c.branch, c.history, proof,
-        )?;
-        crate::trace::mark("initialize objects");
-        let mut checkout = match (prepared_checkout, c.base) {
-            (Some(checkout), _) => checkout,
-            (None, Some(oid)) if !c.no_checkout => {
-                let materialize = if c.history != api::History::Isolated {
-                    storage::materialize_local
-                } else {
-                    storage::materialize
-                };
-                materialize(&r.path, &p.state, oid, c.sparse, origin)?
-            }
-            _ => json!({"backend":"empty","files":0,"logical_bytes":0}),
-        };
-        checkout["objects"] = objects;
-        crate::trace::mark("checkout");
-        if c.base.is_some() && !c.no_checkout && c.sparse.is_empty() && !c.no_deps {
-            if let Some(deps) = layer::inherit_shared(&r.path, &p.state, &p.repo)? {
-                checkout["dependencies"] = deps;
-            }
-            let registered = crate::package_manager::attach(p, &r.path);
-            if !registered.is_empty() {
-                checkout["registered_dependencies"] = json!(registered);
-            }
+        _ => json!({"backend":"empty","files":0,"logical_bytes":0}),
+    };
+    // A checkout published its index and released the reservation; an
+    // unborn or --no-checkout graft has no index to publish.
+    storage::release_index(&r.path.join(".git"))?;
+    checkout["objects"] = objects;
+    crate::trace::mark("checkout");
+    if c.base.is_some() && !c.no_checkout && c.sparse.is_empty() && !c.no_deps {
+        if let Some(deps) = layer::inherit_shared(&r.path, &p.state, &p.repo)? {
+            checkout["dependencies"] = deps;
         }
-        r.storage = checkout;
-        r.locked.clone_from(&c.locked);
-        let finished = registry::finish(p, r);
-        crate::trace::mark("finish");
-        finished
-    })();
-    if built.is_err() {
-        // The reservation was verified as this graft's, so it may be guarded.
-        // The build error is reported either way.
-        let _ = creation::guard(&r.path);
+        let registered = crate::package_manager::attach(p, &r.path);
+        if !registered.is_empty() {
+            checkout["registered_dependencies"] = json!(registered);
+        }
     }
-    built
+    r.storage = checkout;
+    r.locked.clone_from(&c.locked);
+    registry::finish(p, r)?;
+    crate::trace::mark("finish");
+    Ok(())
 }
 
-/// Report a creation that stopped before it finished, with what is needed to
-/// archive it.
-fn incomplete(r: &Record, message: String, recovery: &str) -> anyhow::Error {
-    api::fault(
-        "spawn_incomplete",
-        message,
-        json!({"name":r.name,"lease":r.lease,"path":r.path,"recovery":recovery}),
-    )
-}
-
-/// Restore an archived graft. A creation archived before it finished is
-/// built again when what it left can be reclaimed: no index was published,
-/// and every checkout file still matches its commit. Otherwise it is restored
-/// as it was, still pending and guarded by Graft's index lock, and the
-/// reply's `incomplete` says why and how to archive it again.
-fn restore(p: &Project, name: &str, lease: &str) -> Result<Value> {
-    let restored = registry::restore(p, name, lease)?;
-    if restored.status != Status::Pending {
-        return Ok(with_lease(&restored));
-    }
-    let _lock = registry::workspace_lock(p, name)?;
-    let mut r = registry::authenticate(p, name, &restored.lease)?;
-    registry::verify(p, &r)?;
-    if r.status != Status::Pending {
-        return Ok(with_lease(&r));
-    }
-    if creation::progress(&r.path)? == creation::Progress::Published {
-        // Git published the checkout before the creation stopped.
-        creation::release(&r.path)?;
-        return Ok(with_lease(&r));
-    }
-    if let Err(error) = finish_restored(p, &mut r) {
-        creation::guard(&r.path)?;
-        let mut value = with_lease(&r);
-        value["incomplete"] = json!({
-            "reason": format!("The graft's creation never finished: {error:#}"),
-            "recovery": "Graft keeps the graft's index lock, so Git cannot commit its missing files as deletions. Run remove with --discard and this lease to archive it again.",
-        });
-        return Ok(value);
-    }
-    Ok(with_lease(&r))
-}
-
-/// Build a restored creation again from its recorded add options.
-fn finish_restored(p: &Project, r: &mut Record) -> Result<()> {
-    let mut request = r.request.clone();
+/// Restore an archived graft. An archived creation that never finished is
+/// kept exactly as it is; a new graft is built in its place from the same add
+/// options, and the reply's `unfinished_archive` names the archive and the
+/// lease that keeps it. Restoring it again returns that same graft. The new
+/// graft takes its base from `origin`, which is resolved only for such an
+/// archive.
+fn restore(
+    p: &Project,
+    origin: impl FnOnce() -> Result<PathBuf>,
+    name: &str,
+    lease: &str,
+) -> Result<Value> {
+    let Some((archived, next)) = registry::unfinished_archive(p, name, lease)? else {
+        return Ok(with_lease(&registry::restore(p, name, lease)?));
+    };
+    let origin = &origin()?;
+    let mut request = archived.request.clone();
     let options = request
         .as_object_mut()
-        .context("its add options were not recorded")?;
+        .context("the unfinished creation's add options were not recorded")?;
     options.remove("project_local_history");
     options.remove("project_history");
-    let args: Spawn =
-        serde_json::from_value(request).context("its add options could not be read")?;
-    let history = args.history.unwrap_or_else(|| recorded_history(&r.request));
-    let (base, branch) = (r.base.clone(), r.branch.clone());
-    let creation = Creation {
-        history,
-        base: base.as_deref(),
-        branch: branch.as_deref(),
-        sparse: &args.sparse,
-        no_checkout: args.no_checkout,
-        no_deps: args.no_deps,
-        locked: args.lock.then(|| args.reason.clone().unwrap_or_default()),
-    };
-    let source = objects::preflight(&p.repo)?;
-    create(p, &p.repo, &source, r, &creation, None, true)
+    let args: Spawn = serde_json::from_value(request)
+        .context("the unfinished creation's add options could not be read")?;
+    let history = args
+        .history
+        .unwrap_or_else(|| recorded_history(&archived.request));
+    // A nested add may start from a commit only its parent graft holds, so
+    // check the origin has it before reserving anything.
+    if let Some(base) = &archived.base {
+        git::oid(origin, base).with_context(|| {
+            format!(
+                "the unfinished graft's base commit {base} is not in {}; run restore from the graft the add ran in",
+                origin.display()
+            )
+        })?;
+    }
+    let (mut r, _lock) = registry::reserve_locked(
+        p,
+        name,
+        Some(&next),
+        archived.base.as_deref(),
+        archived.branch.as_deref(),
+        archived.request.clone(),
+    )?;
+    if r.status != Status::Active {
+        let creation = Creation {
+            history,
+            base: archived.base.as_deref(),
+            branch: archived.branch.as_deref(),
+            sparse: &args.sparse,
+            no_checkout: args.no_checkout,
+            no_deps: args.no_deps,
+            locked: args.lock.then(|| args.reason.clone().unwrap_or_default()),
+        };
+        let source = objects::preflight(origin)?;
+        if let Err(error) = create(p, origin, &source, &mut r, &creation, None) {
+            return Err(api::fault(
+                "spawn_incomplete",
+                format!("Building the graft again stopped: {error:#}"),
+                json!({"name":r.name,"lease":r.lease,"path":r.path,"recovery":"Restore the archive again with its lease to retry; the archive itself is unchanged."}),
+            ));
+        }
+    }
+    let mut value = with_leftovers(p, &r)?;
+    value["unfinished_archive"] =
+        json!({"archive_path": archived.archive, "lease": archived.lease});
+    Ok(value)
 }
 
 fn clean(path: &Path, allow_ignored: bool) -> Result<()> {
@@ -679,6 +676,24 @@ fn report_status(p: &Project, name: &str) -> Result<Value> {
     Ok(result)
 }
 
+/// The repository a new graft takes its base and objects from: the graft
+/// the command runs in, since a child can start from a commit only its
+/// parent owns, or else the primary.
+fn origin(p: &Project, repo: &Path, location: Option<&registry::Location>) -> Result<PathBuf> {
+    let Some(location) = location else {
+        return Ok(p.repo.clone());
+    };
+    let parent = registry::load(p, &location.name)?;
+    ensure!(
+        parent.id == location.id
+            && parent.status == Status::Active
+            && dunce::canonicalize(repo)?.starts_with(&parent.path),
+        "the invoking graft moved or is no longer active"
+    );
+    registry::verify(p, &parent)?;
+    Ok(parent.path)
+}
+
 pub fn run(repo: &Path, command: Command) -> Result<Value> {
     // Resolving the project is read-only, so it runs beside the version check;
     // a version failure is still reported first.
@@ -764,26 +779,15 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             let Command::Spawn(args) = command else {
                 unreachable!()
             };
-            let origin = if let Some(location) = location {
-                // A child can start from a commit that only its parent workspace owns.
-                let parent = registry::load(p, &location.name)?;
-                ensure!(
-                    parent.id == location.id
-                        && parent.status == Status::Active
-                        && dunce::canonicalize(repo)?.starts_with(&parent.path),
-                    "the invoking graft moved or is no longer active"
-                );
-                registry::verify(p, &parent)?;
-                parent.path
-            } else {
-                p.repo.clone()
-            };
-            return spawn(p, &origin, args);
+            return spawn(p, &origin(p, repo, location.as_ref())?, args);
         }
         Command::SeedLayer(a) => return engine::seed_layer(p, a),
         Command::Drop(a) => return drop_workspace(p, a),
         Command::Land(a) => return land_workspace(p, a),
-        Command::Restore(a) => return restore(p, &a.name, &a.lease),
+        Command::Restore(a) => {
+            let origin = || origin(p, repo, location.as_ref());
+            return restore(p, origin, &a.name, &a.lease);
+        }
         Command::UndoLand(a) => {
             let r = registry::load_retired(p, &a.name, &a.lease)?;
             let plan = r.plan.as_ref().context("graft was not archived by merge")?;

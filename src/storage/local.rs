@@ -162,7 +162,7 @@ pub(super) struct LocalCheckout<'a> {
     worktree: &'a Path,
     scratch: tempfile::TempDir,
     index: PathBuf,
-    index_lock: tempfile::TempPath,
+    reservation: IndexReservation,
     proof_objects: Option<&'a Path>,
 }
 
@@ -170,11 +170,7 @@ impl<'a> LocalCheckout<'a> {
     fn reserve(worktree: &'a Path, proof_objects: Option<&'a Path>) -> Result<Self> {
         ensure_empty(worktree)?;
         let admin = worktree.join(".git");
-        let index_lock = reserve_index(&admin.join("index.lock"))?;
-        ensure!(
-            matches!(fs::symlink_metadata(admin.join("index")), Err(error) if error.kind() == io::ErrorKind::NotFound),
-            "workspace Git index already exists"
-        );
+        let reservation = IndexReservation::hold(&admin)?;
         let scratch = tempfile::Builder::new()
             .prefix(".graft-local-")
             .tempdir_in(&admin)?;
@@ -184,7 +180,7 @@ impl<'a> LocalCheckout<'a> {
             worktree,
             scratch,
             index,
-            index_lock,
+            reservation,
             proof_objects,
         })
     }
@@ -216,11 +212,7 @@ impl<'a> LocalCheckout<'a> {
     }
 
     fn publish(self) -> Result<()> {
-        let destination = self.worktree.join(".git/index");
-        crate::recovery::rename_exclusive(&self.index, &destination)
-            .context("publish workspace Git index")?;
-        self.index_lock.close()?;
-        Ok(())
+        self.reservation.publish(&self.index)
     }
 
     fn native(
