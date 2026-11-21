@@ -120,9 +120,8 @@ impl Snapshot {
                 );
             }
         }
-        self.admin
-            .0
-            .sync_all()
+        // Ordered before the checkout; finishing the graft makes it durable.
+        crate::registry::order(&self.admin.0)
             .context("sync independent Git object snapshot")?;
         Ok(Some(self.receipt))
     }
@@ -358,7 +357,7 @@ impl Source {
         for loose in loose_totals {
             totals.merge(loose);
         }
-        finish_snapshot_writeback(destination)?;
+        crate::registry::order(&File::open(destination)?)?;
         let bytes = totals.pack_bytes + totals.index_bytes + totals.loose_bytes;
         Ok(json!({
             "method": if cfg!(target_os = "macos") { "clonefile" } else { "reflink" },
@@ -511,8 +510,9 @@ impl Totals {
 }
 
 // All staged files and directories are on the same device. On macOS fsync
-// waits for writeback, and F_FULLFSYNC then drains the device cache once for
-// the batch. A failed final flush disqualifies the unpublished snapshot.
+// waits for writeback, and one write barrier then orders the batch before
+// its publication (see `crate::registry::order`). Finishing the graft flushes
+// the device. A failed barrier disqualifies the unpublished snapshot.
 fn sync_snapshot_entry(file: &File) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -528,19 +528,6 @@ fn sync_snapshot_entry(file: &File) -> io::Result<()> {
     }
     #[cfg(target_os = "linux")]
     file.sync_all()
-}
-
-fn finish_snapshot_writeback(directory: &Path) -> io::Result<()> {
-    let root = File::open(directory)?;
-    #[cfg(target_os = "macos")]
-    {
-        if unsafe { libc::fcntl(root.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    #[cfg(target_os = "linux")]
-    root.sync_all()
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -1001,10 +1001,24 @@ fn persist(p: &Project, r: &Record) -> Result<()> {
 }
 
 fn write_record(directory: &Path, r: &Record) -> Result<()> {
+    store_record(directory, r, atomic)
+}
+
+/// [`write_record`] during a reservation: ordered before the steps that
+/// follow, and made durable with them when [`finish`] writes the record.
+fn order_record(directory: &Path, r: &Record) -> Result<()> {
+    store_record(directory, r, crate::registry::atomic_ordered)
+}
+
+fn store_record(
+    directory: &Path,
+    r: &Record,
+    write: fn(&Path, &[u8]) -> Result<()>,
+) -> Result<()> {
     validate_record(r)?;
     let path = directory.join(format!("{}.json", r.id));
     ensure!(absent_or_regular(&path)?, "graft record path is occupied");
-    atomic(&path, &serde_json::to_vec(r)?)
+    write(&path, &serde_json::to_vec(r)?)
 }
 
 /// Whether `path` is missing or an ordinary file reached without a link.
@@ -1396,6 +1410,18 @@ pub(super) fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Order the entries of the directory `path` before every later write
+/// without flushing the device (see [`crate::registry::order`]). Creating a
+/// graft orders its steps this way: the creation reports nothing until
+/// [`finish`] durably writes the active record, which flushes them all.
+pub(super) fn order_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    crate::registry::order(&File::open(path)?)?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 fn same_filesystem(source: &Path, destination: &Path) -> Result<bool> {
     let parent = destination.parent().context("destination has no parent")?;
     Ok(file_id(source)?.volume == file_id(parent)?.volume)
@@ -1429,11 +1455,17 @@ fn relocate(p: &Project, r: &Record, from: &Path, to: &Path, fresh_placement: bo
         }
     }
     // Persist the directory entries before committing the journal record.
+    // A fresh placement only orders them, as the rest of the creation does.
     let from_parent = from.parent().context("source has no parent")?;
     let to_parent = to.parent().context("destination has no parent")?;
-    sync_directory(to_parent)?;
+    let sync = if fresh_placement {
+        order_directory
+    } else {
+        sync_directory
+    };
+    sync(to_parent)?;
     if from_parent != to_parent && exists(from_parent)? {
-        sync_directory(from_parent)?;
+        sync(from_parent)?;
     }
     // An external Git command can run independently of our locks. If a
     // nested checkout appeared during the rename, retain both the data and
@@ -1691,16 +1723,19 @@ pub(super) fn reserve_locked(
     let admin = stage.path().join(".git");
     dir(&admin)?;
     let id = Uuid::new_v4().to_string();
-    atomic(
+    // Each step below is ordered before the next rather than flushed: a power
+    // loss keeps a prefix of them, which recovery handles like an interrupted
+    // reservation. The graft is reported only after finish flushes them all.
+    crate::registry::atomic_ordered(
         &admin.join(MARKER),
         &serde_json::to_vec(&marker(p, &id, name))?,
     )?;
     // Hold the index lock from the start, so Git cannot write an index for
     // missing files at any point before the checkout is published.
     crate::storage::reserve_index(&admin)?;
-    sync_directory(&admin)?;
-    sync_directory(stage.path())?;
-    sync_directory(&root)?;
+    order_directory(&admin)?;
+    order_directory(stage.path())?;
+    order_directory(&root)?;
     crate::trace::mark("reserve: stage marker");
     let identity = Identity::read(stage.path())?;
     crate::trace::mark("reserve: identity");
@@ -1732,13 +1767,13 @@ pub(super) fn reserve_locked(
         superseded_by: None,
     };
     let result = (|| {
-        write_record(&directory, &r)?;
+        order_record(&directory, &r)?;
         crate::trace::mark("reserve: write placement");
         // The private stage was just created with only our marker and lock.
         relocate(p, &r, &from, &r.path, true)?;
         crate::trace::mark("reserve: relocate");
         r.transition = None;
-        write_record(&directory, &r)
+        order_record(&directory, &r)
     })();
     if let Err(error) = result {
         return Err(fault(
