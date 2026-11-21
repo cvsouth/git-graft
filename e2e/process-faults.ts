@@ -544,6 +544,14 @@ export const cases: Scenario[] = [
       assert.equal(readFileSync(join(ctx.repo, 'payload.dat'), 'utf8'), 'filtered payload\n');
       // The filter outlives the killed add; let it finish before retrying.
       await waitFor(() => existsSync(finished), 'the orphaned checkout filter');
+      // Until recovery, a reservation without a published index keeps an
+      // index lock, so Git cannot commit its missing files as deletions.
+      const pending = graftStatus(ctx, 'interrupted');
+      assert.equal(pending?.status, 'pending', JSON.stringify(pending));
+      const reserved = String(pending?.path);
+      if (!existsSync(join(reserved, '.git', 'index'))) {
+        assert(existsSync(join(reserved, '.git', 'index.lock')), 'an unfinished graft left Git able to write its index');
+      }
       // Retrying the same request completes the graft; another request cannot take the name.
       assert.equal(ctx.fail(['add', 'interrupted', '--request-id', randomUUID()]).code, 'already_exists');
       const retried = await graft(ctx, ['add', 'interrupted', '--history', history, '--request-id', id]);
@@ -556,19 +564,17 @@ export const cases: Scenario[] = [
         ctx.cli(['remove', 'interrupted', '--lease', id, '--discard']);
         path = restore(ctx, 'interrupted', id);
       }
+      // Recovery ends in a complete checkout: every tracked file is present
+      // and matches HEAD. A missing file would be committed as a deletion.
       assert.equal(ctx.git(['rev-parse', 'HEAD'], path), base);
       assert.equal(readFileSync(join(path, 'payload.dat'), 'utf8'), 'filtered payload\n');
+      const tracked = ctx.git(['ls-files', '-z'], path).split('\0').filter(Boolean);
+      assert.deepEqual(tracked.toSorted(), ['.gitattributes', '.gitignore', 'payload.dat', 'tracked.txt']);
+      for (const file of tracked) assert(existsSync(join(path, file)), `recovered graft is missing ${file}`);
+      assert.equal(ctx.git(['status', '--porcelain', '--untracked-files=all'], path), '');
       ctx.git(['fsck', '--full'], path);
-      // Known gap: a local-history add reserves the graft's index with an
-      // empty index.lock, and nothing reclaims it after a kill. It holds no
-      // data, so deleting it, as Git's own message suggests, makes the graft
-      // usable. Until recovery reclaims it, pin that it is Graft's empty file.
-      const reservation = join(path, '.git', 'index.lock');
-      if (existsSync(reservation)) {
-        assert.equal(history, 'local', 'an isolated add left an index lock');
-        assert.equal(readFileSync(reservation).length, 0);
-        rmSync(reservation);
-      }
+      // Recovery reclaims the index lock the interrupted creation held.
+      assert(!existsSync(join(path, '.git', 'index.lock')), 'recovery left the index lock');
       // The recovered graft is usable: Git can write its index and commit.
       write(path, 'after.txt', 'work after recovery\n');
       ctx.git(['add', 'after.txt'], path);
