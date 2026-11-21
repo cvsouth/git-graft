@@ -1105,8 +1105,8 @@ impl Update {
                 Ok(true) => {
                     return self.local_changes(
                         path,
-                        "Files written while Graft was updating",
-                        "lie where updating",
+                        "Files written during the update",
+                        "would be overwritten by updating",
                         "Git kept them as they are. Move them aside, then retry",
                         refused,
                     );
