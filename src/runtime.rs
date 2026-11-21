@@ -115,21 +115,127 @@ impl Runtime {
             .with_context(|| format!("start {program}"))?;
         // Drain both pipes concurrently, even after the capture limit, to avoid
         // deadlocks when a child writes large amounts to either stream.
-        let stdout = child.stdout.take().context("capture stdout")?;
-        let stderr = child.stderr.take().context("capture stderr")?;
-        let out_thread = thread::spawn(move || capture(stdout));
-        let err_thread = thread::spawn(move || capture(stderr));
+        let stdout = Capture::start(child.stdout.take().context("capture stdout")?)?;
+        let stderr = Capture::start(child.stderr.take().context("capture stderr")?)?;
         let status = child.wait().context("wait for child")?;
-        let (stdout, stdout_truncated) = out_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("stdout reader failed"))??;
-        let (stderr, stderr_truncated) = err_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("stderr reader failed"))??;
+        let (stdout, stdout_truncated) = stdout.finish("stdout")?;
+        let (stderr, stderr_truncated) = stderr.finish("stderr")?;
         Ok(
             json!({"success": status.success(), "exit_code": status.code(),
             "stdout": stdout, "stderr": stderr,
             "stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated}),
+        )
+    }
+}
+
+/// How long output may keep arriving after the started process exits.
+/// Windows hands every inheritable handle to the processes a child starts,
+/// so a background process keeps the output pipes open even when it never
+/// writes to them; output after this is not captured.
+#[cfg(windows)]
+const OUTPUT_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Output read so far, and whether it exceeded [`OUTPUT_LIMIT`].
+#[derive(Default)]
+struct Captured {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+/// One output pipe drained on its own thread.
+struct Capture {
+    output: std::sync::Arc<std::sync::Mutex<Captured>>,
+    reader: thread::JoinHandle<io::Result<()>>,
+    /// Set before reads are cancelled, so a cancelled read is not an error.
+    #[cfg(windows)]
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A second handle to the pipe that stays open while the reader runs.
+    #[cfg(windows)]
+    pipe: std::os::windows::io::OwnedHandle,
+}
+
+impl Capture {
+    #[cfg(not(windows))]
+    fn start(reader: impl Read + Send + 'static) -> Result<Self> {
+        let output = std::sync::Arc::default();
+        let shared = std::sync::Arc::clone(&output);
+        let reader = thread::spawn(move || capture(reader, &shared, &|| false));
+        Ok(Self { output, reader })
+    }
+
+    #[cfg(windows)]
+    fn start<R>(reader: R) -> Result<Self>
+    where
+        R: Read + Send + std::os::windows::io::AsHandle + 'static,
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pipe = reader.as_handle().try_clone_to_owned()?;
+        let output = std::sync::Arc::default();
+        let shared = std::sync::Arc::clone(&output);
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&cancelled);
+        let reader =
+            thread::spawn(move || capture(reader, &shared, &|| flag.load(Ordering::SeqCst)));
+        Ok(Self {
+            output,
+            reader,
+            cancelled,
+            pipe,
+        })
+    }
+
+    /// Wait until the pipe closes, and return what it carried.
+    #[cfg(not(windows))]
+    fn finish(self, name: &str) -> Result<(String, bool)> {
+        self.reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("{name} reader failed"))??;
+        Ok(Self::take_from(&self.output))
+    }
+
+    /// Wait until the pipe closes or [`OUTPUT_DRAIN`] passes, and return what
+    /// it carried. A reader still blocked by a background process that holds
+    /// the pipe is cancelled, or left to end when that process exits.
+    #[cfg(windows)]
+    fn finish(self, name: &str) -> Result<(String, bool)> {
+        use std::os::windows::io::AsRawHandle;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::IO::{CancelIoEx, CancelSynchronousIo};
+        let wait = |deadline: Instant| {
+            while !self.reader.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            self.reader.is_finished()
+        };
+        if !wait(Instant::now() + OUTPUT_DRAIN) {
+            self.cancelled.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !self.reader.is_finished() && Instant::now() < deadline {
+                // SAFETY: both handles stay open for these calls: `pipe` is
+                // owned here, and the thread has not finished.
+                unsafe {
+                    CancelIoEx(self.pipe.as_raw_handle(), std::ptr::null());
+                    CancelSynchronousIo(self.reader.as_raw_handle());
+                }
+                wait(Instant::now() + Duration::from_millis(20));
+            }
+        }
+        if self.reader.is_finished() {
+            self.reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("{name} reader failed"))??;
+        }
+        Ok(Self::take_from(&self.output))
+    }
+
+    fn take_from(output: &std::sync::Mutex<Captured>) -> (String, bool) {
+        let captured = output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            String::from_utf8_lossy(&captured.bytes).into_owned(),
+            captured.truncated,
         )
     }
 }
@@ -173,20 +279,29 @@ fn inherit(_command: &mut Command, file: &std::fs::File) -> Result<()> {
     Ok(())
 }
 
-fn capture(mut reader: impl Read) -> io::Result<(String, bool)> {
-    let mut retained = Vec::new();
-    let mut truncated = false;
+/// Read `reader` to its end into `output`, keeping at most [`OUTPUT_LIMIT`]
+/// bytes. A read that fails after `cancelled` is set ends quietly.
+fn capture(
+    mut reader: impl Read,
+    output: &std::sync::Mutex<Captured>,
+    cancelled: &dyn Fn() -> bool,
+) -> io::Result<()> {
     let mut buffer = [0; 8192];
     loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        let keep = n.min(OUTPUT_LIMIT.saturating_sub(retained.len()));
-        retained.extend_from_slice(&buffer[..keep]);
-        truncated |= keep < n;
+        let n = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) if cancelled() => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut captured = output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keep = n.min(OUTPUT_LIMIT.saturating_sub(captured.bytes.len()));
+        captured.bytes.extend_from_slice(&buffer[..keep]);
+        captured.truncated |= keep < n;
     }
-    Ok((String::from_utf8_lossy(&retained).into_owned(), truncated))
 }
 
 /// The file name of a native executable on this platform.
