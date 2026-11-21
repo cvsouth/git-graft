@@ -312,6 +312,12 @@ exec "$GRAFT_TEST_GIT" "$@"
       const restored = ctx.cli(['restore', ...args]);
       assert.equal(restored.path, path);
       assert.equal(read(path, 'my-recovery-note'), 'retain this file\n');
+      // A file Graft did not write keeps the creation from being rebuilt. It
+      // stays pending, and its index lock keeps Git from committing it.
+      assert.equal(restored.status, 'pending');
+      assert.equal(typeof objectResult(restored.incomplete).reason, 'string');
+      assert(!existsSync(join(path, '.git', 'index')));
+      assert(existsSync(join(path, '.git', 'index.lock')));
       assert.equal(read(ctx.repo, 'selected'), 'content missing from the export\n');
       assert.equal(ctx.git(['rev-parse', 'HEAD']), tip);
       assert.equal(ctx.git(['status', '--porcelain']), '');
