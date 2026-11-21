@@ -122,19 +122,31 @@ fn materialize_with<F: FnOnce() -> Result<()>>(
     early: Early<'_>,
 ) -> Result<Value> {
     let proof_objects = metadata.objects;
-    let oid = checkout_identity_with_objects(workspace, oid, proof_objects)?;
+    // Checking the checkout's identity only reads, and preparing a planned
+    // index only writes the private scratch index, so both run at once.
+    // Nothing reaches the working tree until the identity is confirmed.
+    let (identity, checkout, prepared) = std::thread::scope(|scope| {
+        let identity =
+            scope.spawn(|| checkout_identity_with_objects(workspace, oid, proof_objects));
+        let checkout = LocalCheckout::reserve(workspace, proof_objects);
+        let prepared = match (&checkout, metadata.index) {
+            (Ok(checkout), Some(manifest)) => manifest.prepare(checkout).is_ok(),
+            _ => false,
+        };
+        (crate::workspace::joined(identity), checkout, prepared)
+    });
+    let oid = identity?;
     validate_sparse(workspace, &oid, sparse)?;
-    let mut checkout = LocalCheckout::reserve(workspace, proof_objects)?;
-    crate::trace::mark("checkout: identity and reserve");
+    let mut checkout = checkout?;
+    crate::trace::mark("checkout: identity and index");
     let listed;
     let files = if let Some(manifest) = metadata.index {
-        if manifest.prepare(&checkout).is_err() {
+        if !prepared {
             ready()?;
             drop(checkout);
             return materialize_local(workspace, state, &oid, sparse, primary);
         }
         checkout.planned = true;
-        crate::trace::mark("checkout: prepare index");
         &manifest.entries
     } else {
         listed = entries_with_objects(workspace, &oid, proof_objects)?;
