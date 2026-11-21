@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - A merge or undo into the branch checked out in the primary now goes ahead around your uncommitted edits, as `git merge` does, and leaves them exactly as they were: staged changes stay staged and unstaged edits keep their bytes. It refuses only when an edit touches a path the merge changes, with `destination_has_local_changes` listing those paths in `details.paths`. A retry of a merge stopped before it wrote any file follows the same rule, so an unrelated edit no longer keeps it stuck.
-- `remove` and `merge` refuse a graft with uncommitted, untracked or ignored files as `local_changes`, listing each path with its status (`modified`, `untracked` or `ignored`) and noting that `remove --discard` archives them.
+- `remove` and `merge` refuse a graft with uncommitted, untracked or ignored files as `local_changes`, listing each path with its status (`added`, `deleted`, `modified`, `untracked` or `ignored`); on `remove` it notes that `remove --discard` archives them.
 
 ## [0.1.0] - 2026-11-21
 

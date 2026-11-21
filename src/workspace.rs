@@ -370,9 +370,9 @@ const LISTED_CHANGES: usize = 200;
 /// Refuse to archive a graft whose files hold work Git has not recorded:
 /// staged, unstaged and untracked changes and, unless `allow_ignored`,
 /// ignored files. The refusal is `local_changes`, naming each path with its
-/// status, and touches nothing. `remove --discard` would archive every one of
-/// these files with the rest of the graft, so `discard_archives` is always
-/// true: Graft never deletes them.
+/// status, and touches nothing. For `remove`, `discard_archives` is always
+/// true: `remove --discard` would archive every one of these files with the
+/// rest of the graft, never delete them. `merge` has no such option.
 fn clean(path: &Path, allow_ignored: bool, retiring: Retiring) -> Result<()> {
     git::check_idle(path)?;
     let found: Vec<_> = git::changes(path)?
@@ -386,9 +386,12 @@ fn clean(path: &Path, allow_ignored: bool, retiring: Retiring) -> Result<()> {
         .iter()
         .take(LISTED_CHANGES)
         .map(|change| {
-            let status = match change.status.as_str() {
-                "??" => "untracked",
-                "!!" => "ignored",
+            let status = match change.status.as_bytes() {
+                b"??" => "untracked",
+                b"!!" => "ignored",
+                // The staged side names a staged addition or deletion.
+                [b'A', _] | [b' ', b'A'] => "added",
+                [b'D', _] | [b' ', b'D'] => "deleted",
                 _ => "modified",
             };
             json!({"path": change.path, "status": status})
@@ -402,13 +405,17 @@ fn clean(path: &Path, allow_ignored: bool, retiring: Retiring) -> Result<()> {
             "Commit or merge them, or archive the graft with them using remove --discard and keep the recovery lease. Its files and index have been retained"
         }
     };
+    let mut details = json!({"paths": paths, "count": found.len()});
+    if matches!(retiring, Retiring::Remove) {
+        details["discard_archives"] = json!(true);
+    }
     Err(api::fault(
         "local_changes",
         format!(
             "The graft has {} local changes or ignored files. {remedy}",
             found.len()
         ),
-        json!({"paths": paths, "count": found.len(), "discard_archives": true}),
+        details,
     ))
 }
 
@@ -884,9 +891,26 @@ mod tests {
         }
         std::fs::write(repo.join(".gitignore"), "build/\n")?;
         std::fs::write(repo.join("tracked.txt"), "tracked\n")?;
+        std::fs::write(repo.join("old.txt"), "old\n")?;
         git::bytes(repo, &["add", "-A"])?;
         git::bytes(repo, &["commit", "-qm", "base"])?;
         clean(repo, false, Retiring::Remove)?;
+
+        std::fs::write(repo.join("new.txt"), "new\n")?;
+        git::bytes(repo, &["add", "new.txt"])?;
+        git::bytes(repo, &["rm", "-q", "old.txt"])?;
+        let error = api::error_json(&clean(repo, false, Retiring::Merge).unwrap_err());
+        assert_eq!(
+            error["details"],
+            json!({"paths": [
+                {"path": "new.txt", "status": "added"},
+                {"path": "old.txt", "status": "deleted"},
+            ], "count": 2}),
+            "a merge has no discard option to describe"
+        );
+        git::bytes(repo, &["reset", "-q", "--", "new.txt", "old.txt"])?;
+        std::fs::remove_file(repo.join("new.txt"))?;
+        git::bytes(repo, &["checkout", "-q", "--", "old.txt"])?;
 
         std::fs::write(repo.join("tracked.txt"), "edited\n")?;
         std::fs::write(repo.join("notes.txt"), "untracked\n")?;
