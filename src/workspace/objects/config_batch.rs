@@ -127,4 +127,45 @@ mod tests {
         }
         Ok(())
     }
+
+    /// One to three inherited settings, written once, read back with the
+    /// values `git config --local` would have stored.
+    #[test]
+    fn single_write_matches_git_config() -> Result<()> {
+        use super::super::run;
+        let settings = [
+            ("user.name", r#" Ann "Q" Lee \ #1 "#),
+            ("core.autocrlf", "true"),
+            ("user.email", "a;b@example.com"),
+        ]
+        .map(|(key, value)| (key.to_owned(), value.to_owned()));
+        for count in 1..=settings.len() {
+            let chosen = &settings[..count];
+            let [batched, git] = [tempfile::tempdir()?, tempfile::tempdir()?];
+            for repo in [&batched, &git] {
+                run(repo.path(), &["init", "--quiet", "--template="])?;
+            }
+            assert!(append(batched.path(), chosen)?);
+            for (key, value) in chosen {
+                run(git.path(), &["config", "--local", "--", key, value])?;
+            }
+            // The batch opens a new section where Git would reuse one, so
+            // compare the entries Git reads, each key set once.
+            let entries = |repo: &Path| -> Result<Vec<Vec<u8>>> {
+                let listed = run(
+                    repo,
+                    &["config", "--file", ".git/config", "--null", "--list"],
+                )?;
+                let mut entries: Vec<_> = listed.split(|&b| b == 0).map(<[u8]>::to_vec).collect();
+                entries.sort();
+                Ok(entries)
+            };
+            assert_eq!(
+                entries(batched.path())?,
+                entries(git.path())?,
+                "{count} settings"
+            );
+        }
+        Ok(())
+    }
 }
