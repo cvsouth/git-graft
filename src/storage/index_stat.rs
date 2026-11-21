@@ -101,15 +101,76 @@ pub(super) fn record(index: &Path, installed: &HashMap<Vec<u8>, Installed>) -> R
     let mut bytes = fs::read(index).context("read private Git index")?;
     let updated = patch(&mut bytes, installed)?;
     if updated > 0 {
-        let parent = index.parent().context("private Git index has no parent")?;
-        let mut staged = tempfile::NamedTempFile::new_in(parent)?;
-        std::io::Write::write_all(&mut staged, &bytes)?;
-        staged
-            .persist(index)
-            .map_err(|error| error.error)
-            .context("replace private Git index")?;
+        replace(index, &bytes)?;
     }
     Ok(updated)
+}
+
+/// Refresh the change times of the top-level entries just renamed into
+/// `worktree` from the private tree Git checked them out in. A rename moves
+/// a file's change time, which Git compares, after Git recorded it. Only the
+/// change time is updated, and only where every other recorded field still
+/// matches the file; anything else is left for Git to check.
+/// Returns how many entries were updated.
+#[cfg(unix)]
+pub(super) fn renamed(index: &Path, worktree: &Path, width: usize) -> Result<usize> {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let mut bytes = fs::read(index).context("read private Git index")?;
+    let (slots, _) = walk(&bytes, width)?;
+    let mut updated = 0;
+    for slot in slots {
+        let start = slot.start;
+        // A submodule's stat data is not compared, and a nested entry's
+        // own inode was not renamed.
+        if slot.path.contains(&b'/')
+            || slot.flags & STAGE != 0
+            || slot.extended & SKIP_WORKTREE != 0
+            || be32(&bytes, start + 24)? == 0o160000
+        {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(worktree.join(OsStr::from_bytes(&slot.path)))
+        else {
+            continue;
+        };
+        let mut current = [0; STAT];
+        Stat::from_metadata(&metadata).write(&mut current);
+        let recorded = &mut bytes[start..start + STAT];
+        if recorded[8..24] == current[8..24]
+            && recorded[28..] == current[28..]
+            && recorded[..8] != current[..8]
+        {
+            recorded[..8].copy_from_slice(&current[..8]);
+            updated += 1;
+        }
+    }
+    if updated > 0 {
+        reseal(&mut bytes, width);
+        replace(index, &bytes)?;
+    }
+    Ok(updated)
+}
+
+/// Recompute the index checksum, unless Git wrote it as zeros
+/// (`index.skipHash`).
+fn reseal(bytes: &mut [u8], width: usize) {
+    let body = bytes.len() - width;
+    if bytes[body..].iter().any(|&b| b != 0) {
+        let sum = digest(&bytes[..body], width);
+        bytes[body..].copy_from_slice(&sum);
+    }
+}
+
+/// Atomically replace the private index with `bytes`.
+fn replace(index: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = index.parent().context("private Git index has no parent")?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut staged, bytes)?;
+    staged
+        .persist(index)
+        .map_err(|error| error.error)
+        .context("replace private Git index")?;
+    Ok(())
 }
 
 fn be32(bytes: &[u8], at: usize) -> Result<u32> {
@@ -222,8 +283,6 @@ fn patch(bytes: &mut [u8], installed: &HashMap<Vec<u8>, Installed>) -> Result<us
         .context("no installed entries")?;
     ensure!(matches!(width, 20 | 32), "unsupported object ID width");
     let (slots, _) = walk(bytes, width)?;
-    let body = bytes.len() - width;
-    let trailer_was_zero = bytes[body..].iter().all(|&b| b == 0);
     let mut updated = 0;
     for slot in slots {
         let Some(entry) = installed.get(&slot.path) else {
@@ -242,9 +301,8 @@ fn patch(bytes: &mut [u8], installed: &HashMap<Vec<u8>, Installed>) -> Result<us
         entry.stat.write(&mut bytes[start..start + STAT]);
         updated += 1;
     }
-    if updated > 0 && !trailer_was_zero {
-        let sum = digest(&bytes[..body], width);
-        bytes[body..].copy_from_slice(&sum);
+    if updated > 0 {
+        reseal(bytes, width);
     }
     Ok(updated)
 }
@@ -514,6 +572,51 @@ mod tests {
                 assert!(!debug.contains("ctime: 0:0"), "{debug}");
             }
         }
+    }
+
+    /// Renaming a checked-out file into place moves only its change time.
+    /// The index follows it, and an edited file is left for Git to check.
+    #[test]
+    fn renamed_entries_take_their_new_change_time() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        git(root.path(), &["init", "-q", "repo"]);
+        fs::create_dir(repo.join("dir")).unwrap();
+        for name in ["a.txt", "b.txt", "dir/c.txt"] {
+            fs::write(repo.join(name), name).unwrap();
+        }
+        git(&repo, &["add", "."]);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let aside = root.path().join("aside");
+        for name in ["a.txt", "b.txt"] {
+            fs::rename(repo.join(name), &aside).unwrap();
+            fs::rename(&aside, repo.join(name)).unwrap();
+        }
+        // A same-size edit moves the modification time as well.
+        fs::write(repo.join("b.txt"), "B.txt").unwrap();
+        let index = repo.join(".git/index");
+        assert_eq!(renamed(&index, &repo, 20).unwrap(), 1);
+        let ctime = |name: &str| {
+            let debug = git(&repo, &["ls-files", "--debug", name]);
+            let line = debug
+                .lines()
+                .find(|line| line.trim_start().starts_with("ctime:"));
+            line.unwrap().trim_start()["ctime: ".len()..].to_owned()
+        };
+        let actual = |name: &str| {
+            let metadata = fs::symlink_metadata(repo.join(name)).unwrap();
+            format!("{}:{}", metadata.ctime(), metadata.ctime_nsec())
+        };
+        assert_eq!(ctime("a.txt"), actual("a.txt"));
+        assert_ne!(ctime("b.txt"), actual("b.txt"));
+        assert_eq!(ctime("dir/c.txt"), actual("dir/c.txt"));
+        assert_eq!(
+            git(&repo, &["status", "--porcelain"]),
+            "A  a.txt\nAM b.txt\nA  dir/c.txt\n"
+        );
+        // Nothing is left to refresh.
+        assert_eq!(renamed(&index, &repo, 20).unwrap(), 0);
     }
 
     #[test]

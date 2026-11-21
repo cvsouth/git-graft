@@ -279,6 +279,9 @@ impl<'a> LocalCheckout<'a> {
             crate::recovery::rename_exclusive(&entry.path(), &destination)
                 .with_context(|| format!("publish checkout path {}", destination.display()))?;
         }
+        // Keep the index exactly as Git's own checkout in place would.
+        #[cfg(unix)]
+        index_stat::renamed(&self.index, self.worktree, oid.len() / 2)?;
         Ok(receipt.json("git", Some(reason)))
     }
 }
