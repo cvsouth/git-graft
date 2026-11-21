@@ -93,6 +93,22 @@ Retry the same request. Graft deletes nothing: it archives the whole unfinished 
 
 An archived creation that never finished cannot be restored: `restore` with its lease, or with the lease of a pending graft you archived with `remove --discard`, fails with `unfinished_creation` and leaves the archive exactly as it was. `details.archive_path` names it; copy what you need from there, or run `add` again.
 
+## Uncommitted edits in the primary checkout
+
+A merge or undo into the branch checked out in the primary works like `git merge` with local edits. Your uncommitted edits stay exactly as they were, as long as none of them touches a path the merge changes. Edits are staged and unstaged changes and untracked files. Staged changes stay staged, unstaged edits keep their bytes, line endings included, and untracked files stay where they are. A retry of a merge that was stopped before it wrote any file follows the same rule.
+
+If any edit touches a path the merge changes, Graft refuses with `destination_has_local_changes` and changes nothing. `details.paths` lists the overlapping paths, and `details.checkout`, `target`, `previous` and `commit` name the checkout and the update. Commit those edits or move them aside, then retry. Edits to other paths can stay.
+
+These edits count as touching a changed path:
+
+- an edit, deletion, staged version or type change (file, symlink or directory) of a file the merge changes, including a staged version that already equals the merged one;
+- an untracked file where the merge adds a file, including one whose name differs only by case or Unicode normalization on a filesystem that treats both spellings as one name;
+- either side of a rename, because a rename is a deletion and an addition;
+- a file inside a path the merge turns into a file, or a file the merge turns into a directory;
+- a submodule with new commits or edits, when the merge moves that submodule. A merge that leaves the submodule alone never touches it.
+
+Graft checks again just before Git writes the files, so an edit made while the merge prepares is refused the same way. Git's own update also checks each file it replaces against the index before it writes any of them. Ignored files have their own rule: the merge stops when it would overwrite one. Unresolved conflicts, assume-unchanged or skip-worktree flags and sparse checkouts in the primary still block the merge.
+
 ## When two tasks edit the same file
 
 Two grafts created from the same commit each get a writable checkout of that version. Saving or committing a file in one leaves the other graft and the primary at their own versions. When both tasks merge into the same branch, the first successful merge updates that branch. Graft uses Git's three-way merge for a second, diverged task. Edits to separate parts of a file can merge automatically.
@@ -135,6 +151,8 @@ These codes and fields tell you that Graft kept something instead of deleting or
 | `spawn_incomplete` | `add` stopped before the graft was built. `details.path` is the pending graft, which holds its index lock so Git cannot commit it. | Retry the same request. See [interrupted add](#interrupted-add). |
 | `archived_attempts` | Named in `add`, `status`, merge, remove, `restore` and `prune` replies about a graft whose request was retried: archives of its unfinished attempts, each with `archive_path` and `lease`. | Copy what you need from `archive_path`. |
 | `unfinished_creation` | `restore` was asked for an archive of a creation that never finished. `details.archive_path` names it; nothing was changed. | Copy what you need from the archive, or run `add` again. |
+| `destination_has_local_changes` | Uncommitted edits in the primary checkout touch paths the merge or undo changes. `details.paths` lists them; nothing changed. | Commit those edits or move them aside, then retry. See [uncommitted edits in the primary checkout](#uncommitted-edits-in-the-primary-checkout). |
+| `local_changes` | `merge` or `remove` found uncommitted, untracked or ignored files in the graft. `details.paths` lists up to 200 of them, each with `status` `modified`, `untracked` or `ignored`, and `details.count` gives the total. `details.discard_archives` is `true`: `remove --discard` archives every one of them with the graft. | Commit them and retry, or archive the graft with `remove --discard` and keep the `recovery_lease`. |
 | `checkout_recovery_required` | A checkout update of the primary was interrupted. `details.paths` lists files that need attention. | Retry the same merge or undo with the same lease. See [interrupted checkout update](#interrupted-checkout-update). |
 | `checkout_update_set_aside` | An interrupted checkout update can no longer finish because its branch moved or is no longer checked out. The journal stays at `details.recovery_path`. | Check `git status` in the primary, then retry the merge. |
 | `git_busy` | A Git lock or an unreadable index in the graft or primary is held by a command Graft did not start, or cannot prove has exited. | Wait for the Git command to finish. Remove a lock only once no Git command is running. |
