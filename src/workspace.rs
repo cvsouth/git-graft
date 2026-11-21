@@ -251,11 +251,17 @@ fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
     with_leftovers(p, &r)
 }
 
-/// The reply for a finished graft, naming any unfinished earlier attempts of
-/// its request that were archived whole, with the lease that restores each.
+/// The reply for a finished graft, with its lease.
 fn with_leftovers(p: &Project, r: &Record) -> Result<Value> {
-    let mut value = with_lease(r);
-    let archived = registry::leftovers(p, &r.name, &r.lease)?;
+    with_attempts(p, r, with_lease(r))
+}
+
+/// Add `archived_attempts` to a reply about the graft `r`: the unfinished
+/// earlier attempts of its request that a retry archived whole, each with its
+/// archive path and lease. Every reply about the graft repeats them, so they
+/// are not lost with the add reply.
+fn with_attempts(p: &Project, r: &Record, mut value: Value) -> Result<Value> {
+    let archived = registry::archived_attempts(p, r)?;
     if !archived.is_empty() {
         value["archived_attempts"] = json!(archived);
     }
@@ -353,8 +359,8 @@ fn clean(path: &Path, allow_ignored: bool) -> Result<()> {
 /// merge had landed, the action is `remove`: the receipt still names the
 /// merge that landed, and `head` is the archived graft HEAD whose later
 /// commits were never merged.
-fn receipt(r: &Record) -> Value {
-    match (&r.plan, &r.unmerged_head) {
+fn receipt(p: &Project, r: &Record) -> Result<Value> {
+    let value = match (&r.plan, &r.unmerged_head) {
         (Some(plan), None) => {
             json!({"action":"merge","name":r.name,"target":plan.target,"previous":plan.old,
             "commit":plan.new,"graft_tip":plan.tip,"removed":true,"recovery_lease":r.lease})
@@ -367,11 +373,12 @@ fn receipt(r: &Record) -> Value {
         (None, _) => {
             json!({"action":"remove","name":r.name,"removed":true,"recovery_lease":r.lease})
         }
-    }
+    };
+    with_attempts(p, r, value)
 }
 
 fn retire(p: &Project, name: &str, lease: &str, status: Status) -> Result<Value> {
-    Ok(receipt(&registry::retire(p, name, lease, status, None)?))
+    receipt(p, &registry::retire(p, name, lease, status, None)?)
 }
 
 fn destination_contains(p: &Project, plan: &crate::landing::Plan) -> Result<bool> {
@@ -424,7 +431,7 @@ fn land_workspace(p: &Project, opts: &api::Land) -> Result<Value> {
     if let Ok(r) = registry::load_retired(p, &opts.name, &opts.lease)
         && r.plan.as_ref().is_some_and(|plan| plan.target == opts.into)
     {
-        return Ok(receipt(&r));
+        return receipt(p, &r);
     }
     let mut r = registry::authenticate(p, &opts.name, &opts.lease)?;
     if r.retiring_to().is_some() {
@@ -499,11 +506,10 @@ fn keep_advanced(p: &Project, mut r: Record) -> Result<Value> {
     let plan = r.plan.take().context("no merge is pending")?;
     let head = git::oid(&r.path, "HEAD")?;
     registry::save(p, &r)?;
-    Ok(
-        json!({"action":"merge","name":r.name,"target":plan.target,"previous":plan.old,
+    let value = json!({"action":"merge","name":r.name,"target":plan.target,"previous":plan.old,
         "commit":plan.new,"graft_tip":plan.tip,"graft_head":head,"removed":false,
-        "message":format!("Merged the graft up to {}. The graft has later work at {head}, so it stays active; merge it again to land that work.", plan.tip)}),
-    )
+        "message":format!("Merged the graft up to {}. The graft has later work at {head}, so it stays active; merge it again to land that work.", plan.tip)});
+    with_attempts(p, &r, value)
 }
 
 fn drop_workspace(p: &Project, opts: &api::DropWorkspace) -> Result<Value> {
@@ -513,7 +519,7 @@ fn drop_workspace(p: &Project, opts: &api::DropWorkspace) -> Result<Value> {
     if let Ok(r) = registry::load_retired(p, &opts.name, &opts.lease)
         && (r.status == Status::Dropped || opts.discard)
     {
-        return Ok(receipt(&r));
+        return receipt(p, &r);
     }
     let mut r = registry::authenticate(p, &opts.name, &opts.lease)?;
     if r.retiring_to() == Some(Status::Landed) && opts.discard {
@@ -539,13 +545,10 @@ fn drop_workspace(p: &Project, opts: &api::DropWorkspace) -> Result<Value> {
                     .then(|| git::oid(&r.path, "HEAD"))
                     .transpose()?
                     .filter(|head| *head != plan.tip);
-                return Ok(receipt(&registry::retire(
+                return receipt(
                     p,
-                    &r.name,
-                    &r.lease,
-                    Status::Landed,
-                    head.as_deref(),
-                )?));
+                    &registry::retire(p, &r.name, &r.lease, Status::Landed, head.as_deref())?,
+                );
             }
             crate::landing::require_no_pending_checkout(&p.repo, plan)?;
             r.plan = None;
@@ -603,7 +606,7 @@ fn report_status(p: &Project, name: &str) -> Result<Value> {
         result["change_count"] = json!(changes.len());
         result["changes"] = json!(changes.iter().take(200).collect::<Vec<_>>());
     }
-    Ok(result)
+    with_attempts(p, &r, result)
 }
 
 pub fn run(repo: &Path, command: Command) -> Result<Value> {
@@ -710,7 +713,7 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
         Command::SeedLayer(a) => return engine::seed_layer(p, a),
         Command::Drop(a) => return drop_workspace(p, a),
         Command::Land(a) => return land_workspace(p, a),
-        Command::Restore(a) => return Ok(with_lease(&registry::restore(p, &a.name, &a.lease)?)),
+        Command::Restore(a) => return with_leftovers(p, &registry::restore(p, &a.name, &a.lease)?),
         Command::UndoLand(a) => {
             let r = registry::load_retired(p, &a.name, &a.lease)?;
             let plan = r.plan.as_ref().context("graft was not archived by merge")?;

@@ -317,6 +317,21 @@ export function killedAdd(history: 'local' | 'isolated', window: AddWindow): Sce
       write(path, 'after.txt', 'work after recovery\n');
       ctx.git(['add', 'after.txt'], path);
       ctx.git(['commit', '-qm', 'Work after recovery'], path);
+      // Every later reply about the graft names the archived attempt again,
+      // so it is not lost with the add reply.
+      const attempts = retried.json.archived_attempts;
+      assert.deepEqual(ctx.cli(['status', 'interrupted']).archived_attempts, attempts);
+      assert.deepEqual(ctx.cli(['merge', 'interrupted', '--lease', id]).archived_attempts, attempts);
+      const restored = ctx.cli(['restore', 'interrupted', '--lease', id]);
+      assert.deepEqual(restored.archived_attempts, attempts);
+      age(ctx);
+      const pruned = ctx.cli(['prune']);
+      assert(Array.isArray(pruned.retained));
+      const entry = pruned.retained.map(objectResult).find(w => w.name === 'interrupted');
+      assert.deepEqual(entry?.archived_attempts, attempts, JSON.stringify(pruned));
+      const removed = ctx.cli(['remove', 'interrupted', '--lease', String(restored.lease), '--discard']);
+      assert.deepEqual(removed.archived_attempts, attempts);
+      assertKept(archive, files);
     },
   };
 }

@@ -212,6 +212,9 @@ pub struct Summary {
     /// Why prune could not check this graft. It was left as it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// For prune, the archived unfinished attempts of the graft's request.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub archived_attempts: Vec<Value>,
 }
 
 fn summary(r: &Record, available: bool, reason: Option<&'static str>) -> Summary {
@@ -247,6 +250,7 @@ fn summary(r: &Record, available: bool, reason: Option<&'static str>) -> Summary
         storage: r.storage.clone(),
         reason,
         error: None,
+        archived_attempts: Vec::new(),
     }
 }
 
@@ -1519,7 +1523,7 @@ fn valid_port(port: u16) -> bool {
 /// caller keeps until the graft is built. Retrying `request_id` returns its
 /// finished graft. An unfinished one is archived whole with a new lease, then
 /// a fresh reservation takes the same name, path and request ID; see
-/// [`leftovers`].
+/// [`archived_attempts`].
 #[cfg(test)]
 pub fn reserve(
     p: &Project,
@@ -1733,17 +1737,25 @@ pub fn for_request(p: &Project, name: &str, request_id: &str) -> Option<Record> 
         .cloned()
 }
 
-/// Archives of unfinished attempts replaced by the graft with `lease`, each
-/// with its archive path and its own lease.
-pub fn leftovers(p: &Project, name: &str, lease: &str) -> Result<Vec<Value>> {
-    Ok(scan(p)?
-        .records
+/// Archives of unfinished attempts that a retry of `r`'s request replaced,
+/// each with its archive path and its own lease. The request's lease is `r`'s
+/// lease, or one of its earlier leases once `r` was restored, so every reply
+/// about the graft names them, even after the add reply was lost.
+fn attempts_of(records: &[Record], r: &Record) -> Vec<Value> {
+    let request =
+        |lease: &String| *lease == r.lease || r.previous.iter().any(|old| old.lease == *lease);
+    records
         .iter()
-        .filter(|r| {
-            r.name == name && r.status.retired() && r.superseded_by.as_deref() == Some(lease)
+        .filter(|a| {
+            a.name == r.name && a.status.retired() && a.superseded_by.as_ref().is_some_and(request)
         })
-        .map(|r| json!({"archive_path": r.archive, "lease": r.lease}))
-        .collect())
+        .map(|a| json!({"archive_path": a.archive, "lease": a.lease}))
+        .collect()
+}
+
+/// [`attempts_of`] the graft `r`, read from the current records.
+pub fn archived_attempts(p: &Project, r: &Record) -> Result<Vec<Value>> {
+    Ok(attempts_of(&scan(p)?.records, r))
 }
 
 pub fn finish(p: &Project, r: &mut Record) -> Result<()> {
@@ -2248,17 +2260,20 @@ fn open_existing_lock(p: &Project, name: &str) -> Result<WorkspaceLock> {
 /// An error on one graft is reported on that graft, and prune goes on.
 pub fn prune(p: &Project, apply: bool) -> Result<Vec<Summary>> {
     let mut result = Vec::new();
-    for mut r in scan(p)?.records {
+    let records = scan(p)?.records;
+    for mut r in records.iter().cloned() {
         if r.status.retired() || now().saturating_sub(r.heartbeat) < LEASE_SECS {
             continue;
         }
-        result.push(match prune_one(p, &mut r, apply) {
+        let mut entry = match prune_one(p, &mut r, apply) {
             Ok((reason, available)) => summary(&r, available, Some(reason)),
             Err(error) => Summary {
                 error: Some(format!("{error:#}")),
                 ..summary(&r, false, Some("error"))
             },
-        });
+        };
+        entry.archived_attempts = attempts_of(&records, &r);
+        result.push(entry);
     }
     Ok(result)
 }
@@ -2959,7 +2974,7 @@ mod tests {
             (lease.as_str(), &first.path, Status::Pending)
         );
         assert!(!retried.path.join("partial").exists());
-        let left = leftovers(p, "pending", &lease)?;
+        let left = archived_attempts(p, &retried)?;
         assert_eq!(left.len(), 1, "{left:?}");
         let kept = left[0]["lease"].as_str().context("leftover lease")?;
         assert_ne!(kept, lease);
