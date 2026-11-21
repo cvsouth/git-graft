@@ -367,7 +367,10 @@ export const cases: Scenario[] = [
         const before = ctx.git(['rev-parse', 'HEAD']);
         const merge = ['merge', 'unicode-collision', '--lease', ws.lease];
         if (folds) {
-          assert.match(String(ctx.fail(merge).message), /ignored path would be overwritten/i);
+          const refused = ctx.fail(merge);
+          assert.equal(refused.code, 'destination_has_local_changes', String(refused.message));
+          assert.match(String(refused.message), /Ignored files .* would be overwritten/);
+          assert.deepEqual((refused.details as Record<string, unknown>).paths, ['café/secret.env']);
           assert.equal(ctx.git(['rev-parse', 'HEAD']), before);
           assert.equal(ctx.git(['rev-parse', 'HEAD'], ws.path), tip);
         } else {

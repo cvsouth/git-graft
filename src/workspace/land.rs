@@ -901,8 +901,9 @@ mod tests {
             ".git/info/exclude",
             "collision.txt\nnoncollision.txt\n",
         );
-        let error = format!("{:#}", apply(&fixture.p, &plan).unwrap_err());
-        assert!(error.contains("collision.txt"), "{error}");
+        let error = crate::api::error_json(&apply(&fixture.p, &plan).unwrap_err());
+        assert_eq!(error["code"], "destination_has_local_changes", "{error}");
+        assert_eq!(error["details"]["paths"], json!(["collision.txt"]));
         assert_eq!(run(&fixture.p.repo, &["rev-parse", "HEAD"]), fixture.base);
         assert_eq!(
             fs::read_to_string(fixture.p.repo.join("collision.txt")).unwrap(),
@@ -951,11 +952,9 @@ mod tests {
         let index = fs::read(fixture.p.repo.join(".git/index"))?;
         let folds = fixture.p.repo.join("caf\u{e9}").exists();
         if folds {
-            let error = format!("{:#}", apply(&fixture.p, &plan).unwrap_err());
-            assert!(
-                error.contains("an ignored path would be overwritten by checkout"),
-                "{error}"
-            );
+            let error = crate::api::error_json(&apply(&fixture.p, &plan).unwrap_err());
+            assert_eq!(error["code"], "destination_has_local_changes", "{error}");
+            assert_eq!(error["details"]["paths"], json!(["caf\u{e9}/secret"]));
             assert_eq!(run(&fixture.p.repo, &["rev-parse", "HEAD"]), fixture.base);
             assert_eq!(fs::read(fixture.p.repo.join(".git/index"))?, index);
             assert!(!fixture.p.repo.join(".git/graft/checkout-update").exists());

@@ -16,23 +16,27 @@ use anyhow::Result;
 /// A file's device and file number, read without following a final symlink.
 type Identity = (u64, u64);
 
-/// Return the first changed path that the filesystem resolves onto an ignored
-/// entry, onto a path inside one, or onto a directory holding one.
+/// Return each changed path that the filesystem resolves onto an ignored
+/// entry, onto a path inside one, or onto a directory holding one, in
+/// `changed` order.
 ///
 /// `ignored` and `changed` are slash-separated paths relative to `root`, as
 /// Git prints them with `-z`.
-pub(crate) fn ignored_collision<'a>(
+pub(crate) fn ignored_collisions<'a>(
     root: &Path,
     ignored: &[&[u8]],
     changed: &[&'a [u8]],
-) -> Result<Option<&'a [u8]>> {
+) -> Result<Vec<&'a [u8]>> {
     let ignored: Vec<_> = ignored
         .iter()
         .map(|path| path.strip_suffix(b"/").unwrap_or(path))
         .collect();
-    Ok(resolved_collisions(root, &ignored, changed, true)?
-        .first()
-        .map(|(_, changed)| *changed))
+    let mut found: Vec<&[u8]> = resolved_collisions(root, &ignored, changed)?
+        .into_iter()
+        .map(|(_, changed)| changed)
+        .collect();
+    found.dedup();
+    Ok(found)
 }
 
 /// The edited paths an update would write over: each edited path that is a
@@ -66,7 +70,7 @@ pub(crate) fn overlapping<'e>(
             found.insert(index);
         }
     }
-    for (index, _) in resolved_collisions(root, &paths, changed, false)? {
+    for (index, _) in resolved_collisions(root, &paths, changed)? {
         found.insert(index);
     }
     Ok(found.into_iter().map(|index| edited[index]).collect())
@@ -74,13 +78,12 @@ pub(crate) fn overlapping<'e>(
 
 /// Pairs of an entry's index and a changed path where the filesystem resolves the
 /// changed path onto the entry, onto a path inside it, or onto a directory
-/// holding it. Entries that do not exist on disk never match. With `first`,
-/// stop at the first pair.
+/// holding it, in `changed` order. Entries that do not exist on disk never
+/// match.
 fn resolved_collisions<'c>(
     root: &Path,
     entries: &[&[u8]],
     changed: &[&'c [u8]],
-    first: bool,
 ) -> Result<Vec<(usize, &'c [u8])>> {
     let mut cache = HashMap::new();
     // The entries each file identity names, and the entries inside each
@@ -112,12 +115,7 @@ fn resolved_collisions<'c>(
                 matches.extend(named.get(&id).into_iter().flatten());
             }
         }
-        for entry in matches {
-            found.push((entry, *path));
-            if first {
-                return Ok(found);
-            }
-        }
+        found.extend(matches.into_iter().map(|entry| (entry, *path)));
     }
     Ok(found)
 }
@@ -221,13 +219,22 @@ mod tests {
         fs::write(root.join("src/.env"), "SECRET=1\n")?;
         fs::write(root.join("src/main.rs"), "tracked\n")?;
         let ignored: &[&[u8]] = &[b"build/", b"src/.env"];
-        let find = |changed: &'static [u8]| ignored_collision(root, ignored, &[changed]);
+        let find = |changed: &'static [u8]| -> Result<Option<&[u8]>> {
+            Ok(ignored_collisions(root, ignored, &[changed])?
+                .first()
+                .copied())
+        };
         assert_eq!(find(b"build/out/app")?, Some(&b"build/out/app"[..]));
         assert_eq!(find(b"build")?, Some(&b"build"[..]));
         assert_eq!(find(b"src/.env")?, Some(&b"src/.env"[..]));
         assert_eq!(find(b"src")?, Some(&b"src"[..]));
         assert_eq!(find(b"src/main.rs")?, None);
         assert_eq!(find(b"new/file")?, None);
+        let all: &[&[u8]] = &[b"src", b"src/main.rs", b"build/out/app"];
+        assert_eq!(
+            ignored_collisions(root, ignored, all)?,
+            [&b"src"[..], b"build/out/app"]
+        );
         Ok(())
     }
 
@@ -294,11 +301,11 @@ mod tests {
         let ignored: &[&[u8]] = &["CAFE\u{301}/".as_bytes()];
         // Lowercase and precomposed (NFC).
         let incoming = "caf\u{e9}/secret".as_bytes();
-        let found = ignored_collision(root, ignored, &[incoming])?;
+        let found = ignored_collisions(root, ignored, &[incoming])?;
         let same = root.join("caf\u{e9}").exists();
-        assert_eq!(found.is_some(), same);
+        assert_eq!(!found.is_empty(), same);
         if folds_unicode_case(root)? && cfg!(target_os = "macos") {
-            assert_eq!(found, Some(incoming));
+            assert_eq!(found, [incoming]);
         }
         Ok(())
     }

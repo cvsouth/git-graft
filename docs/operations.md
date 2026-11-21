@@ -107,7 +107,7 @@ These edits count as touching a changed path:
 - a file inside a path the merge turns into a file, or a file the merge turns into a directory;
 - a submodule with new commits or edits, when the merge moves that submodule. A merge that leaves the submodule alone never touches it.
 
-Graft checks again just before Git writes the files, so an edit made while the merge prepares is refused the same way. Git's own update also checks each file it replaces against the index before it writes any of them. Ignored files have their own rule: the merge stops when it would overwrite one. Unresolved conflicts, assume-unchanged or skip-worktree flags and sparse checkouts in the primary still block the merge.
+Just before Git writes any file, its dry run checks every file the merge replaces again, so an edit made while the merge prepares is refused the same way and leaves no recovery state behind. An ignored file the merge would overwrite or write into also stops it with `destination_has_local_changes`, naming the paths the merge would write; move that file aside, then retry. Unresolved conflicts, assume-unchanged or skip-worktree flags and sparse checkouts in the primary still block the merge.
 
 ## When two tasks edit the same file
 

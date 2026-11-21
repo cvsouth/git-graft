@@ -489,23 +489,43 @@ impl Update {
         if refused.is_empty() {
             return Ok(());
         }
+        Err(self.local_changes(
+            path,
+            "Uncommitted changes",
+            "touch paths changed by updating",
+            "Commit them or move them aside, then retry; changes to other paths can stay",
+            &refused,
+        ))
+    }
+
+    /// `destination_has_local_changes` for `paths`: `what` in the checkout
+    /// at `path` that the update would change, such as uncommitted edits or
+    /// ignored files. Nothing was written.
+    fn local_changes(
+        &self,
+        path: &Path,
+        what: &str,
+        touch: &str,
+        remedy: &str,
+        paths: &[Vec<u8>],
+    ) -> anyhow::Error {
         let plan = &self.record.plan;
-        let names: Vec<_> = refused
+        let names: Vec<_> = paths
             .iter()
             .map(|name| String::from_utf8_lossy(name).into_owned())
             .collect();
-        Err(fault(
+        fault(
             "destination_has_local_changes",
             format!(
-                "Uncommitted changes in {} touch paths that updating {} to {} would change: {}. Graft changed nothing. Commit these changes or move them aside, then retry; changes to other paths can stay",
+                "{what} in {} {touch} {} to {}: {}. Graft changed nothing. {remedy}",
                 path.display(),
                 plan.target,
                 plan.new,
-                listed(&refused)
+                listed(paths)
             ),
             json!({"target":plan.target,"previous":plan.old,"commit":plan.new,
                 "checkout":path,"paths":names}),
-        ))
+        )
     }
 
     fn protect_ignored(&self, path: &Path, objects: Option<&Path>) -> Result<()> {
@@ -559,12 +579,11 @@ impl Update {
             .collect();
         // Byte comparison folds ASCII only. The filesystem may also fold other
         // case and Unicode normalization, so compare what each path resolves to.
-        if let Some(changed) = crate::collision::ignored_collision(path, &entries, &changed)? {
-            bail!(
-                "an ignored path would be overwritten by checkout: {}",
-                String::from_utf8_lossy(changed)
-            );
-        }
+        let mut overwritten: BTreeSet<Vec<u8>> =
+            crate::collision::ignored_collisions(path, &entries, &changed)?
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect();
         for changed in changed {
             let mut folded = changed.to_ascii_lowercase();
             let ancestor = folded
@@ -577,13 +596,21 @@ impl Update {
                 .range(folded.clone()..)
                 .next()
                 .is_some_and(|path| path.starts_with(&folded));
-            ensure!(
-                !(ancestor || exact || descendant),
-                "an ignored path would be overwritten by checkout: {}",
-                String::from_utf8_lossy(changed)
-            );
+            if ancestor || exact || descendant {
+                overwritten.insert(changed.to_vec());
+            }
         }
-        Ok(())
+        if overwritten.is_empty() {
+            return Ok(());
+        }
+        let overwritten: Vec<_> = overwritten.into_iter().collect();
+        Err(self.local_changes(
+            path,
+            "Ignored files",
+            "would be overwritten by updating",
+            "Move them aside, then retry",
+            &overwritten,
+        ))
     }
 
     fn matches_result(&self, path: &Path, objects: Option<&Path>) -> Result<bool> {
