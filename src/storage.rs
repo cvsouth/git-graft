@@ -1580,6 +1580,7 @@ mod tests {
             &repo,
             Some(&repo.join(".git/objects")),
             None,
+            None,
             || {
                 calls += 1;
                 assert!(!workspace.join(".git/index").exists());
@@ -1613,6 +1614,7 @@ mod tests {
             &oid,
             &repo,
             Some(&repo.join(".git/objects")),
+            None,
             None,
             || {
                 calls += 1;
@@ -2759,6 +2761,7 @@ mod tests {
             &oid,
             &repo,
             Some(&repo.join(".git/objects")),
+            None,
             None,
             || {
                 fs::create_dir(&module)?;

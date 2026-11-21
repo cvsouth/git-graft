@@ -441,16 +441,14 @@ pub(super) fn initialize(
     let tip_boundary = (history == History::Tip)
         .then(|| shallow::publish(root, &base, format!("{base}\n")))
         .transpose()?;
-    let transfer = || {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if history == History::Local
-            && let Some(receipt) = local::bootstrap(primary, root, format, &base)?
-        {
-            return Ok(receipt);
-        }
-        let boundary = match tip_boundary {
+    let exported = || {
+        let initialized;
+        let boundary = match &tip_boundary {
             Some(boundary) => Some(boundary),
-            None => shallow::initialize(primary, root, &base)?,
+            None => {
+                initialized = shallow::initialize(primary, root, &base)?;
+                initialized.as_ref()
+            }
         };
         history::bootstrap(
             primary,
@@ -458,41 +456,87 @@ pub(super) fn initialize(
             state,
             format,
             &base,
-            boundary.as_ref().map(shallow::Boundary::history),
+            boundary.map(shallow::Boundary::history),
         )
+    };
+    let transfer = || {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if history == History::Local
+            && let Some(receipt) = local::bootstrap(primary, root, format, &base)?
+        {
+            return Ok(receipt);
+        }
+        exported()
     };
     if history == History::Tip
         && let Some(plan) = discovery.take().and_then(CheckoutDiscovery::finish)
     {
-        return history::tip::checkout(source, root, state, &base, reference, plan, transfer);
+        return history::tip::checkout(
+            source,
+            root,
+            state,
+            &base,
+            reference,
+            plan,
+            None,
+            |_| transfer(),
+            |receipt, _| Ok(receipt),
+        );
+    }
+    // The checkout plan finishes while the snapshot is cloned. The snapshot
+    // is verified in its staging directory while the checkout runs, and
+    // published when the checkout is ready for history.
+    #[cfg(target_os = "macos")]
+    if history == History::Local {
+        let snapshot = local::snapshot(primary, root, format, &base);
+        crate::trace::mark("init: snapshot objects");
+        let Some(plan) = discovery.and_then(CheckoutDiscovery::finish) else {
+            let receipt = match snapshot {
+                Some(snapshot) => snapshot.publish(root)?,
+                None => None,
+            };
+            let receipt = match receipt {
+                Some(receipt) => receipt,
+                None => exported()?,
+            };
+            finish_head(primary, root, reference, &base, None)?;
+            return Ok((receipt, None));
+        };
+        let sizes = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.loose_blob_sizes(plan.index.blobs()));
+        return history::tip::checkout(
+            source,
+            root,
+            state,
+            &base,
+            reference,
+            plan,
+            sizes.as_ref(),
+            |plan| {
+                if let (Some(snapshot), Some(sizes)) = (&snapshot, &sizes) {
+                    // A blob read from the snapshot's own loose files is proven.
+                    plan.verify_local(root, &snapshot.objects(), |mut blobs| {
+                        blobs.retain(|blob| !sizes.contains_key(*blob));
+                        Ok(blobs)
+                    })?;
+                }
+                Ok(snapshot)
+            },
+            |snapshot, plan| {
+                if let Some(snapshot) = snapshot
+                    && let Some(receipt) = snapshot.publish(root)?
+                {
+                    return Ok(receipt);
+                }
+                let receipt = exported()?;
+                plan.verify_local(root, &root.join(".git").join("objects"), Ok)?;
+                Ok(receipt)
+            },
+        );
     }
     let receipt = transfer()?;
     crate::trace::mark("init: transfer objects");
-    #[cfg(target_os = "macos")]
-    if history == History::Local
-        && let Some(plan) = discovery.and_then(CheckoutDiscovery::finish)
-    {
-        let checkout = std::thread::scope(|scope| -> Result<Value> {
-            let verified =
-                std::thread::Builder::new().spawn_scoped(scope, || plan.verify_local(root))?;
-            finish_head(primary, root, reference, &base, None)?;
-            crate::trace::mark("init: head and config");
-            crate::storage::materialize_planned(
-                root,
-                state,
-                &base,
-                primary,
-                None,
-                Some(&plan.index),
-                || {
-                    verified
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("Git snapshot verification worker failed"))?
-                },
-            )
-        })?;
-        return Ok((receipt, Some(checkout)));
-    }
     finish_head(primary, root, reference, &base, None)?;
     Ok((receipt, None))
 }

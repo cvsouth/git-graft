@@ -1,12 +1,15 @@
 //! Direct CoW reuse from a trusted local checkout. Git still owns the tree and
 //! index, and supplies every file the donor cannot be proven to provide.
 use super::*;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 #[derive(Default)]
 struct CheckoutMetadata<'a> {
     objects: Option<&'a Path>,
     index: Option<&'a TipIndex>,
+    /// Blob sizes already read from the history the checkout will use.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    sizes: Option<&'a HashMap<String, u64>>,
 }
 
 pub(crate) fn materialize_local(
@@ -28,7 +31,9 @@ pub(crate) fn materialize_local(
     )
 }
 
-/// Prepare files from a verified manifest and join history checks before index publication.
+/// Prepare files from a verified manifest and join history checks before index
+/// publication. `sizes` holds blob sizes the caller has already proven.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize_planned<F: FnOnce() -> Result<()>>(
     workspace: &Path,
     state: &Path,
@@ -36,6 +41,7 @@ pub(crate) fn materialize_planned<F: FnOnce() -> Result<()>>(
     primary: &Path,
     proof_objects: Option<&Path>,
     manifest: Option<&TipIndex>,
+    sizes: Option<&HashMap<String, u64>>,
     ready: F,
 ) -> Result<Value> {
     let mut ready = Some(ready);
@@ -50,6 +56,7 @@ pub(crate) fn materialize_planned<F: FnOnce() -> Result<()>>(
             CheckoutMetadata {
                 objects: proof_objects,
                 index: manifest,
+                sizes,
             },
             || {
                 ready.take().expect("checkout readiness called once")()?;
@@ -82,9 +89,21 @@ fn materialize<F: FnOnce() -> Result<()>>(
     // both while the workspace index is prepared.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     return std::thread::scope(|scope| {
+        let known = metadata.sizes;
         let early = Early {
             sizes: metadata.index.map(|manifest| {
-                scope.spawn(move || direct::blob_sizes(|| git_command(primary), &manifest.entries))
+                scope.spawn(move || {
+                    let loose;
+                    let known = match known {
+                        Some(known) => known,
+                        None => {
+                            let objects = primary.join(".git").join("objects");
+                            loose = direct::loose_sizes(&objects, &manifest.entries);
+                            &loose
+                        }
+                    };
+                    direct::blob_sizes(|| git_command(primary), &manifest.entries, known)
+                })
             }),
             tracked: sparse
                 .is_empty()
@@ -403,7 +422,9 @@ pub(super) mod direct {
             let config = scope.spawn(|| raw_file_policy(checkout.worktree, gitlinks));
             let sizes = match early.sizes {
                 Some(early) => early,
-                None => scope.spawn(|| blob_sizes(|| checkout.proof_command(), files)),
+                None => {
+                    scope.spawn(|| blob_sizes(|| checkout.proof_command(), files, &HashMap::new()))
+                }
             };
             let tracked = match early.tracked {
                 Some(early) => early,
@@ -487,20 +508,49 @@ pub(super) mod direct {
         }))
     }
 
-    /// Each regular file blob's size, or `None` if Git cannot report them all.
-    /// Reading a loose object's size inflates its header, so large sets are
-    /// split across several Git processes made by `command`.
-    pub(super) fn blob_sizes(
-        command: impl Fn() -> Command + Sync,
-        files: &[Entry],
-    ) -> Option<HashMap<String, u64>> {
-        let mut seen = std::collections::HashSet::new();
+    /// The sizes of `files`' blobs that are loose in `objects`, an object
+    /// directory Git reads, from the header Git would read.
+    pub(super) fn loose_sizes(objects: &Path, files: &[Entry]) -> HashMap<String, u64> {
         let blobs: Vec<&str> = files
             .iter()
             .filter(|entry| entry.regular())
             .map(|entry| entry.blob.as_str())
-            .filter(|blob| seen.insert(*blob))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
             .collect();
+        let sizes = crate::git::loose::blob_sizes(objects, &blobs, |_, _| true);
+        blobs
+            .into_iter()
+            .zip(sizes)
+            .filter_map(|(blob, size)| Some((blob.to_owned(), size?)))
+            .collect()
+    }
+
+    /// Each regular file blob's size, or `None` if Git cannot report them all.
+    /// Blobs in `known` keep that size. Reading a loose object's size inflates
+    /// its header, so large sets of the rest are split across several Git
+    /// processes made by `command`.
+    pub(super) fn blob_sizes(
+        command: impl Fn() -> Command + Sync,
+        files: &[Entry],
+        known: &HashMap<String, u64>,
+    ) -> Option<HashMap<String, u64>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut sizes = HashMap::new();
+        let mut blobs = Vec::new();
+        for blob in files
+            .iter()
+            .filter(|entry| entry.regular())
+            .map(|entry| entry.blob.as_str())
+            .filter(|blob| seen.insert(*blob))
+        {
+            match known.get(blob) {
+                Some(&size) => {
+                    sizes.insert(blob.to_owned(), size);
+                }
+                None => blobs.push(blob),
+            }
+        }
         let workers = if blobs.len() >= 1024 { 4 } else { 1 };
         let shards = std::thread::scope(|scope| {
             let handles: Vec<_> = blobs
@@ -512,8 +562,8 @@ pub(super) mod direct {
                 .map(crate::workspace::joined)
                 .collect::<Option<Vec<_>>>()
         })?;
-        let sizes: HashMap<String, u64> = shards.into_iter().flatten().collect();
-        (sizes.len() == blobs.len()).then_some(sizes)
+        sizes.extend(shards.into_iter().flatten());
+        (sizes.len() == seen.len()).then_some(sizes)
     }
 
     fn shard_sizes(mut command: Command, blobs: &[&str]) -> Option<Vec<(String, u64)>> {
