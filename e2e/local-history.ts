@@ -306,6 +306,8 @@ exec "$GRAFT_TEST_GIT" "$@"
       const {path, lease} = objectResult(failure.details);
       assert(typeof path === 'string' && typeof lease === 'string');
       assert(!existsSync(join(path, '.git', 'index')));
+      // The index was never published, so the reply says the lock guards it.
+      assert.match(String(objectResult(failure.details).recovery), /index lock keeps Git from committing/);
       writeFileSync(join(path, 'my-recovery-note'), 'retain this file\n');
       const args = ['incomplete', '--lease', lease];
       ctx.cli(['remove', ...args, '--discard']);

@@ -242,10 +242,20 @@ fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
         locked: args.lock.then(|| args.reason.unwrap_or_default()),
     };
     if let Err(error) = create(p, origin, &source, &mut r, &creation, proof) {
+        // A failure after the checkout published its index, such as while
+        // attaching dependencies, leaves a complete checkout without the lock.
+        let guard = match storage::index_reserved(&r.path.join(".git")) {
+            Ok(true) => {
+                "Until then the graft's index lock keeps Git from committing the files it lacks as deletions."
+            }
+            _ => {
+                "Its checkout was published before it stopped, but the graft is not ready; do not work in it until the retry."
+            }
+        };
         return Err(api::fault(
             "spawn_incomplete",
             format!("Creating the graft stopped: {error:#}"),
-            json!({"name":r.name,"lease":r.lease,"path":r.path,"recovery":"Retry the same request: Graft archives this attempt whole and builds the graft again. Until then Graft holds the graft's index lock, so Git cannot commit its missing files as deletions."}),
+            json!({"name":r.name,"lease":r.lease,"path":r.path,"recovery":format!("Retry the same request: Graft archives this attempt whole and builds the graft again. {guard}")}),
         ));
     }
     with_leftovers(p, &r)

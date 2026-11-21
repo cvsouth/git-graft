@@ -60,11 +60,17 @@ pub(crate) fn reserve_index(admin: &Path) -> Result<()> {
 /// Release the reservation of a creation that publishes no index, such as an
 /// unborn or `--no-checkout` graft. A lock Graft did not create is kept.
 pub(crate) fn release_index(admin: &Path) -> Result<()> {
-    let lock = admin.join("index.lock");
-    if crate::registry::exists(&lock)? && crate::registry::regular(&lock)? == CREATION_LOCK {
-        fs::remove_file(lock)?;
+    if index_reserved(admin)? {
+        fs::remove_file(admin.join("index.lock"))?;
     }
     Ok(())
+}
+
+/// Whether a creation still holds its marked index lock in `admin`, which
+/// it releases only when it publishes the checkout's index.
+pub(crate) fn index_reserved(admin: &Path) -> Result<bool> {
+    let lock = admin.join("index.lock");
+    Ok(crate::registry::exists(&lock)? && crate::registry::regular(&lock)? == CREATION_LOCK)
 }
 
 /// The creation's index reservation, held by a checkout until it publishes
