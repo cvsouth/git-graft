@@ -103,7 +103,7 @@ export const cases: Scenario[] = [
         ctx.env.GRAFT_TEST_OBSERVED = join(ctx.root, 'link-checkout-observed');
         writeFileSync(join(bin, 'git'), `#!/bin/sh
 case " $* " in
-  *" checkout-index --stdin -z "*)
+  *" checkout-index -u --stdin -z "*)
     test -d "$GRAFT_TEST_PARENT" || exit 77
     touch "$GRAFT_TEST_OBSERVED";;
 esac
@@ -476,15 +476,19 @@ exec "$GRAFT_TEST_GIT" "$@"
           writeFileSync(join(config, 'attributes'), readFileSync(attributes));
         }
         const ws = ctx.spawn('external-' + history, ['--history', history]);
+        const shares = nativeClone && ['darwin', 'linux'].includes(process.platform);
         for (const file of ['tracked.txt', 'other.txt', 'expanded.txt', 'plain.bin']) {
-          assert.deepEqual(readFileSync(join(ws.path, file)), readFileSync(join(reference, file)));
+          // A shared file mirrors the primary, whose LF tracked.txt Git's
+          // clean under `text eol=crlf` stores unchanged; ident goes to Git.
+          const source = shares && file !== 'expanded.txt' ? ctx.repo : reference;
+          assert.deepEqual(readFileSync(join(ws.path, file)), readFileSync(join(source, file)), file);
         }
         assert.equal(ctx.git(['write-tree'], ws.path), ctx.git(['rev-parse', 'HEAD^{tree}']));
         assert.equal(ctx.git(['status', '--porcelain'], ws.path), '');
-        if (nativeClone && ['darwin', 'linux'].includes(process.platform)) {
+        if (shares) {
           const bytes = objectResult(ws.result.storage).cloned_bytes;
-          const expected = ['.gitignore', 'plain.bin', 'other.txt']
-            .reduce((sum, name) => sum + readFileSync(join(reference, name)).length, 0);
+          const expected = ['.gitignore', 'plain.bin', 'other.txt', 'tracked.txt']
+            .reduce((sum, name) => sum + readFileSync(join(ctx.repo, name)).length, 0);
           assert.equal(bytes, expected, 'expected the unchanged files to share donor data');
         }
         writeFileSync(join(ws.path, 'plain.bin'), 'private edit');
@@ -561,7 +565,9 @@ exec "$GRAFT_TEST_GIT" "$@"
         assert.equal(ctx.git(['show', ':tracked.txt'], ws.path), 'initial');
         assert.equal(ctx.git(['show', ':converted.txt'], ws.path), 'one\ntwo');
         assert.equal(read(ws.path, 'tracked.txt'), 'initial\r\n');
-        assert.equal(read(ws.path, 'converted.txt'), 'one\r\ntwo\r\n');
+        // Local grafts mirror the primary's LF file, which Git cleans to its
+        // blob; an isolated graft holds Git's own checkout.
+        assert.equal(read(ws.path, 'converted.txt'), local ? 'one\ntwo\n' : 'one\r\ntwo\r\n');
         assert.equal(read(ws.path, 'forced.lf'), 'explicit\nLF\n');
         assert.equal(read(ws.path, 'binary.raw'), '\0binary\r\nbytes\n');
         assert.equal(existsSync(join(ws.path, 'donor-untracked.txt')), false);
