@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- An `add` killed during its checkout could leave a graft without an index or with tracked files missing, which `git commit -a` would record as deletions. The graft now holds its index lock from the moment it is reserved until its checkout is published, so Git refuses to commit an unfinished graft. Retrying the request archives the unfinished attempt whole, with every file it held, and builds the graft again; the reply lists the archive in `archived_attempts`. Restoring such an archive builds a new graft and keeps the archive untouched.
+- An `add` killed during its checkout could leave a graft without an index or with tracked files missing, which `git commit -a` would record as deletions. The graft now holds its index lock from the moment it is reserved until its checkout is published, so Git refuses to commit an unfinished graft. Retrying the request archives the unfinished attempt whole, with every file it held, and builds the graft again. Replies about the graft list the archive in `archived_attempts`. Restoring an archived creation that never finished is refused with `unfinished_creation`, and the archive is left as it was.
 
 ## [0.1.0] - 2026-11-21
 
