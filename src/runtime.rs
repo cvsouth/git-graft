@@ -240,6 +240,32 @@ impl Capture {
     }
 }
 
+/// Stop processes Graft starts from inheriting Graft's own standard handles.
+///
+/// Windows gives a new process every inheritable handle of its parent, and
+/// the handles a parent passed as standard input and output arrive
+/// inheritable. Without this, a background process started by `exec` would
+/// hold the caller's output pipes open, and the caller would wait for it to
+/// exit even after Graft returned. A child that is meant to share them still
+/// receives its own copies, which the standard library duplicates for it.
+#[cfg(windows)]
+pub(crate) fn keep_standard_handles_private() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    for handle in [
+        io::stdin().as_raw_handle(),
+        io::stdout().as_raw_handle(),
+        io::stderr().as_raw_handle(),
+    ] {
+        if !handle.is_null() {
+            // SAFETY: the standard handles stay open for the whole process.
+            // A console or absent handle may refuse the change; it is not
+            // inherited through a pipe, so the result is ignored.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+}
+
 /// Let the started process, and the processes it starts in turn, inherit
 /// `file`. Git Graft opens every other file close-on-exec.
 #[cfg(unix)]
