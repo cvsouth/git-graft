@@ -511,7 +511,8 @@ pub(super) fn initialize(
             reference,
             plan,
             Some(sizes),
-            |plan| {
+            // Owning the sender ends the checkout's wait however this returns.
+            move |plan| {
                 let Some(snapshot) = snapshot else {
                     return Ok(None);
                 };
