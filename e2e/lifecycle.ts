@@ -540,7 +540,7 @@ export const cases: Scenario[] = [
       assert.equal(ctx.fail(['heartbeat', 'torn', '--lease', torn.lease]).code, 'record_damaged');
       expire(ctx, other.result.id);
       const pruned = ctx.cli(['prune', '--apply']);
-      assert.deepEqual(reasons(pruned), { other: 'archived' });
+      assert.deepEqual(reasons(pruned), { other: 'archived' }, JSON.stringify(pruned.retained));
       assert.equal(array(pruned.damaged_records).length, 1);
       ctx.cli(['restore', 'other', '--lease', other.lease]);
       assert.deepEqual(readFileSync(file), damaged);

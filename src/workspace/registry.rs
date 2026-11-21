@@ -205,7 +205,8 @@ pub struct Summary {
     pub storage: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
-    /// Why prune could not check this graft. It was left as it is.
+    /// Why prune could not check this graft, or could not verify that its
+    /// checkout is the one it created. It was left as it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -2123,7 +2124,10 @@ pub fn prune(p: &Project, apply: bool) -> Result<Vec<Summary>> {
             continue;
         }
         result.push(match prune_one(p, &mut r, apply) {
-            Ok((reason, available)) => summary(&r, available, Some(reason)),
+            Ok((reason, available, error)) => Summary {
+                error,
+                ..summary(&r, available, Some(reason))
+            },
             Err(error) => Summary {
                 error: Some(format!("{error:#}")),
                 ..summary(&r, false, Some("error"))
@@ -2133,25 +2137,31 @@ pub fn prune(p: &Project, apply: bool) -> Result<Vec<Summary>> {
     Ok(result)
 }
 
-/// The prune reason for one expired graft, and whether it is available.
-fn prune_one(p: &Project, r: &mut Record, apply: bool) -> Result<(&'static str, bool)> {
+/// The prune reason for one expired graft, whether it is available, and why
+/// its checkout could not be verified when it is missing or replaced.
+fn prune_one(
+    p: &Project,
+    r: &mut Record,
+    apply: bool,
+) -> Result<(&'static str, bool, Option<String>)> {
     if apply && r.retiring_to() == Some(Status::Dropped) {
         let _lock = open_existing_lock(p, &r.name)?;
         return match resume(p, r) {
-            Ok(()) => Ok(("archived", false)),
-            Err(error) if is_nested_git_error(&error) => Ok(("nested_git_metadata", false)),
+            Ok(()) => Ok(("archived", false, None)),
+            Err(error) if is_nested_git_error(&error) => Ok(("nested_git_metadata", false, None)),
             Err(error) => Err(error),
         };
     }
     let endpoint =
         registered_path(p, &r.name, &r.path).and_then(|()| verify_endpoint(p, r, &r.path));
     let available = endpoint.is_ok();
+    let unverified = endpoint.as_ref().err().map(|error| format!("{error:#}"));
     let reason = if r.locked.is_some() {
         "locked"
     } else if r.plan.is_some() || r.transition.is_some() || r.status == Status::Pending {
         "transition_in_progress"
     } else if !available {
-        "missing_or_replaced"
+        return Ok(("missing_or_replaced", false, unverified));
     } else {
         match open_existing_lock(p, &r.name) {
             Ok(_lock) => {
@@ -2181,7 +2191,7 @@ fn prune_one(p: &Project, r: &mut Record, apply: bool) -> Result<(&'static str, 
             Err(error) => return Err(error),
         }
     };
-    Ok((reason, available && !r.status.retired()))
+    Ok((reason, available && !r.status.retired(), None))
 }
 
 #[cfg(test)]
