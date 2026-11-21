@@ -18,12 +18,16 @@ Ten rounds measured first checkouts and sixteen measured later ones. Each round 
 
 ### Small and freshly committed repositories
 
-Creating a standalone repository has a fixed cost that a linked worktree does not: reserving a recoverable graft, snapshotting the object store and running Git's checks takes Graft about 150–190 ms even when there is almost nothing to check out. Below a few thousand files, `git worktree add` is therefore faster in absolute terms, although both finish in a fraction of a second. These first-checkout medians use synthetic repositories whose objects are all loose, as right after `git commit`:
+Creating a standalone repository has a fixed cost that a linked worktree does not: reserving a recoverable graft, snapshotting the object store and running Git's checks takes Graft about 100 ms even when there is almost nothing to check out. Below a few thousand files, `git worktree add` is therefore faster in absolute terms, although both finish in a fraction of a second. These medians use synthetic repositories whose objects are all loose, as right after `git commit`, measured with a load average of 4–10:
 
 | Repository | git-graft | `git worktree add` |
 | --- | ---: | ---: |
-| 50 files | 190 ms | 26 ms |
-| 2,000 files | 343 ms | 163 ms |
+| 50 files, first checkout | 98 ms | 21 ms |
+| 2,000 files, first checkout | 274 ms | 231 ms |
+| 3,000 files, later checkout | 294 ms | 253 ms |
+| 30,000 files, later checkout | **2.13 s** | 2.74 s |
+
+Each loose object is a separate file that Graft clones into its snapshot and `git worktree add` inflates, so both slow down with the number of loose objects; at 30,000 the snapshot's clones cost less than writing every file.
 
 The disk saving holds at every size, and from a few thousand files upward Graft's directory clones overtake the cost of writing every file.
 
@@ -68,6 +72,7 @@ A graft is a standalone repository, so creating one does more than a linked work
 - **Git's stat test instead of hashing.** A primary file whose stat data matches its non-racy index entry and whose size matches its blob holds the staged bytes, by the same test `git status` relies on. Its stat must also be unchanged across the clone. Other files are hashed.
 - **Recorded stat data.** Graft writes each cloned file's stat into the new index, exactly as Git's checkout does, so the first `git status` reads no file contents.
 - **Concurrent Git queries.** Independent read-only Git commands run in parallel instead of one after another.
+- **Loose object headers.** Right after a commit, the newest objects are loose files, and Git looks up their types and sizes one inflated header at a time. Graft reads the headers of the checkout's loose blobs itself, with several workers, from the primary's cached copies whose stat proves they are the files it cloned, while the checkout writes HEAD and its index.
 
 Set `GIT_GRAFT_TRACE=1` to print the duration of each phase of a command to standard error.
 

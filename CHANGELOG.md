@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `remove` and `merge` refuse a graft with uncommitted, untracked or ignored files as `local_changes`, listing each path with its status (`added`, `deleted`, `modified`, `untracked` or `ignored`); on `remove` it notes that `remove --discard` archives them.
 - A graft mirrors its primary's line endings. A primary file is reused when Git's own line-ending conversion of it, the one `git status` compares and `git add` stores, gives exactly the committed blob, verified by hashing the converted bytes or, for a file equal to its blob, by Git's index stat test. With `core.autocrlf=true`, an LF primary's text files are now cloned instead of written in full. Paths with a filter, `ident` or a working-tree encoding still come from Git, and so does any file `git add` would refuse under `core.safecrlf=true`.
 - `doctor` reports `file_sharing.shared` from cloning support alone; line-ending settings no longer stop sharing.
+- Creating a graft right after a commit, while the primary's newest objects are still loose, is faster. Graft reads each loose checkout blob's type and size from its object header instead of asking Git one object at a time, checks its snapshot's cloned objects without opening each one, and lists the object store with several workers. On a 3,000-file repository whose objects are all loose, a later `add` takes about 294 ms instead of 441 ms (`git worktree add`: 253 ms); at 30,000 files it takes 2.1 s instead of 3.6 s, ahead of `git worktree add` at 2.7 s.
 
 ### Fixed
 
