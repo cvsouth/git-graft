@@ -213,7 +213,7 @@ function assertComplete(ctx: Context, path: string, base: string, tracked: strin
  * Kill an `add` and every process it started inside one creation window,
  * as a crash would. The test then writes an agent's work into the leftover
  * attempt. A retry must archive that attempt byte for byte, build a complete
- * graft, and restore must find the archive by the lease the retry reported.
+ * graft, and restore must refuse the archive the retry reported, untouched.
  */
 export function killedAdd(history: 'local' | 'isolated', window: AddWindow): Scenario {
   return {
@@ -308,24 +308,12 @@ export function killedAdd(history: 'local' | 'isolated', window: AddWindow): Sce
       const replay = ctx.cli(['add', 'interrupted', '--history', history, '--request-id', id]);
       assert.deepEqual(replay.archived_attempts, retried.json.archived_attempts);
 
-      // Restoring the archive names the graft built in its place, twice over.
-      for (let round = 0; round < 2; round++) {
-        const restored = ctx.cli(['restore', 'interrupted', '--lease', lease]);
-        assert.equal(restored.lease, id);
-        assert.equal(restored.path, path);
-        assert.equal(objectResult(restored.unfinished_archive).archive_path, archive);
-      }
-      // Once that graft is archived too, restore builds a new one, and the
-      // leftover attempt's archive is still exactly as it was.
-      ctx.cli(['remove', 'interrupted', '--lease', id, '--discard']);
-      const rebuilt = ctx.cli(['restore', 'interrupted', '--lease', lease]);
-      assert.equal(rebuilt.path, path);
-      assert.notEqual(rebuilt.lease, id);
-      assert.notEqual(rebuilt.lease, lease);
-      assert.equal(objectResult(rebuilt.unfinished_archive).lease, lease);
-      assertComplete(ctx, path, base, tracked);
+      // Restore refuses an unfinished creation and leaves its archive as it was.
+      const refused = ctx.fail(['restore', 'interrupted', '--lease', lease]);
+      assert.equal(refused.code, 'unfinished_creation');
+      assert.equal(objectResult(refused.details).archive_path, archive);
       assertKept(archive, files);
-      // The rebuilt graft is usable: Git can write its index and commit.
+      // The retried graft is usable: Git can write its index and commit.
       write(path, 'after.txt', 'work after recovery\n');
       ctx.git(['add', 'after.txt'], path);
       ctx.git(['commit', '-qm', 'Work after recovery'], path);

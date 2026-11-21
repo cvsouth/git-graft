@@ -275,8 +275,8 @@ fn recorded_history(request: &Value) -> api::History {
     }
 }
 
-/// What a reserved graft is built from: a first attempt, a retry of the same
-/// request, or a restored creation that never finished.
+/// What a reserved graft is built from: the options of the first attempt or
+/// of a retry of the same request.
 struct Creation<'a> {
     history: api::History,
     base: Option<&'a str>,
@@ -336,76 +336,6 @@ fn create(
     registry::finish(p, r)?;
     crate::trace::mark("finish");
     Ok(())
-}
-
-/// Restore an archived graft. An archived creation that never finished is
-/// kept exactly as it is; a new graft is built in its place from the same add
-/// options, and the reply's `unfinished_archive` names the archive and the
-/// lease that keeps it. Restoring it again returns that same graft. The new
-/// graft takes its base from `origin`, which is resolved only for such an
-/// archive.
-fn restore(
-    p: &Project,
-    origin: impl FnOnce() -> Result<PathBuf>,
-    name: &str,
-    lease: &str,
-) -> Result<Value> {
-    let Some((archived, next)) = registry::unfinished_archive(p, name, lease)? else {
-        return Ok(with_lease(&registry::restore(p, name, lease)?));
-    };
-    let origin = &origin()?;
-    let mut request = archived.request.clone();
-    let options = request
-        .as_object_mut()
-        .context("the unfinished creation's add options were not recorded")?;
-    options.remove("project_local_history");
-    options.remove("project_history");
-    let args: Spawn = serde_json::from_value(request)
-        .context("the unfinished creation's add options could not be read")?;
-    let history = args
-        .history
-        .unwrap_or_else(|| recorded_history(&archived.request));
-    // A nested add may start from a commit only its parent graft holds, so
-    // check the origin has it before reserving anything.
-    if let Some(base) = &archived.base {
-        git::oid(origin, base).with_context(|| {
-            format!(
-                "the unfinished graft's base commit {base} is not in {}; run restore from the graft the add ran in",
-                origin.display()
-            )
-        })?;
-    }
-    let (mut r, _lock) = registry::reserve_locked(
-        p,
-        name,
-        Some(&next),
-        archived.base.as_deref(),
-        archived.branch.as_deref(),
-        archived.request.clone(),
-    )?;
-    if r.status != Status::Active {
-        let creation = Creation {
-            history,
-            base: archived.base.as_deref(),
-            branch: archived.branch.as_deref(),
-            sparse: &args.sparse,
-            no_checkout: args.no_checkout,
-            no_deps: args.no_deps,
-            locked: args.lock.then(|| args.reason.clone().unwrap_or_default()),
-        };
-        let source = objects::preflight(origin)?;
-        if let Err(error) = create(p, origin, &source, &mut r, &creation, None) {
-            return Err(api::fault(
-                "spawn_incomplete",
-                format!("Building the graft again stopped: {error:#}"),
-                json!({"name":r.name,"lease":r.lease,"path":r.path,"recovery":"Restore the archive again with its lease to retry; the archive itself is unchanged."}),
-            ));
-        }
-    }
-    let mut value = with_leftovers(p, &r)?;
-    value["unfinished_archive"] =
-        json!({"archive_path": archived.archive, "lease": archived.lease});
-    Ok(value)
 }
 
 fn clean(path: &Path, allow_ignored: bool) -> Result<()> {
@@ -676,24 +606,6 @@ fn report_status(p: &Project, name: &str) -> Result<Value> {
     Ok(result)
 }
 
-/// The repository a new graft takes its base and objects from: the graft
-/// the command runs in, since a child can start from a commit only its
-/// parent owns, or else the primary.
-fn origin(p: &Project, repo: &Path, location: Option<&registry::Location>) -> Result<PathBuf> {
-    let Some(location) = location else {
-        return Ok(p.repo.clone());
-    };
-    let parent = registry::load(p, &location.name)?;
-    ensure!(
-        parent.id == location.id
-            && parent.status == Status::Active
-            && dunce::canonicalize(repo)?.starts_with(&parent.path),
-        "the invoking graft moved or is no longer active"
-    );
-    registry::verify(p, &parent)?;
-    Ok(parent.path)
-}
-
 pub fn run(repo: &Path, command: Command) -> Result<Value> {
     // Resolving the project is read-only, so it runs beside the version check;
     // a version failure is still reported first.
@@ -779,15 +691,26 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             let Command::Spawn(args) = command else {
                 unreachable!()
             };
-            return spawn(p, &origin(p, repo, location.as_ref())?, args);
+            let origin = if let Some(location) = location {
+                // A child can start from a commit that only its parent workspace owns.
+                let parent = registry::load(p, &location.name)?;
+                ensure!(
+                    parent.id == location.id
+                        && parent.status == Status::Active
+                        && dunce::canonicalize(repo)?.starts_with(&parent.path),
+                    "the invoking graft moved or is no longer active"
+                );
+                registry::verify(p, &parent)?;
+                parent.path
+            } else {
+                p.repo.clone()
+            };
+            return spawn(p, &origin, args);
         }
         Command::SeedLayer(a) => return engine::seed_layer(p, a),
         Command::Drop(a) => return drop_workspace(p, a),
         Command::Land(a) => return land_workspace(p, a),
-        Command::Restore(a) => {
-            let origin = || origin(p, repo, location.as_ref());
-            return restore(p, origin, &a.name, &a.lease);
-        }
+        Command::Restore(a) => return Ok(with_lease(&registry::restore(p, &a.name, &a.lease)?)),
         Command::UndoLand(a) => {
             let r = registry::load_retired(p, &a.name, &a.lease)?;
             let plan = r.plan.as_ref().context("graft was not archived by merge")?;

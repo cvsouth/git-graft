@@ -72,8 +72,8 @@ pub struct Record {
     /// already landed an earlier tip: its later commits were never merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unmerged_head: Option<String>,
-    /// For an unfinished creation that a retry or restore archived, the lease
-    /// of the graft built in its place. This record's own lease restores it.
+    /// For an unfinished creation that a retry archived, the request's lease,
+    /// which names the graft built in its place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     superseded_by: Option<String>,
 }
@@ -893,6 +893,19 @@ fn archived(r: &Record, name_in_use: bool) -> anyhow::Error {
             r.name
         ),
         json!({"name":r.name,"archived_by":archived_by,"archive_path":r.archive,"name_in_use":name_in_use}),
+    )
+}
+
+/// The archive holds a creation that never finished. Graft never rebuilds it
+/// or adopts its files, which it cannot tell from a partial checkout.
+fn unfinished_creation(r: &Record) -> anyhow::Error {
+    fault(
+        "unfinished_creation",
+        format!(
+            "Graft {} was archived before its creation finished, so it cannot be restored. Its files are kept in the archive exactly as they were: copy what you need from there, or run add again",
+            r.name
+        ),
+        json!({"name":r.name,"archive_path":r.archive}),
     )
 }
 
@@ -1721,7 +1734,7 @@ pub fn for_request(p: &Project, name: &str, request_id: &str) -> Option<Record> 
 }
 
 /// Archives of unfinished attempts replaced by the graft with `lease`, each
-/// with its archive path and the lease that restores it.
+/// with its archive path and its own lease.
 pub fn leftovers(p: &Project, name: &str, lease: &str) -> Result<Vec<Value>> {
     Ok(scan(p)?
         .records
@@ -1731,63 +1744,6 @@ pub fn leftovers(p: &Project, name: &str, lease: &str) -> Result<Vec<Value>> {
         })
         .map(|r| json!({"archive_path": r.archive, "lease": r.lease}))
         .collect())
-}
-
-/// When `lease` restores an archived creation that never finished, the
-/// archive and the lease of the graft to build in its place. The archive is
-/// kept as it is; restoring it again returns the same new graft while that
-/// graft is live.
-pub fn unfinished_archive(
-    p: &Project,
-    name: &str,
-    lease: &str,
-) -> Result<Option<(Record, String)>> {
-    validate_name(name)?;
-    let find = |registry: &Registry| {
-        registry
-            .records
-            .iter()
-            .find(|r| {
-                r.name == name
-                    && r.lease == lease
-                    && r.status.retired()
-                    && !r.initialized
-                    && r.transition.is_none()
-            })
-            .cloned()
-    };
-    // Anything else is restored by `restore`, which reports a wrong lease.
-    if find(&scan(p)?).is_none() {
-        return Ok(None);
-    }
-    let _lock = workspace_lock(p, name)?;
-    let registry = scan(p)?;
-    registry.damaged_name(name)?;
-    let known = &registry.records;
-    let Some(mut r) = find(&registry) else {
-        return Ok(None);
-    };
-    ensure!(
-        !r.request.is_null(),
-        "the archive holds an unfinished creation whose add options were not recorded; copy what you need from {}",
-        r.archive.as_deref().unwrap_or(Path::new("")).display()
-    );
-    let used = |lease: &str| {
-        known.iter().any(|k| {
-            (k.lease == lease && k.status.retired())
-                || k.previous.iter().any(|old| old.lease == lease)
-        })
-    };
-    let next = match &r.superseded_by {
-        Some(next) if !used(next) => next.clone(),
-        _ => {
-            let next = Uuid::new_v4().to_string();
-            r.superseded_by = Some(next.clone());
-            persist(p, &r)?;
-            next
-        }
-    };
-    Ok(Some((r, next)))
 }
 
 pub fn finish(p: &Project, r: &mut Record) -> Result<()> {
@@ -2043,6 +1999,9 @@ pub fn restore(p: &Project, name: &str, lease: &str) -> Result<Record> {
         .find(|r| r.name == name && r.lease == lease && r.status.retired())
         .cloned()
         .ok_or_else(|| registry.missing(name, bad_lease(name)))?;
+    if r.transition.is_none() && !r.initialized {
+        return Err(unfinished_creation(&r));
+    }
     let _lock = workspace_lock(p, name)?;
     if active.as_ref().is_some_and(|active| active.id != r.id) {
         return Err(fault(
@@ -3007,43 +2966,27 @@ mod tests {
         let archive = PathBuf::from(left[0]["archive_path"].as_str().context("archive")?);
         assert_eq!(fs::read_to_string(archive.join("partial"))?, "keep it");
         assert_eq!(fs::read(archive.join(".git/index.lock"))?, marked);
-        // The archived attempt is restored by building the graft afresh, and
-        // asking again names the same graft while it is live.
-        let (unfinished, next) =
-            unfinished_archive(p, "pending", kept)?.context("unfinished archive")?;
-        assert_eq!(
-            (unfinished.archive.as_ref(), next.as_str()),
-            (Some(&archive), lease.as_str())
-        );
-        assert_eq!(
-            unfinished_archive(p, "pending", kept)?.map(|(_, next)| next),
-            Some(next)
-        );
-        assert!(unfinished_archive(p, "pending", &lease)?.is_none());
+        // Restore refuses the unfinished archive and leaves it as it was.
+        let refused = restore(p, "pending", kept).unwrap_err();
+        assert_eq!(code(&refused), "unfinished_creation");
+        let details = &crate::api::error_json(&refused)["details"];
+        assert_eq!(details["archive_path"], json!(archive));
+        assert_eq!(fs::read_to_string(archive.join("partial"))?, "keep it");
 
-        // An explicit archive of the reservation keeps its data and its
-        // registry restore stays pending.
+        // So does a reservation archived explicitly; its data stays there.
         fs::write(retried.path.join("partial"), "keep this too")?;
         let retired = {
             let _lock = workspace_lock(p, &retried.name)?;
             retire(p, &retried.name, &lease, Status::Dropped, None)?
         };
         assert_eq!(retired.status, Status::Dropped);
-        let restored = restore(p, &retried.name, &lease)?;
-        assert_eq!(restored.id, retried.id);
-        assert_ne!(restored.lease, lease);
-        assert_eq!(restored.status, Status::Pending);
-        assert_eq!(
-            fs::read_to_string(restored.path.join("partial"))?,
-            "keep this too"
-        );
-        assert!(verify(p, &retried).is_err());
-        let public = serde_json::to_value(list(p)?)?;
-        let public = public.as_array().context("expected list")?;
-        assert_eq!(public[0]["path"], json!(retried.path));
-        assert!(public[0].get("worktree_path").is_none());
-        assert!(!serde_json::to_string(public)?.contains(&lease));
-        assert!(!serde_json::to_string(public)?.contains(&restored.lease));
+        let refused = restore(p, &retried.name, &lease).unwrap_err();
+        assert_eq!(code(&refused), "unfinished_creation");
+        let kept = retired.archive.context("missing archive")?;
+        assert_eq!(fs::read_to_string(kept.join("partial"))?, "keep this too");
+        assert!(!retried.path.exists());
+        let public = serde_json::to_value(recoverable(p)?)?;
+        assert!(!serde_json::to_string(&public)?.contains(&lease));
         Ok(())
     }
 
@@ -3329,12 +3272,14 @@ mod tests {
             assert!(archive.join("dir/.git").exists());
 
             // Simulate the same previous version having committed the archive.
+            // It holds an unfinished creation, which restore refuses.
             r.status = Status::Dropped;
             r.transition = None;
             persist(p, &r)?;
-            assert!(is_nested_git_error(
-                &restore(p, &r.name, &r.lease).unwrap_err()
-            ));
+            assert_eq!(
+                code(&restore(p, &r.name, &r.lease).unwrap_err()),
+                "unfinished_creation"
+            );
             assert!(archive.join("dir/.git").exists());
             assert!(load_retired(p, &r.name, &r.lease)?.transition.is_none());
             r.transition = Some(Transition::Restore {

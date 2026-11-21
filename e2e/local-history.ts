@@ -289,7 +289,7 @@ exec "$GRAFT_TEST_GIT" "$@"
     },
   },
   {
-    name: 'a failed tip export leaves an unpublished index and a recoverable workspace',
+    name: 'a failed tip export leaves an unpublished index and keeps the partial graft in its archive',
     run(ctx) {
       const tip = commitFile(ctx, ctx.repo, 'selected', 'content missing from the export\n');
       const blob = ctx.git(['rev-parse', tip + ':selected']);
@@ -310,21 +310,12 @@ exec "$GRAFT_TEST_GIT" "$@"
       const args = ['incomplete', '--lease', lease];
       ctx.cli(['remove', ...args, '--discard']);
       assert(!existsSync(path));
-      // Restore keeps the unfinished archive as it is and builds the graft
-      // afresh in its place, now that the export can complete.
-      const restored = ctx.cli(['restore', ...args]);
-      assert.equal(restored.path, path);
-      assert.equal(restored.status, 'active');
-      assert.notEqual(restored.lease, lease);
-      const archived = objectResult(restored.unfinished_archive);
-      assert.equal(archived.lease, lease);
-      assert.equal(read(String(archived.archive_path), 'my-recovery-note'), 'retain this file\n');
-      assert(!existsSync(join(path, 'my-recovery-note')));
-      assert.equal(read(path, 'selected'), 'content missing from the export\n');
-      assert(!existsSync(join(path, '.git', 'index.lock')));
-      assert.equal(ctx.git(['status', '--porcelain'], path), '');
-      // Restoring it again returns the same graft.
-      assert.equal(ctx.cli(['restore', ...args]).lease, restored.lease);
+      // Restore refuses the unfinished creation and keeps its archive as it was.
+      const refused = ctx.fail(['restore', ...args]);
+      assert.equal(refused.code, 'unfinished_creation');
+      const archive = String(objectResult(refused.details).archive_path);
+      assert.equal(read(archive, 'my-recovery-note'), 'retain this file\n');
+      assert(!existsSync(path));
       assert.equal(read(ctx.repo, 'selected'), 'content missing from the export\n');
       assert.equal(ctx.git(['rev-parse', 'HEAD']), tip);
       assert.equal(ctx.git(['status', '--porcelain']), '');
