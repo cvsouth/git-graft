@@ -1,5 +1,8 @@
 //! Identity and crash-recoverable directory transitions for independent Git
-//! repositories. Callers hold the project lock while reading or changing records.
+//! repositories. Callers hold the project lock while reading or changing
+//! records. The one exception is an add building its reserved graft: it
+//! holds the graft lock, so no one else changes that record meanwhile, and
+//! reads only that record. Records are replaced whole, never torn.
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

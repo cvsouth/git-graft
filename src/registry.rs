@@ -822,6 +822,27 @@ impl Project {
         &self.id
     }
 
+    /// Hold the build lock: shared while building a reserved graft, so
+    /// independent grafts build in parallel, and exclusive for every other
+    /// command that changes project state, so none of them runs during a
+    /// build. Builds read the primary, a parent graft and the shared caches
+    /// and layers, which those commands change or delete.
+    ///
+    /// Lock ordering. A process waits for these only in this order, never
+    /// for an earlier lock while it holds a later one:
+    /// 1. `project.lock`, exclusive: records, name and port reservation, and
+    ///    every command's checks and changes. An add releases it while it
+    ///    builds and takes it again, without the build lock, to finish.
+    /// 2. `build.lock`, taken while holding the project lock.
+    /// 3. `fill.lock`, exclusive while a build fills a missing shared cache
+    ///    entry, so each entry is built once.
+    ///
+    /// Graft locks (`workspaces/locks/<name>`) are only ever tried, never
+    /// waited for, so holding one while waiting for any lock cannot deadlock.
+    pub(crate) fn lock_builds(&self, shared: bool) -> Result<Held> {
+        hold(&self.state.join("build.lock"), shared)
+    }
+
     /// The old registry can still contain references to workspace data and caches.
     pub(crate) fn has_legacy_workspace_records(&self) -> Result<bool> {
         if exists(&self.state.join("independent"))? {

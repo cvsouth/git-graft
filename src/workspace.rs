@@ -112,7 +112,15 @@ pub(crate) fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
-fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
+/// Add the graft `args` describes. The caller holds the project lock, `lock`,
+/// and the shared build lock, `builds`.
+fn spawn(
+    p: &Project,
+    origin: &Path,
+    mut args: Spawn,
+    lock: &std::fs::File,
+    builds: crate::registry::Held,
+) -> Result<Value> {
     if let Some(id) = &mut args.request_id {
         *id = uuid::Uuid::parse_str(id)
             .context("request ID must be a UUID")?
@@ -219,7 +227,7 @@ fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
         })
         .and_then(|oid| objects::CheckoutDiscovery::start(origin, oid, local));
     crate::trace::mark("start discovery");
-    let (mut r, _lock) = registry::reserve_locked(
+    let (mut r, _graft_lock) = registry::reserve_locked(
         p,
         &args.name,
         args.request_id.as_deref(),
@@ -241,7 +249,18 @@ fn spawn(p: &Project, origin: &Path, mut args: Spawn) -> Result<Value> {
         no_deps: args.no_deps,
         locked: args.lock.then(|| args.reason.unwrap_or_default()),
     };
-    if let Err(error) = create(p, origin, &source, &mut r, &creation, proof) {
+    // The graft lock keeps every other command off this graft and its
+    // record, and the build lock keeps the shared inputs in place, so other
+    // grafts can be added meanwhile.
+    let built = (lock.unlock().context("release the project lock"))
+        .and_then(|()| create(p, origin, &source, &mut r, &creation, proof))
+        .and_then(|()| {
+            drop(builds);
+            lock.lock().context("lock graft registry")?;
+            registry::finish(p, &mut r)
+        });
+    crate::trace::mark("finish");
+    if let Err(error) = built {
         // A failure after the checkout published its index, such as while
         // attaching dependencies, leaves a complete checkout without the lock.
         let guard = match storage::index_reserved(&r.path.join(".git")) {
@@ -306,9 +325,10 @@ struct Creation<'a> {
     locked: Option<String>,
 }
 
-/// Build the freshly reserved graft `r` and mark it active. The caller holds
-/// the graft's workspace lock. The reservation's index lock stays in place
-/// if building stops, so Git cannot use the graft while it is incomplete.
+/// Build the freshly reserved graft `r`, ready for [`registry::finish`]. The
+/// caller holds the graft's workspace lock and the shared build lock, but
+/// not the project lock. The reservation's index lock stays in place if
+/// building stops, so Git cannot use the graft while it is incomplete.
 fn create(
     p: &Project,
     origin: &Path,
@@ -354,8 +374,6 @@ fn create(
     }
     r.storage = checkout;
     r.locked.clone_from(&c.locked);
-    registry::finish(p, r)?;
-    crate::trace::mark("finish");
     Ok(())
 }
 
@@ -713,6 +731,21 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
     }
     let (p, lock) = Project::open_at(paths?, !matches!(&command, Command::Spawn(_)))?;
     let p = &p;
+    // Commands that only read, or change one graft's record, run beside
+    // builds. Adds share the build lock; every other command excludes builds.
+    let builds = match &command {
+        Command::Doctor
+        | Command::List
+        | Command::ListManagers
+        | Command::Status(_)
+        | Command::Env(_)
+        | Command::Heartbeat(_)
+        | Command::Lock { .. }
+        | Command::Unlock(_) => None,
+        Command::Gc(args) if !args.apply => None,
+        Command::Spawn(_) => Some(p.lock_builds(true)?),
+        _ => Some(p.lock_builds(false)?),
+    };
     crate::trace::mark("open project");
     match &command {
         Command::Doctor
@@ -775,7 +808,8 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             } else {
                 p.repo.clone()
             };
-            return spawn(p, &origin, args);
+            let builds = builds.context("adding a graft requires the build lock")?;
+            return spawn(p, &origin, args, &lock, builds);
         }
         Command::SeedLayer(a) => return engine::seed_layer(p, a),
         Command::Drop(a) => return drop_workspace(p, a),
@@ -856,7 +890,7 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             crate::cache::prepare_package_roots(p)?;
             let runtime = Runtime::new(&r.path, &p.state, r.port, &r.id)?;
             runtime.prepare_private_directory()?;
-            drop(lock);
+            drop((lock, builds));
             let hold = exec_lock
                 .as_ref()
                 .context("exec requires the shared graft lock")?;
@@ -867,7 +901,7 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             crate::cache::prepare_package_roots(p)?;
             let runtime = Runtime::new(&r.path, &p.state, r.port, &r.id)?;
             runtime.prepare_private_directory()?;
-            drop(lock);
+            drop((lock, builds));
             runtime.install(&a.manager, &a.packages, a.offline, attached)
         }
         _ => unreachable!(),
