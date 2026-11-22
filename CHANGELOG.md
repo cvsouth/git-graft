@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-22
+
+Upgrade if you use 0.1.0: after a restart, macOS can give the disk a new device number, and 0.1.0 then refuses every command in a project with `graft namespace ownership is unverified`. 0.2.0 reads 0.1.0's state and upgrades it on its first command, with nothing to run; after that, 0.1.0 can no longer read some of its caches, so don't downgrade.
+
+Two changes in behaviour can affect scripts:
+
+- A merge into the branch checked out in the primary now goes ahead around uncommitted edits to other paths instead of refusing.
+- Several refusals that returned `operation_failed` now return their own codes: `destination_has_local_changes`, `local_changes` and `dependencies_not_shareable`. Check `code`, and `details`, rather than the message.
+
 ### Changed
 
 - A merge or undo into the branch checked out in the primary now goes ahead around your uncommitted edits, as `git merge` does, and leaves them exactly as they were: staged changes stay staged and unstaged edits keep their bytes. It refuses only when an edit touches a path the merge changes, with `destination_has_local_changes` listing those paths in `details.paths`. A retry of a merge stopped before it wrote any file follows the same rule, so an unrelated edit no longer keeps it stuck.
@@ -14,7 +23,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `doctor` reports `file_sharing.shared` from cloning support alone; line-ending settings no longer stop sharing.
 - Creating a graft right after a commit, while the primary's newest objects are still loose, is faster. Graft reads each loose checkout blob's type and size from its object header instead of asking Git one object at a time, checks its snapshot's cloned objects without opening each one, and lists the object store with several workers. On a 3,000-file repository whose objects are all loose, a later `add` takes about 294 ms instead of 441 ms (`git worktree add`: 253 ms); at 30,000 files it takes 2.1 s instead of 3.6 s, ahead of `git worktree add` at 2.7 s.
 - Simultaneous `add` calls build their grafts in parallel instead of queuing. An add holds the project lock only to reserve its name and to record the finished graft; the first build to need a missing shared cache fills it while the others wait to reuse it. `merge`, `remove`, `prune --apply` and the other commands that change project state wait for builds in progress, while `list`, `status`, lease renewal, `lock` and `unlock` do not. On 1,200 files, four simultaneous adds after a commit take a median of 1.0 s each instead of 2.0 s (`git worktree add`: 2.0 s), and eight take 2.2 s instead of 4.2 s (`git worktree add`: 3.2 s), measured on a heavily loaded machine.
-
 - `deps share` refuses a project that cannot share, such as one with npm workspaces, overrides or linked or bundled packages, as `dependencies_not_shareable` instead of `operation_failed`. `details` names the `reason`, the offending `field` and `path` and a `fallback`: run `npm ci` in the graft, or use `deps add`. Workspaces stay unsupported because their links leave `node_modules`; the rules are in [what can be shared](docs/operations.md#what-can-be-shared).
 
 ### Fixed
@@ -55,5 +63,6 @@ First public release.
 - Merges refuse paths that the filesystem folds onto ignored files by Unicode case or normalization.
 - Cache purges keep saved and registered layers, `deps layer remove` retires layers to `.git/graft/retained-layers/`, and restore reports `already_exists` and `archive_damaged` without touching the archive.
 
-[Unreleased]: https://github.com/mprync/git-graft/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mprync/git-graft/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mprync/git-graft/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mprync/git-graft/releases/tag/v0.1.0
