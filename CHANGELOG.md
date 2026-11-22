@@ -35,6 +35,7 @@ Two changes in behaviour can affect scripts:
 - A graft checked out by Git records the change time of its top-level files after moving them into place, so its index matches the files exactly.
 - A merge or undo into the branch checked out in the primary no longer overwrites an ignored file created there after Graft's last check. Git's `read-tree -u` replaces ignored files without asking, so each file the update creates is now written by `git checkout-index`, which creates it exclusively and refuses a path that is already taken. Graft then returns every other file to the previous commit and reports `destination_has_local_changes` naming the path; a retry reports `checkout_recovery_required` instead.
 - A retry of an undo that stopped after Git turned a directory back into a file no longer refuses that file as untracked.
+- On file systems that compare names exactly, such as Linux's, a retry or reversal of an interrupted merge or undo whose update turns a file into a directory, or back, now finishes. Git refused to remove the directory's old paths there, taking the file in their way for an untracked one, so the update stayed stopped. Graft now has Git finish the update from the tree the files hold rather than from the commit it moved away from.
 
 ## [0.1.0] - 2026-11-21
 
