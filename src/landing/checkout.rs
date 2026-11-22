@@ -20,7 +20,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -411,7 +411,7 @@ impl Update {
             self.record.worker = None;
             self.save()?;
         }
-        let mut child = command
+        let child = command
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -422,11 +422,7 @@ impl Update {
             .spawn()?;
         self.record.worker = Some(child.id());
         let recorded = self.save();
-        let written = match (child.stdin.take(), input) {
-            (Some(mut stdin), Some(input)) => stdin.write_all(input),
-            _ => Ok(()),
-        };
-        let output = child.wait_with_output();
+        let (output, written) = feed_and_wait(child, input);
         recorded?;
         let output = output?;
         if output.status.success() {
@@ -503,8 +499,13 @@ impl Update {
             input.extend_from_slice(name);
             input.push(0);
         }
+        // `read-tree -u` takes attributes from the index it builds, but
+        // `checkout-index` from the files first, which may hold uncommitted
+        // edits. Reading them from `to` writes what Git's own update would.
         let mut command = self.index_command(path, objects)?;
-        command.args(["checkout-index", "-u", "-z", "--stdin"]);
+        command
+            .arg(format!("--attr-source={to}"))
+            .args(["checkout-index", "-u", "-z", "--stdin"]);
         let output = self.run_private(command, Some(&input))?;
         if output.status.success() {
             return Ok(Vec::new());
@@ -555,17 +556,13 @@ impl Update {
             let output = match stdin {
                 None => command.output()?,
                 Some(bytes) => {
-                    let mut child = command
+                    let child = command
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .spawn()?;
-                    let written = child
-                        .stdin
-                        .take()
-                        .context("no input to Git")?
-                        .write_all(bytes);
-                    let output = child.wait_with_output()?;
+                    let (output, written) = feed_and_wait(child, Some(bytes));
+                    let output = output?;
                     written?;
                     output
                 }
@@ -1148,6 +1145,29 @@ impl Update {
         let next = registry::regular(&self.directory.join("index.next"))?;
         registry::atomic(&admin.join("index"), &next)
     }
+}
+
+/// Wait for `child` while another thread writes `input` to it, so a child
+/// that fills its output pipes before it reads all of its input, such as
+/// `checkout-index` naming each path it refuses, cannot block both
+/// processes. Returns the output and whether all of the input was written.
+fn feed_and_wait(
+    mut child: Child,
+    input: Option<&[u8]>,
+) -> (std::io::Result<Output>, std::io::Result<()>) {
+    let stdin = child.stdin.take();
+    std::thread::scope(|scope| {
+        let writer = stdin
+            .zip(input)
+            .map(|(mut stdin, input)| scope.spawn(move || stdin.write_all(input)));
+        let output = child.wait_with_output();
+        let written = writer.map_or(Ok(()), |writer| {
+            writer
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("writing Git's input failed")))
+        });
+        (output, written)
+    })
 }
 
 /// Whether anything is at `name` in the checkout at `root`, or in place of
@@ -1847,6 +1867,115 @@ mod tests {
         assert_eq!(read(&p, "gone.local")?, "tracked though ignored\n");
         assert!(!p.repo.join("late.local").exists());
         Ok(())
+    }
+
+    /// A primary at `old` holding `before` and a commit `new` that adds
+    /// `added`, committed even where the ignore patterns match.
+    fn adding_fixture(
+        before: &[(String, String)],
+        added: &[(String, String)],
+    ) -> Result<(tempfile::TempDir, Project, fs::File, Plan)> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repository");
+        fs::create_dir(&repo)?;
+        git::bytes(&repo, &["init", "-q", "--template=", "-b", "main"])?;
+        for (key, value) in [
+            ("user.name", "Checkout Fixture"),
+            ("user.email", "checkout@example.invalid"),
+            ("core.autocrlf", "false"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", "disabled-hooks"),
+        ] {
+            git::bytes(&repo, &["config", key, value])?;
+        }
+        let write = |files: &[(String, String)]| -> Result<()> {
+            for (name, content) in files {
+                let file = repo.join(name);
+                fs::create_dir_all(file.parent().context("no parent")?)?;
+                fs::write(file, content)?;
+            }
+            git::bytes(&repo, &["add", "-A", "-f"])?;
+            Ok(())
+        };
+        write(before)?;
+        git::bytes(&repo, &["commit", "-qm", "old"])?;
+        let old = git::oid(&repo, "HEAD")?;
+        git::bytes(&repo, &["switch", "-qc", "incoming"])?;
+        write(added)?;
+        git::bytes(&repo, &["commit", "-qm", "new"])?;
+        let new = git::oid(&repo, "HEAD")?;
+        git::bytes(&repo, &["switch", "-q", "main"])?;
+        let (p, lock) = Project::open(&repo)?;
+        let plan = Plan {
+            target: "main".into(),
+            old,
+            tip: new.clone(),
+            new,
+        };
+        Ok((temp, p, lock, plan))
+    }
+
+    #[test]
+    fn a_new_file_is_written_with_the_attributes_git_merge_uses() -> Result<()> {
+        let attributes = |eol: &str| (".gitattributes".into(), format!("*.txt text eol={eol}\n"));
+        let (_temp, p, _lock, plan) = adding_fixture(
+            &[attributes("lf")],
+            &[("new.txt".into(), "one\ntwo\n".into())],
+        )?;
+        // An uncommitted edit the merge does not touch. Git's own checkout
+        // reads attributes from the index, never from this file.
+        let (name, content) = attributes("crlf");
+        fs::write(p.repo.join(name), content)?;
+        apply(&p, &plan, || Ok(()))?;
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.new);
+        assert_eq!(read(&p, "new.txt")?, "one\ntwo\n");
+        Ok(())
+    }
+
+    #[test]
+    fn many_files_written_after_the_dry_run_are_all_refused_without_a_hang() -> Result<()> {
+        let names: Vec<String> = (0..1500)
+            .map(|n| format!("many/{}-{n:04}.local", "x".repeat(80)))
+            .collect();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let body = || -> Result<()> {
+                let (_temp, p, _lock, plan) = adding_fixture(
+                    &[(".gitignore".into(), "*.local\n".into())],
+                    &names
+                        .iter()
+                        .map(|name| (name.clone(), "from the graft\n".into()))
+                        .collect::<Vec<_>>(),
+                )?;
+                let (repo, late) = (p.repo.clone(), names.clone());
+                let error = with_late_write(
+                    move || {
+                        fs::create_dir_all(repo.join("many")).unwrap();
+                        for name in &late {
+                            fs::write(repo.join(name), "mine\n").unwrap();
+                        }
+                    },
+                    || apply(&p, &plan, || Ok(())),
+                )
+                .unwrap_err();
+                let reported = crate::api::error_json(&error);
+                assert_eq!(
+                    reported["code"], "destination_has_local_changes",
+                    "{reported}"
+                );
+                assert_eq!(reported["details"]["paths"], json!(names));
+                for name in &names {
+                    assert_eq!(read(&p, name)?, "mine\n");
+                }
+                assert_eq!(git::oid(&p.repo, "HEAD")?, plan.old);
+                assert!(Update::load(&p.common)?.is_none());
+                Ok(())
+            };
+            let _ = sender.send(body());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(300))
+            .context("the update hung")?
     }
 
     #[test]
