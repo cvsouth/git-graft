@@ -218,6 +218,32 @@ function assertComplete(ctx: Context, path: string, base: string, tracked: strin
   ctx.git(['fsck', '--full'], path);
 }
 
+/** Every file tracked at `base` in the primary. */
+function trackedAt(ctx: Context, base: string): string[] {
+  return ctx.git(['ls-tree', '-r', '-z', '--name-only', base]).split('\0').filter(Boolean);
+}
+
+/** Write `count` files under `dir` in the primary and commit them as loose objects. */
+function commitFiles(ctx: Context, dir: string, count: number): string {
+  for (let i = 0; i < count; i++) write(ctx.repo, `${dir}/d${i % 4}/f${i}.txt`, `${dir} file ${i}\n`);
+  return commit(ctx, ctx.repo, `Add ${count} files under ${dir}`);
+}
+
+/** Require every outcome to be a complete graft at the base it reports, and return the replies. */
+function assertAllComplete(ctx: Context, outcomes: Outcome[]): ObjectResult[] {
+  for (const outcome of outcomes) assert(outcome.ok, JSON.stringify(outcome.json));
+  const added = outcomes.map(outcome => outcome.json);
+  for (const reply of added) {
+    assertComplete(ctx, String(reply.path), String(reply.base), trackedAt(ctx, String(reply.base)));
+  }
+  return added;
+}
+
+/** Add every name in `names` at once, with `extra` options. */
+function addAll(ctx: Context, names: string[], extra: string[] = []): Promise<Outcome[]> {
+  return Promise.all(names.map(name => graft(ctx, ['add', name, ...extra])));
+}
+
 /**
  * Kill an `add` and every process it started inside one creation window,
  * as a crash would. The test then writes an agent's work into the leftover
@@ -786,4 +812,113 @@ export const cases: Scenario[] = [
     },
   })),
   ...(['initialize', 'prepare', 'checkout', 'published'] as const).map(window => killedAdd('isolated', window)),
+  {
+    name: 'many adds with distinct names at once all build complete grafts',
+    async run(ctx) {
+      commitFiles(ctx, 'many', 60);
+      const names = Array.from({ length: 8 }, (_, i) => `many-${i}`);
+      const added = assertAllComplete(ctx, await addAll(ctx, names));
+      assert.equal(new Set(added.map(reply => reply.port)).size, names.length, 'ports must be unique');
+      const listed = objectResult(ctx.cli(['list'])).workspaces;
+      assert(Array.isArray(listed));
+      assert.deepEqual(listed.map(objectResult).map(w => w.name).toSorted(), names.toSorted());
+      for (const reply of added) ctx.cli(['heartbeat', String(reply.name), '--lease', String(reply.lease)]);
+    },
+  },
+  {
+    name: 'an add builds without the project lock, so another add finishes meanwhile',
+    async run(ctx) {
+      if (process.platform === 'win32') ctx.unavailable('the fault hooks are POSIX shell scripts');
+      // A smudge filter holds the first add part way through its checkout.
+      const gate = new Gate(ctx, 'build');
+      const filter = join(ctx.root, 'hold-filter.sh');
+      writeFileSync(filter, ['#!/bin/sh', gate.shell(), 'exec cat', ''].join('\n'), { mode: 0o755 });
+      writeFileSync(ctx.env.GIT_CONFIG_GLOBAL!, `[filter "hold"]\n\tsmudge = '${filter}'\n\tclean = cat\n`, { flag: 'a' });
+      write(ctx.repo, '.gitattributes', '*.dat filter=hold\n');
+      write(ctx.repo, 'payload.dat', 'filtered payload\n');
+      commit(ctx, ctx.repo, 'A filtered file');
+      gate.arm();
+      let heldDone = false;
+      const held = graft(ctx, ['add', 'held']).finally(() => { heldDone = true; });
+      try {
+        await waitFor(() => existsSync(gate.reached) || heldDone, 'the held checkout');
+        assert(existsSync(gate.reached), 'the first add finished before its checkout');
+        assert.equal(graftStatus(ctx, 'held')?.phase, 'creating');
+        const free = await graft(ctx, ['add', 'free']);
+        assert(!heldDone, 'the first add should still be held');
+        assertAllComplete(ctx, [free]);
+        // Merge, remove and prune wait for the build instead of disturbing it.
+        const removal = graft(ctx, ['remove', 'free', '--lease', String(free.json.lease)]);
+        await delay(300);
+        assert(!heldDone);
+        gate.open();
+        const [built, removed] = await Promise.all([held, removal]);
+        assertAllComplete(ctx, [built]);
+        assert(removed.ok, JSON.stringify(removed.json));
+      } finally {
+        gate.open();
+        await held;
+      }
+    },
+  },
+  {
+    name: 'many adds with one name at once create one graft and the rest are refused',
+    async run(ctx) {
+      const outcomes = await addAll(ctx, Array.from({ length: 6 }, () => 'contested'));
+      const winners = outcomes.filter(outcome => outcome.ok);
+      assert.equal(winners.length, 1, JSON.stringify(outcomes.map(outcome => outcome.json)));
+      for (const loser of outcomes.filter(outcome => !outcome.ok)) {
+        assert.equal(loser.json.code, 'already_exists', JSON.stringify(loser.json));
+      }
+      assertAllComplete(ctx, winners);
+      const listed = objectResult(ctx.cli(['list'])).workspaces;
+      assert(Array.isArray(listed));
+      assert.deepEqual(listed.map(objectResult).map(w => w.name), ['contested']);
+    },
+  },
+  {
+    name: 'adds racing merge, remove and prune of other grafts leave every graft whole',
+    async run(ctx) {
+      commitFiles(ctx, 'racing', 30);
+      const merging = ctx.spawn('merging');
+      write(merging.path, 'merged.txt', 'merged work\n');
+      const tip = commit(ctx, merging.path, 'Work to merge');
+      const removing = ctx.spawn('removing');
+      write(removing.path, 'kept.txt', 'uncommitted work\n');
+      const names = Array.from({ length: 4 }, (_, i) => `racer-${i}`);
+      const [merged, removed, pruned, ...adds] = await Promise.all([
+        graft(ctx, ['merge', 'merging', '--lease', merging.lease]),
+        graft(ctx, ['remove', 'removing', '--lease', removing.lease, '--discard']),
+        graft(ctx, ['prune', '--apply']),
+        ...names.map(name => graft(ctx, ['add', name])),
+      ]);
+      for (const outcome of [merged, removed, pruned]) assert(outcome.ok, JSON.stringify(outcome.json));
+      assertAllComplete(ctx, adds);
+      assert(contains(ctx, tip), 'the merge landed');
+      const listed = objectResult(ctx.cli(['list'])).workspaces;
+      assert(Array.isArray(listed));
+      assert.deepEqual(listed.map(objectResult).map(w => w.name).toSorted(), names);
+      const restored = restore(ctx, 'removing', String(removed.json.recovery_lease));
+      assert.equal(readFileSync(join(restored, 'kept.txt'), 'utf8'), 'uncommitted work\n');
+    },
+  },
+  {
+    name: 'adds racing a first-time cache fill fill each cache once and all build',
+    async run(ctx) {
+      if (!objectResult(ctx.cli(['doctor']).source_storage).native_clone) {
+        ctx.unavailable('isolated snapshots need a cloning file system');
+      }
+      // Every add of a new base finds its isolated snapshot missing at once.
+      commitFiles(ctx, 'isolated', 40);
+      const isolated = assertAllComplete(ctx, await addAll(ctx, ['iso-0', 'iso-1', 'iso-2', 'iso-3', 'iso-4'], ['--history', 'isolated']));
+      const storage = isolated.map(reply => objectResult(reply.storage));
+      assert.equal(storage.filter(receipt => receipt.snapshot_reused === false).length, 1, JSON.stringify(storage));
+      // Tip adds of a new base race to publish its Git history cache.
+      commitFiles(ctx, 'tip', 20);
+      const tip = assertAllComplete(ctx, await addAll(ctx, ['tip-0', 'tip-1', 'tip-2', 'tip-3'], ['--history', 'tip']));
+      for (const receipt of [...storage, ...tip.map(reply => objectResult(reply.storage))]) {
+        assert.equal(objectResult(receipt.objects).cache_errors, undefined, JSON.stringify(receipt));
+      }
+    },
+  },
 ];
