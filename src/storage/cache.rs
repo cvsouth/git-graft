@@ -56,9 +56,14 @@ pub(super) fn key(state: &Path, create: bool) -> Result<Key> {
 
 /// Git owns the tracked mode. A cached inode also has size and change-time
 /// constraints, so an edit, rename, chmod, xattr or hardlink invalidates it.
+///
+/// A source snapshot's manifest stores stamps, and a reboot can renumber the
+/// device under it, so a stamp has no device number; earlier manifests' is
+/// ignored. Snapshot files are opened beneath the pinned snapshot root,
+/// which refuses entries on another device, and a replaced file has a new
+/// inode or change time.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Stamp {
-    device: u64,
     inode: u64,
     size: u64,
     mode: u32,
@@ -69,7 +74,6 @@ pub(super) struct Stamp {
 impl From<&Metadata> for Stamp {
     fn from(m: &Metadata) -> Self {
         Self {
-            device: m.dev(),
             inode: m.ino(),
             size: m.len(),
             mode: m.mode(),
@@ -83,8 +87,7 @@ impl Stamp {
     // libc's stat field widths vary between Unix targets.
     #[allow(clippy::unnecessary_cast)]
     pub(super) fn matches_stat(&self, info: &libc::stat) -> bool {
-        self.device == info.st_dev as u64
-            && self.inode == info.st_ino as u64
+        self.inode == info.st_ino as u64
             && self.size == info.st_size as u64
             && self.mode == info.st_mode as u32
             && self.modified == (info.st_mtime as i64, info.st_mtime_nsec as i64)

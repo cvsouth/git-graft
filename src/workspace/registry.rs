@@ -135,30 +135,19 @@ struct Identity {
     git: FileId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct FileId {
-    volume: u64,
-    file: u64,
-}
+/// A graft directory's identity. Records and namespace markers persist it;
+/// [`FileId::names`] checks it so that it survives a reboot.
+type FileId = crate::cache::FileIdentity;
 
 #[cfg(unix)]
 fn file_id(path: &Path) -> Result<FileId> {
-    Ok(unix_file_id(&owned_directory(path)?))
-}
-
-#[cfg(unix)]
-fn unix_file_id(meta: &fs::Metadata) -> FileId {
-    use std::os::unix::fs::MetadataExt;
-    FileId {
-        volume: meta.dev(),
-        file: meta.ino(),
-    }
+    FileId::at(path, &owned_directory(path)?)
 }
 
 #[cfg(windows)]
 fn file_id(path: &Path) -> Result<FileId> {
     let (volume, file) = crate::cache::windows_directory_id(path, "directory")?;
-    Ok(FileId { volume, file })
+    Ok(FileId::windows(volume, file))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -172,6 +161,20 @@ impl Identity {
             workspace: file_id(path)?,
             git: file_id(&path.join(".git"))?,
         })
+    }
+
+    /// Whether this recorded identity names the directories read as `current`.
+    fn names(&self, current: &Self) -> bool {
+        self.workspace.names(&current.workspace) && self.git.names(&current.git)
+    }
+
+    /// Whether `current` names the same directories and this identity is in
+    /// an earlier form that writing `current` replaces, as in a record Graft
+    /// 0.1.0 or the build before this one wrote.
+    fn upgrades_to(&self, current: &Self) -> bool {
+        self.names(current)
+            && (self.workspace.upgrades_to(&current.workspace)
+                || self.git.upgrades_to(&current.git))
     }
 }
 
@@ -293,20 +296,29 @@ pub(super) fn marked_dir(path: &Path, id: &str, create: bool) -> Result<()> {
             "shared directory at {}",
             path.display()
         );
-        unix_file_id(&metadata)
+        FileId::at(path, &metadata)?
     };
     #[cfg(not(unix))]
     let directory = {
         let _ = metadata;
         file_id(path)?
     };
-    let owner: NamespaceOwner = serde_json::from_slice(&regular(&path.join(CACHE_OWNER))?)
+    let marker = path.join(CACHE_OWNER);
+    let mut owner: NamespaceOwner = serde_json::from_slice(&regular(&marker)?)
         .with_context(|| format!("invalid workspace namespace marker at {}", path.display()))?;
     ensure!(
-        owner.project_id == id && owner.directory == directory,
+        owner.project_id == id && owner.directory.names(&directory),
         "graft namespace ownership is unverified at {}",
         path.display()
     );
+    // A marker an earlier build wrote has a birth time or, on macOS, no volume
+    // UUID. Rewrite it, so later checks compare the volume too. The marker
+    // never changes otherwise, so racing commands write the same bytes; one
+    // that cannot write it uses the old marker.
+    if owner.directory.upgrades_to(&directory) {
+        owner.directory = directory;
+        let _ = crate::registry::atomic_ordered(&marker, &serde_json::to_vec(&owner)?);
+    }
     Ok(())
 }
 
@@ -876,11 +888,84 @@ fn scan(p: &Project) -> Result<Registry> {
             None => registry.records.push(r),
         }
     }
+    for r in &mut registry.records {
+        upgrade_identity(&directory, r);
+    }
     registry
         .records
         .sort_by(|a, b| (&a.name, a.created, &a.id).cmp(&(&b.name, b.created, &b.id)));
     registry.damaged.sort_by(|a, b| a.file.cmp(&b.file));
     Ok(registry)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once in [`upgrade_identity`] before it takes the graft lock.
+    static BEFORE_UPGRADE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Rewrite the identities of a graft's directories in a record an earlier
+/// build wrote, with a birth time or, on macOS, without the volume UUID.
+/// Such a record still verifies on its inodes (see
+/// [`crate::cache::FileIdentity::names`]); this makes later checks compare
+/// the volume as well and drops the birth time. It is rewritten only
+/// where the directories are found unchanged, under the project lock and the
+/// graft's lock: a graft being built holds that lock and writes its record
+/// without the project lock. Anything that stands in the way, such as a
+/// graft lock held elsewhere, leaves the record for a later command.
+fn upgrade_identity(directory: &Path, r: &mut Record) {
+    if !cfg!(unix) || r.identity.workspace.is_current() && r.identity.git.is_current() {
+        return;
+    }
+    // Most records need nothing; only those that do take the graft lock.
+    if upgraded_identity(r).is_none() {
+        return;
+    }
+    #[cfg(test)]
+    BEFORE_UPGRADE_LOCK.with_borrow_mut(|hook| hook.take().map(|hook| hook()));
+    let upgraded = (|| -> Result<Identity> {
+        let state = directory.parent().context("records have no parent")?;
+        let _lock = lock_in(state, &r.name)?;
+        let mut live = read_record(directory, &r.id)?;
+        // Rewrite only the record this command read; one that changed is
+        // checked again by the next command.
+        ensure!(
+            serde_json::to_value(&live)? == serde_json::to_value(&*r)?,
+            "graft record changed"
+        );
+        // Read the directories again under the lock: one moved or replaced
+        // since the read above is left for a later command.
+        let current = upgraded_identity(&live).context("graft directories changed")?;
+        live.identity = current.clone();
+        write_record(directory, &live)?;
+        Ok(current)
+    })();
+    if let Ok(current) = upgraded {
+        r.identity = current;
+    }
+}
+
+/// The identity of the directories at a path where `r` can hold them, in the
+/// current form, when `r`'s identity names them in an earlier form.
+fn upgraded_identity(r: &Record) -> Option<Identity> {
+    let mut paths = vec![&r.path];
+    paths.extend(&r.archive);
+    match &r.transition {
+        Some(Transition::Move { to }) => paths.push(to),
+        Some(
+            Transition::Place { from }
+            | Transition::Retire {
+                from: Some(from), ..
+            },
+        ) => paths.push(from),
+        _ => (),
+    }
+    paths.into_iter().find_map(|path| {
+        Identity::read(path)
+            .ok()
+            .filter(|current| r.identity.upgrades_to(current))
+    })
 }
 
 /// Checks of one record against its project, beyond its own format.
@@ -1091,7 +1176,7 @@ fn verify_at(
         path.display()
     );
     ensure!(
-        Identity::read(path)? == *identity,
+        identity.names(&Identity::read(path)?),
         "graft directory was replaced at {}",
         path.display()
     );
@@ -1455,7 +1540,7 @@ pub(super) fn order_directory(path: &Path) -> Result<()> {
 /// Barriers order writes within one device only, so a creation step that
 /// another device's next write depends on is flushed instead.
 fn flush_if_elsewhere(path: &Path, other: &Path) -> Result<()> {
-    if file_id(path)?.volume != file_id(other)?.volume {
+    if !file_id(path)?.same_volume(&file_id(other)?) {
         sync_directory(path)?;
     }
     Ok(())
@@ -1473,7 +1558,7 @@ pub(super) fn flush_reservation(p: &Project, r: &Record) -> Result<()> {
 
 fn same_filesystem(source: &Path, destination: &Path) -> Result<bool> {
     let parent = destination.parent().context("destination has no parent")?;
-    Ok(file_id(source)?.volume == file_id(parent)?.volume)
+    Ok(file_id(source)?.same_volume(&file_id(parent)?))
 }
 
 /// Resume an exclusive rename using directory identity to distinguish the
@@ -2897,6 +2982,200 @@ mod tests {
             retire(p, &next.name, &next.lease, Status::Dropped, None)?;
         }
         assert_eq!(restore(p, &r.name, &r.lease)?.status, Status::Active);
+        Ok(())
+    }
+
+    /// A reboot can renumber the device under Graft's state (APFS does).
+    /// Markers and records Graft 0.1.0 wrote, with that device number, and
+    /// those the build before this one wrote, with birth times, keep
+    /// verifying on every path and are rewritten in the current form: no
+    /// birth time and, on macOS, the volume UUID. A copied or replaced
+    /// directory is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn identities_survive_a_renumbered_device() -> Result<()> {
+        let f = Fixture::new()?;
+        let p = &f.project;
+        let r = f.workspace("agent")?;
+        let namespace = state_dir(p, false)?;
+        let marker = namespace.join(CACHE_OWNER);
+        let record = record_file(p, &r)?;
+        let read = |path: &Path| -> Result<Value> { Ok(serde_json::from_slice(&fs::read(path)?)?) };
+        let current = |id: &Value| {
+            id.get("created").is_none()
+                && id.get("volume_uuid").is_some() == cfg!(target_os = "macos")
+        };
+        // Rewrite in place, keeping each file's inode and mode.
+        let write = |path: &Path, value: &Value| fs::write(path, serde_json::to_vec(value)?);
+        let born = serde_json::json!({"secs_since_epoch": 1_577_836_800, "nanos_since_epoch": 5});
+        // `None` keeps the current form; otherwise drop the volume UUID and
+        // write the birth time, if any, as an earlier build did.
+        let renumber = |id: &mut Value, legacy: Option<Option<&Value>>| {
+            id["volume"] = (id["volume"].as_u64().unwrap() + 1).into();
+            if let Some(created) = legacy {
+                let id = id.as_object_mut().unwrap();
+                id.remove("volume_uuid");
+                if let Some(created) = created {
+                    id.insert("created".into(), created.clone());
+                }
+            }
+        };
+        assert!(current(&read(&marker)?["directory"]));
+        let as_released = |legacy: Option<Option<&Value>>| -> Result<()> {
+            let mut owner = read(&marker)?;
+            renumber(&mut owner["directory"], legacy);
+            write(&marker, &owner)?;
+            let mut stored = read(&record)?;
+            renumber(&mut stored["identity"]["workspace"], legacy);
+            renumber(&mut stored["identity"]["git"], legacy);
+            write(&record, &stored)?;
+            Ok(())
+        };
+
+        // Graft 0.1.0 wrote no birth time; the build before this one did.
+        for created in [None, Some(&born)] {
+            let earlier = created.is_some() || cfg!(target_os = "macos");
+            as_released(Some(created))?;
+            // Discovery verifies the old record without rewriting it.
+            assert_eq!(discover(&r.path)?.context("graft missing")?.id, r.id);
+            assert!(current(&read(&marker)?["directory"]));
+            assert_eq!(current(&read(&record)?["identity"]["workspace"]), !earlier);
+            // A command reading the registry rewrites it.
+            let loaded = load(p, &r.name)?;
+            verify(p, &loaded)?;
+            let stored = read(&record)?;
+            assert!(
+                current(&stored["identity"]["workspace"]) && current(&stored["identity"]["git"])
+            );
+        }
+        // A record a held graft lock protects is left for a later command.
+        as_released(Some(Some(&born)))?;
+        {
+            let _held = workspace_lock(p, &r.name)?;
+            verify(p, &load(p, &r.name)?)?;
+            assert!(!current(&read(&record)?["identity"]["workspace"]));
+        }
+        verify(p, &load(p, &r.name)?)?;
+        assert!(current(&read(&record)?["identity"]["git"]));
+        // The device number alone is never compared.
+        as_released(None)?;
+        verify(p, &load(p, &r.name)?)?;
+        assert_eq!(discover(&r.path)?.context("graft missing")?.id, r.id);
+
+        // A stored birth time is ignored; another inode is another directory.
+        let original = read(&record)?;
+        let mut stored = original.clone();
+        stored["identity"]["workspace"]["created"] = born.clone();
+        write(&record, &stored)?;
+        verify(p, &read_record(&record_directory(p, false)?, &r.id)?)?;
+        assert_eq!(discover(&r.path)?.context("graft missing")?.id, r.id);
+        let mut stored = original.clone();
+        let id = &mut stored["identity"]["workspace"];
+        id["file"] = (id["file"].as_u64().unwrap() + 1).into();
+        write(&record, &stored)?;
+        assert!(verify(p, &load(p, &r.name)?).is_err());
+        assert!(discover(&r.path).is_err());
+        write(&record, &original)?;
+        verify(p, &load(p, &r.name)?)?;
+        // A copied namespace, even with a marker in an old form, is refused.
+        let copy = p.state.join("copied-namespace");
+        dir(&copy)?;
+        let mut owner = read(&marker)?;
+        renumber(&mut owner["directory"], Some(None));
+        crate::registry::atomic(&copy.join(CACHE_OWNER), &serde_json::to_vec(&owner)?)?;
+        assert!(marked_dir(&copy, p.id(), false).is_err());
+        let mut foreign = owner.clone();
+        foreign["project_id"] = Uuid::new_v4().to_string().into();
+        write(&marker, &foreign)?;
+        assert!(state_dir(p, false).is_err());
+        Ok(())
+    }
+
+    /// A graft directory replaced after a command first reads it, before it
+    /// takes the graft lock to rewrite the record, is not recorded.
+    #[cfg(unix)]
+    #[test]
+    fn identity_upgrades_read_the_directories_again_under_the_graft_lock() -> Result<()> {
+        let f = Fixture::new()?;
+        let p = &f.project;
+        let r = f.workspace("agent")?;
+        let record = record_file(p, &r)?;
+        let read = |path: &Path| -> Result<Value> { Ok(serde_json::from_slice(&fs::read(path)?)?) };
+        // The record as the build before this one wrote it.
+        let mut stored = read(&record)?;
+        let born = serde_json::json!({"secs_since_epoch": 1, "nanos_since_epoch": 0});
+        for side in ["workspace", "git"] {
+            stored["identity"][side]["created"] = born.clone();
+        }
+        fs::write(&record, serde_json::to_vec(&stored)?)?;
+        let moved = r.path.with_file_name("moved-away");
+        let (path, away) = (r.path.clone(), moved.clone());
+        BEFORE_UPGRADE_LOCK.set(Some(Box::new(move || {
+            fs::rename(&path, &away).unwrap();
+            fs::create_dir_all(path.join(".git")).unwrap();
+        })));
+        let _ = load(p, &r.name);
+        assert_eq!(read(&record)?, stored);
+        // Once the graft is back, the next command rewrites the record.
+        fs::remove_dir_all(&r.path)?;
+        fs::rename(&moved, &r.path)?;
+        verify(p, &load(p, &r.name)?)?;
+        assert!(
+            read(&record)?["identity"]["workspace"]
+                .get("created")
+                .is_none()
+        );
+        Ok(())
+    }
+
+    /// Setting a directory's modification time before its birth time moves
+    /// the birth time on macOS, as `touch -t`, `rsync -a`, `cp -a` and `tar`
+    /// can. The directory is the same one, so it still verifies.
+    #[cfg(unix)]
+    #[test]
+    fn identities_survive_times_set_into_the_past() -> Result<()> {
+        let f = Fixture::new()?;
+        let p = &f.project;
+        let r = f.workspace("agent")?;
+        let namespace = state_dir(p, false)?;
+        let past =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        for path in [&namespace, &r.path, &r.path.join(".git")] {
+            fs::File::open(path)?.set_modified(past)?;
+        }
+        state_dir(p, false)?;
+        verify(p, &load(p, &r.name)?)?;
+        assert_eq!(discover(&r.path)?.context("graft missing")?.id, r.id);
+        Ok(())
+    }
+
+    /// On macOS a stored identity names its volume by UUID, which survives a
+    /// reboot. A directory with the same inode on another volume is refused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn identities_on_another_volume_are_refused() -> Result<()> {
+        let f = Fixture::new()?;
+        let p = &f.project;
+        let r = f.workspace("agent")?;
+        let marker = state_dir(p, false)?.join(CACHE_OWNER);
+        let record = record_file(p, &r)?;
+        let read = |path: &Path| -> Result<Value> { Ok(serde_json::from_slice(&fs::read(path)?)?) };
+        let write = |path: &Path, value: &Value| fs::write(path, serde_json::to_vec(value)?);
+        let other = Value::from(Uuid::new_v4().to_string());
+        let original = read(&record)?;
+        for side in ["workspace", "git"] {
+            let mut stored = original.clone();
+            stored["identity"][side]["volume_uuid"] = other.clone();
+            write(&record, &stored)?;
+            assert!(verify(p, &load(p, &r.name)?).is_err(), "{side}");
+            assert!(discover(&r.path).is_err(), "{side}");
+        }
+        write(&record, &original)?;
+        verify(p, &load(p, &r.name)?)?;
+        let mut owner = read(&marker)?;
+        owner["directory"]["volume_uuid"] = other;
+        write(&marker, &owner)?;
+        assert!(state_dir(p, false).is_err());
         Ok(())
     }
 

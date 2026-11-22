@@ -3,8 +3,55 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { objectResult, parseExact, type Context, type Scenario } from './harness.ts';
+
+/**
+ * Rewrite Graft's identity markers and records as a reboot that renumbered
+ * the device (as APFS does) leaves them, in the form Graft 0.1.0 wrote:
+ * another device number, no volume UUID and no birth times for graft
+ * directories.
+ */
+function renumberDevice(ctx: Context): number {
+  let rewritten = 0;
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) return value.forEach(visit);
+    if (value === null || typeof value !== 'object') return;
+    const id = value as Record<string, unknown>;
+    for (const key of ['volume', 'device']) {
+      const number = id[key];
+      if (typeof number === 'number' && (typeof id.file === 'number' || typeof id.inode === 'number')) {
+        id[key] = number + 1;
+        delete id.volume_uuid;
+        if (key === 'volume') delete id.created;
+        rewritten++;
+      }
+    }
+    Object.values(id).forEach(visit);
+  };
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) { walk(path); continue; }
+      const known = ['.git-graft-id', '.graft-land-pending', 'verified.json', 'record.json'].includes(entry.name)
+        || /^package-cache-.*-v1\.json$/.test(entry.name) || basename(dir) === 'records';
+      if (!entry.isFile() || !known) continue;
+      let value: unknown;
+      // Project ID markers hold a bare UUID, which is not JSON.
+      try { value = JSON.parse(readFileSync(path, 'utf8')); } catch { continue; }
+      const before = rewritten;
+      visit(value);
+      if (rewritten === before) continue;
+      // Rewrite in place: an owner marker's own inode is part of its identity.
+      const mode = statSync(path).mode & 0o777;
+      chmodSync(path, mode | 0o200);
+      writeFileSync(path, JSON.stringify(value));
+      chmodSync(path, mode);
+    }
+  };
+  walk(join(ctx.repo, '.git', 'graft'));
+  return rewritten;
+}
 
 function drop(ctx: Context, name: string, lease: string) {
   return ctx.cli(['remove', name, '--lease', lease, '--discard']);
@@ -61,6 +108,51 @@ function history(ctx: Context, path: string, text: string) {
 }
 
 export const cases: Scenario[] = [
+  {
+    name: 'state written before a reboot renumbered the device keeps working',
+    run(ctx) {
+      if (process.platform === 'win32') ctx.unavailable('Windows volume serial numbers survive reboots');
+      const landed = ctx.spawn('landed');
+      history(ctx, landed.path, 'landed before the reboot');
+      assert.equal(ctx.cli(['merge', 'landed', '--lease', landed.lease]).removed, true);
+      const merged = ctx.spawn('merged');
+      const tip = history(ctx, merged.path, 'merged after the reboot');
+      const kept = ctx.spawn('kept');
+      const archived = ctx.spawn('archived');
+      writeFileSync(join(archived.path, 'owner.txt'), 'archived before the reboot');
+      drop(ctx, 'archived', archived.lease);
+      const archive = archivePath(ctx, archived.result.id);
+      const before = snapshot(archive);
+      const marker = join(ctx.repo, '.git', 'graft', 'workspaces', '.git-graft-id');
+      const record = (id: unknown) => objectResult(objectResult(parseExact(readFileSync(recordPath(ctx, id), 'utf8'))).identity);
+      assert(renumberDevice(ctx) > 0);
+
+      const listed = ctx.cli(['list']);
+      assert.deepEqual(
+        (listed.workspaces as unknown[]).map(row => objectResult(row).name).sort(), ['kept', 'merged']);
+      assert.equal(ctx.cli(['status', 'kept']).path, kept.path);
+      const fresh = ctx.spawn('fresh');
+      const receipt = ctx.cli(['merge', 'merged', '--lease', merged.lease]);
+      assert.equal(receipt.removed, true);
+      assert.equal(receipt.commit, tip);
+      assert.equal(ctx.git(['rev-parse', 'main']), tip);
+      ctx.cli(['remove', 'kept', '--lease', kept.lease]);
+      assert.equal(existsSync(kept.path), false);
+      ctx.cli(['prune', '--apply']);
+      assert.deepEqual(snapshot(archive), before);
+      ctx.cli(restore('archived', archived.lease));
+      assert.equal(readFileSync(join(archived.path, 'owner.txt'), 'utf8'), 'archived before the reboot');
+      assert.equal(ctx.cli(['status', 'fresh']).path, fresh.path);
+
+      // On macOS the old records gain the volume UUID; none has a birth time.
+      const owner = objectResult(objectResult(parseExact(readFileSync(marker, 'utf8'))).directory);
+      const identities = [owner, ...['workspace', 'git'].map(side => objectResult(record(archived.result.id)[side]))];
+      for (const id of [objectResult(record(fresh.result.id).workspace), ...identities]) {
+        assert.equal(id.created, undefined);
+        assert.equal(typeof id.volume_uuid, process.platform === 'darwin' ? 'string' : 'undefined');
+      }
+    },
+  },
   {
     name: 'destructive prune restores the exact index and local files after Git GC',
     run(ctx) {

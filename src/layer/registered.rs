@@ -636,8 +636,27 @@ mod native {
         receipt
     }
 
-    fn entry_stamp(meta: &Metadata, hash: &mut blake3::Hasher) {
-        for value in [meta.dev(), meta.ino(), meta.len(), u64::from(meta.mode())] {
+    /// The device of the tree a stamp is taken of, and the device number the
+    /// stamp hashes for it.
+    ///
+    /// A generation's binding stores its stamp, and a reboot can renumber the
+    /// device under it. So a stamp hashes the device number recorded in the
+    /// binding's identity for every entry on the tree's own device, which is
+    /// every entry of a stored generation, as its ownership checks require.
+    /// An entry on another device still hashes its own device number.
+    #[derive(Clone, Copy)]
+    struct Devices {
+        live: u64,
+        recorded: u64,
+    }
+
+    fn entry_stamp(meta: &Metadata, devices: Devices, hash: &mut blake3::Hasher) {
+        let device = if meta.dev() == devices.live {
+            devices.recorded
+        } else {
+            meta.dev()
+        };
+        for value in [device, meta.ino(), meta.len(), u64::from(meta.mode())] {
             field(hash, &value.to_le_bytes());
         }
         for value in [
@@ -722,12 +741,13 @@ mod native {
         destination: Option<&Path>,
         transfer: &mut Transfer,
         hash: &mut blake3::Hasher,
+        devices: Devices,
         depth: usize,
     ) -> Result<()> {
         ensure!(depth < 128, "install tree is too deeply nested");
         let meta = source.0.metadata()?;
         check_cache_metadata(path, &meta)?;
-        entry_stamp(&meta, hash);
+        entry_stamp(&meta, devices, hash);
         let entries = names(source)?;
         let has = |expected: &str| {
             entries
@@ -750,7 +770,15 @@ mod native {
                     if let Some(target) = &target {
                         fs::create_dir(target)?;
                     }
-                    capture(&dir, &child, target.as_deref(), transfer, hash, depth + 1)?;
+                    capture(
+                        &dir,
+                        &child,
+                        target.as_deref(),
+                        transfer,
+                        hash,
+                        devices,
+                        depth + 1,
+                    )?;
                 }
                 libc::S_IFREG => {
                     field(hash, b"regular");
@@ -761,7 +789,7 @@ mod native {
                         "install file changed during capture"
                     );
                     check_cache_metadata(&child, &meta)?;
-                    entry_stamp(&meta, hash);
+                    entry_stamp(&meta, devices, hash);
                     if let Some(target) = &target {
                         transfer_file(&child, target, meta.len(), false, transfer, |_, target| {
                             clone_open(&file, target, &meta)
@@ -776,7 +804,7 @@ mod native {
                         "install symlink changed during capture"
                     );
                     check_cache_metadata(&child, &meta)?;
-                    entry_stamp(&meta, hash);
+                    entry_stamp(&meta, devices, hash);
                     let link = source.link(&name)?;
                     field(hash, link.as_bytes());
                     if let Some(target) = &target {
@@ -792,14 +820,22 @@ mod native {
         Ok(())
     }
 
+    /// Stamp the tree at `source`, hashing `recorded` for its own device, or
+    /// its current device number when `None` (see [`Devices`]).
     fn snapshot(
         source: &Dir,
         path: &Path,
         dest: Option<&Path>,
         transfer: &mut Transfer,
+        recorded: Option<u64>,
     ) -> Result<String> {
+        let live = source.0.metadata()?.dev();
+        let devices = Devices {
+            live,
+            recorded: recorded.unwrap_or(live),
+        };
         let mut hash = blake3::Hasher::new();
-        capture(source, path, dest, transfer, &mut hash, 0)?;
+        capture(source, path, dest, transfer, &mut hash, devices, 0)?;
         Ok(hash.finalize().to_hex().to_string())
     }
 
@@ -852,19 +888,24 @@ mod native {
             value["version"] == 1
                 && value["backend"] == "copy-on-write"
                 && value["contents"] == binding.contents
-                && cache::directory_identity(generation)? == binding.identity,
+                && binding
+                    .identity
+                    .names(&cache::directory_identity(generation)?),
             "invalid registered install generation"
         );
         Ok(binding)
     }
 
-    fn tree_stamp(generation: &Path) -> Result<String> {
+    /// Stamp a generation's tree, hashing the device number its binding
+    /// recorded, `recorded`, which a reboot does not change.
+    fn tree_stamp(generation: &Path, recorded: u64) -> Result<String> {
         let tree = Dir::absolute(generation)?.path(Path::new(TREE))?;
         snapshot(
             &tree,
             &generation.join(TREE),
             None,
             &mut Transfer::default(),
+            Some(recorded),
         )
     }
 
@@ -876,7 +917,7 @@ mod native {
         let binding = generation_record(p, generation, digest)?;
         ensure!(
             verify_tree(&generation.join(TREE), None)? == binding.contents
-                && tree_stamp(generation)? == binding.stamp,
+                && tree_stamp(generation, binding.identity.device())? == binding.stamp,
             "registered install tree differs from its original generation"
         );
         Ok(binding)
@@ -927,7 +968,7 @@ mod native {
             )
         );
         let mut transfer = Transfer::default();
-        let installed = snapshot(&source, &src, Some(&tree), &mut transfer)?;
+        let installed = snapshot(&source, &src, Some(&tree), &mut transfer, None)?;
         probe_if_empty(&root, &root, &transfer)?;
         let contents = verify_tree(&tree, Some(git::path_str(checkout)?.as_bytes()))?;
         if checkout != p.repo {
@@ -937,13 +978,14 @@ mod native {
         let generation = root.join(&before.digest);
         let value = json!({"version": 1, "compatibility": before.digest, "contents": contents,
             "backend": "copy-on-write"});
+        let identity = cache::directory_identity(stage.path())?;
         let binding = GenerationBinding {
             version: 1,
             project: p.id().to_owned(),
             digest: before.digest.clone(),
             contents,
-            stamp: tree_stamp(stage.path())?,
-            identity: cache::directory_identity(stage.path())?,
+            stamp: tree_stamp(stage.path(), identity.device())?,
+            identity,
         };
         registry::atomic(
             &stage.path().join("provenance.json"),
@@ -956,7 +998,8 @@ mod native {
                     &current.path(Path::new(&spec.directory))?,
                     &src,
                     None,
-                    &mut Transfer::default()
+                    &mut Transfer::default(),
+                    None,
                 )? == installed
                 && Inputs::read(checkout, &current, spec)? == before,
             "checkout or installed files changed during capture"
@@ -1086,7 +1129,13 @@ mod native {
             let mut transfer = Transfer::default();
             let cached_path = generation.join(TREE);
             let source = Dir::absolute(&root)?.path(&Path::new(&before.digest).join(TREE))?;
-            let stamp = snapshot(&source, &cached_path, Some(&tree), &mut transfer)?;
+            let stamp = snapshot(
+                &source,
+                &cached_path,
+                Some(&tree),
+                &mut transfer,
+                Some(binding.identity.device()),
+            )?;
             probe_if_empty(&root, &root, &transfer)?;
             ensure!(
                 stamp == binding.stamp && verify_tree(&tree, None)? == binding.contents,
@@ -1119,6 +1168,53 @@ mod native {
             Err(_) => status(spec, "unavailable", "attachment_failed"),
         })
     }
+
+    #[cfg(test)]
+    mod renumbered {
+        use super::*;
+
+        /// A reboot can renumber the device under a registered generation.
+        /// Its binding, with the device number it was seeded on, still
+        /// verifies, attaches and seeds again; a stamp of another tree does
+        /// not.
+        #[test]
+        fn generations_survive_a_renumbered_device() -> Result<()> {
+            let f = super::super::tests::Fixture::new()?;
+            let p = &f.project;
+            let spec = f.spec();
+            f.write_tree(&p.repo, "first version")?;
+            let seeded = seed_registered(p, &p.repo, &spec)?;
+            if seeded["reason"] == "cow_unavailable" {
+                return Ok(());
+            }
+            let digest = seeded["digest"].as_str().context("missing digest")?;
+            let generation = p.state.join(REGISTERED_INSTALL_DIR).join(digest);
+            let original = read_binding(p, digest)?;
+            // The binding as seeded before a reboot renumbered the device.
+            let mut value = serde_json::to_value(&original)?;
+            let renumbered = original.identity.device() + 1;
+            value["identity"]["device"] = renumbered.into();
+            value["stamp"] = tree_stamp(&generation, renumbered)?.into();
+            let rewrite = |value: &Value| {
+                let binding: GenerationBinding = serde_json::from_value(value.clone())?;
+                registry::atomic(&binding_path(p, digest), &serde_json::to_vec(&binding)?)
+            };
+            rewrite(&value)?;
+            assert_ne!(read_binding(p, digest)?.stamp, original.stamp);
+            verify_registered_install_generation(p, &generation, digest)?;
+            let attached = attach_registered(p, &f.sibling("after-reboot")?, &spec)?;
+            assert_eq!(attached["status"], "attached", "{attached}");
+            assert_eq!(seed_registered(p, &p.repo, &spec)?["digest"], digest);
+
+            // A stamp that does not match the recorded tree is still refused.
+            value["stamp"] = original.stamp.clone().into();
+            rewrite(&value)?;
+            assert!(verify_registered_install_generation(p, &generation, digest).is_err());
+            let refused = attach_registered(p, &f.sibling("mismatched")?, &spec)?;
+            assert_ne!(refused["status"], "attached", "{refused}");
+            Ok(())
+        }
+    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -1131,15 +1227,15 @@ mod tests {
         path::PathBuf,
     };
 
-    struct Fixture {
+    pub(super) struct Fixture {
         root: PathBuf,
-        project: Project,
+        pub(super) project: Project,
         _lock: fs::File,
         _temp: tempfile::TempDir,
     }
 
     impl Fixture {
-        fn new() -> Result<Self> {
+        pub(super) fn new() -> Result<Self> {
             let temp = tempfile::tempdir()?;
             let root = dunce::canonicalize(temp.path())?;
             let repo = root.join("primary");
@@ -1159,7 +1255,7 @@ mod tests {
             })
         }
 
-        fn sibling(&self, name: &str) -> Result<PathBuf> {
+        pub(super) fn sibling(&self, name: &str) -> Result<PathBuf> {
             let path = self.root.join(name);
             git::bytes(
                 &self.root,
@@ -1178,7 +1274,7 @@ mod tests {
             Ok(path)
         }
 
-        fn spec(&self) -> InstallSpec {
+        pub(super) fn spec(&self) -> InstallSpec {
             InstallSpec {
                 manager: "fixture".into(),
                 key: "fixture ABI".into(),
@@ -1187,7 +1283,7 @@ mod tests {
             }
         }
 
-        fn write_tree(&self, checkout: &Path, value: &str) -> Result<PathBuf> {
+        pub(super) fn write_tree(&self, checkout: &Path, value: &str) -> Result<PathBuf> {
             let tree = checkout.join("vendor/bundle");
             fs::create_dir_all(&tree)?;
             fs::write(tree.join("package"), value)?;
