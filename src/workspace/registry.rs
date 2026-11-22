@@ -422,6 +422,44 @@ fn busy(name: &str) -> anyhow::Error {
     )
 }
 
+fn is_busy(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::api::Fault>()
+        .is_some_and(|fault| fault.code == "workspace_busy")
+}
+
+/// [`reserve_locked`] found another add of the same request building the
+/// graft. The caller waits for it with [`wait_for_graft`], then reserves again.
+#[derive(Debug)]
+pub(super) struct Building;
+
+impl std::fmt::Display for Building {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another add of this request is building the graft")
+    }
+}
+
+impl std::error::Error for Building {}
+
+/// Wait until no process holds the graft lock of `name`. The caller must
+/// hold no other lock: the holder may be an add that needs the project lock
+/// to finish.
+pub(super) fn wait_for_graft(p: &Project, name: &str) -> Result<()> {
+    let path = state_dir(p, false)?.join("locks").join(name);
+    // Windows opens graft locks unshared, so a waiter cannot block on one.
+    #[cfg(windows)]
+    loop {
+        match open_exclusive(&path, name).and_then(|file| try_lock(file, name)) {
+            Err(error) if is_busy(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            waited => return waited.map(drop),
+        }
+    }
+    #[cfg(not(windows))]
+    crate::registry::hold(&path, false).map(drop)
+}
+
 fn try_lock(file: File, name: &str) -> Result<WorkspaceLock> {
     match file.try_lock() {
         Ok(()) => Ok(crate::registry::Held(file)),
@@ -1649,11 +1687,13 @@ pub(super) fn reserve_locked(
     let registry = scan(p)?;
     crate::trace::mark("reserve: read records");
     registry.damaged_name(name)?;
-    if let Some(r) = registry.current(name)
-        && !claims(r, requested.as_ref(), base, branch, &request)
-    {
-        return Err(in_use());
-    }
+    let mine = match registry.current(name) {
+        Some(r) if !claims(r, requested.as_ref(), base, branch, &request) => {
+            return Err(in_use());
+        }
+        Some(_) => true,
+        None => false,
+    };
     if !exists(&p.state.join(NAMESPACE))? {
         validate_fresh_root(p)?;
     }
@@ -1661,7 +1701,11 @@ pub(super) fn reserve_locked(
     let directory = record_directory(p, true)?;
     crate::trace::mark("reserve: record directory");
     let namespace = directory.parent().context("missing workspace namespace")?;
-    let lock = lock_in(namespace, name)?;
+    let lock = match lock_in(namespace, name) {
+        // Another add of this request holds it while building the graft.
+        Err(error) if mine && is_busy(&error) => return Err(Building.into()),
+        locked => locked?,
+    };
     // Records for this name cannot change while the lock is held.
     let mut registry = scan(p)?;
     registry.damaged_name(name)?;

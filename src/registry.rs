@@ -837,8 +837,10 @@ impl Project {
     /// 3. `fill.lock`, exclusive while a build fills a missing shared cache
     ///    entry, so each entry is built once.
     ///
-    /// Graft locks (`workspaces/locks/<name>`) are only ever tried, never
-    /// waited for, so holding one while waiting for any lock cannot deadlock.
+    /// Graft locks (`workspaces/locks/<name>`) are only tried while holding
+    /// another lock, never waited for, so holding one while waiting for any
+    /// lock cannot deadlock. A retry of an add that finds its first attempt
+    /// still building waits for that graft lock holding no other lock.
     pub(crate) fn lock_builds(&self, shared: bool) -> Result<Held> {
         hold(&self.state.join("build.lock"), shared)
     }

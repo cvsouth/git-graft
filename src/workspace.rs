@@ -119,7 +119,7 @@ fn spawn(
     origin: &Path,
     mut args: Spawn,
     lock: &std::fs::File,
-    builds: crate::registry::Held,
+    mut builds: crate::registry::Held,
 ) -> Result<Value> {
     if let Some(id) = &mut args.request_id {
         *id = uuid::Uuid::parse_str(id)
@@ -227,14 +227,28 @@ fn spawn(
         })
         .and_then(|oid| objects::CheckoutDiscovery::start(origin, oid, local));
     crate::trace::mark("start discovery");
-    let (mut r, _graft_lock) = registry::reserve_locked(
-        p,
-        &args.name,
-        args.request_id.as_deref(),
-        base.as_deref(),
-        branch.as_deref(),
-        request,
-    )?;
+    let (mut r, _graft_lock) = loop {
+        match registry::reserve_locked(
+            p,
+            &args.name,
+            args.request_id.as_deref(),
+            base.as_deref(),
+            branch.as_deref(),
+            request.clone(),
+        ) {
+            // A concurrent retry waits for the first attempt outside every
+            // lock, since that attempt needs the project lock to finish,
+            // then reserves again and replies with its graft.
+            Err(error) if error.is::<registry::Building>() => {
+                drop(builds);
+                lock.unlock().context("release the project lock")?;
+                registry::wait_for_graft(p, &args.name)?;
+                lock.lock().context("lock graft registry")?;
+                builds = p.lock_builds(true)?;
+            }
+            reserved => break reserved?,
+        }
+    };
     if r.status == Status::Active {
         registry::verify(p, &r)?;
         return with_leftovers(p, &r);

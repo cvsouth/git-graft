@@ -58,7 +58,7 @@ On Windows, Graft relies on inherited ACLs and does not verify private DACLs. Us
 
 ### Commands running at once
 
-Grafts build in parallel. An `add` holds the project's registry lock only while it reserves its name and while it records the finished graft, and the first build to need a missing shared cache fills it while the others wait to reuse it. `merge`, `remove`, `prune --apply`, `restore`, `move`, `repair`, `exec`, dependency and cache commands wait until the builds in progress finish, so none of them changes the primary, a parent graft or a shared cache under a build. `list`, `status`, lease renewal, `lock` and `unlock` do not wait; `list` shows a graft still being built with the phase `creating`. Retrying an `add` while its first attempt is still building reports `workspace_busy`.
+Grafts build in parallel. An `add` holds the project's registry lock only while it reserves its name and while it records the finished graft, and the first build to need a missing shared cache fills it while the others wait to reuse it. `merge`, `remove`, `prune --apply`, `restore`, `move`, `repair`, `exec`, dependency and cache commands wait until the builds in progress finish, so none of them changes the primary, a parent graft or a shared cache under a build. `list`, `status`, lease renewal, `lock` and `unlock` do not wait; `list` shows a graft still being built with the phase `creating`. Retrying an `add` while its first attempt is still building waits for it and replies with the same graft.
 
 ### Processes left running in a graft
 

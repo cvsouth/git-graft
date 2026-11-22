@@ -839,7 +839,8 @@ export const cases: Scenario[] = [
       commit(ctx, ctx.repo, 'A filtered file');
       gate.arm();
       let heldDone = false;
-      const held = graft(ctx, ['add', 'held']).finally(() => { heldDone = true; });
+      const id = randomUUID();
+      const held = graft(ctx, ['add', 'held', '--request-id', id]).finally(() => { heldDone = true; });
       try {
         await waitFor(() => existsSync(gate.reached) || heldDone, 'the held checkout');
         assert(existsSync(gate.reached), 'the first add finished before its checkout');
@@ -847,13 +848,19 @@ export const cases: Scenario[] = [
         const free = await graft(ctx, ['add', 'free']);
         assert(!heldDone, 'the first add should still be held');
         assertAllComplete(ctx, [free]);
-        // Merge, remove and prune wait for the build instead of disturbing it.
+        // Merge, remove and prune wait for the build instead of disturbing
+        // it, and a retry of the same request waits to reply with its graft.
+        let retryDone = false;
+        const retry = graft(ctx, ['add', 'held', '--request-id', id]).finally(() => { retryDone = true; });
         const removal = graft(ctx, ['remove', 'free', '--lease', String(free.json.lease)]);
         await delay(300);
-        assert(!heldDone);
+        assert(!heldDone && !retryDone);
         gate.open();
-        const [built, removed] = await Promise.all([held, removal]);
+        const [built, retried, removed] = await Promise.all([held, retry, removal]);
         assertAllComplete(ctx, [built]);
+        assert(retried.ok, JSON.stringify(retried.json));
+        assert.equal(retried.json.path, built.json.path);
+        assert.equal(retried.json.lease, id);
         assert(removed.ok, JSON.stringify(removed.json));
       } finally {
         gate.open();
