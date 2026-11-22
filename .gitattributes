@@ -1,1 +1,5 @@
 * text=auto eol=lf
+
+# Keep the end-to-end suite and chart tooling out of GitHub's language stats.
+e2e/** linguist-detectable=false
+scripts/** linguist-detectable=false
