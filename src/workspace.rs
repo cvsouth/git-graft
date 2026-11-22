@@ -391,6 +391,36 @@ fn create(
     Ok(())
 }
 
+/// Drop the ignored `node_modules` that Graft itself attached from the shared
+/// layer, while it still hashes to the `contents` its attach receipt recorded
+/// in `storage`. Once the graft changes it, it counts as local work again.
+/// Every other change, including other ignored files, is kept.
+fn without_attached_install(
+    path: &Path,
+    storage: &Value,
+    found: Vec<git::Change>,
+) -> Vec<git::Change> {
+    let attached = |change: &git::Change| {
+        change.status == "!!"
+            && (change.path == "node_modules" || change.path.starts_with("node_modules/"))
+    };
+    if !found.iter().any(attached) {
+        return found;
+    }
+    let dependencies = &storage["dependencies"];
+    let unchanged = dependencies["status"] == "attached"
+        && dependencies["contents"]
+            .as_str()
+            .is_some_and(|contents| layer::attached_unchanged(path, contents));
+    if unchanged {
+        return found
+            .into_iter()
+            .filter(|change| !attached(change))
+            .collect();
+    }
+    found
+}
+
 /// Which command checks that a graft holds no unrecorded work.
 #[derive(Clone, Copy)]
 enum Retiring {
@@ -407,12 +437,16 @@ const LISTED_CHANGES: usize = 200;
 /// status, and touches nothing. For `remove`, `discard_archives` is always
 /// true: `remove --discard` would archive every one of these files with the
 /// rest of the graft, never delete them. `merge` has no such option.
-fn clean(path: &Path, allow_ignored: bool, retiring: Retiring) -> Result<()> {
+///
+/// The `node_modules` that Graft itself attached is not local work; see
+/// `without_attached_install`.
+fn clean(path: &Path, allow_ignored: bool, retiring: Retiring, storage: &Value) -> Result<()> {
     git::check_idle(path)?;
-    let found: Vec<_> = git::changes(path)?
+    let mut found: Vec<_> = git::changes(path)?
         .into_iter()
         .filter(|change| !(allow_ignored && change.status == "!!"))
         .collect();
+    found = without_attached_install(path, storage, found);
     if found.is_empty() {
         return Ok(());
     }
@@ -556,7 +590,9 @@ fn land_workspace(p: &Project, opts: &api::Land) -> Result<Value> {
     }
     if !opts.discard_ignored {
         ensure!(
-            !git::changes(&r.path)?.iter().any(|c| c.status == "!!"),
+            !without_attached_install(&r.path, &r.storage, git::changes(&r.path)?)
+                .iter()
+                .any(|c| c.status == "!!"),
             "graft has ignored files, such as build output; rerun with --discard-ignored to keep them in its archive"
         );
     }
@@ -573,7 +609,7 @@ fn land_workspace(p: &Project, opts: &api::Land) -> Result<Value> {
         plan
     };
     let apply = || -> Result<()> {
-        clean(&r.path, opts.discard_ignored, Retiring::Merge)?;
+        clean(&r.path, opts.discard_ignored, Retiring::Merge, &r.storage)?;
         ensure!(
             git::oid(&r.path, "HEAD")? == plan.tip,
             "graft HEAD changed during merge"
@@ -594,7 +630,7 @@ fn land_workspace(p: &Project, opts: &api::Land) -> Result<Value> {
     if git::oid(&r.path, "HEAD")? != plan.tip {
         return keep_advanced(p, r);
     }
-    clean(&r.path, opts.discard_ignored, Retiring::Merge)?;
+    clean(&r.path, opts.discard_ignored, Retiring::Merge, &r.storage)?;
     retire(p, &r.name, &r.lease, Status::Landed)
 }
 
@@ -658,7 +694,7 @@ fn drop_workspace(p: &Project, opts: &api::DropWorkspace) -> Result<Value> {
                 r.status == Status::Active,
                 "partial graft requires --discard to archive"
             );
-            clean(&r.path, false, Retiring::Remove)?;
+            clean(&r.path, false, Retiring::Remove, &r.storage)?;
             registry::require_merged(&r, &p.repo)?;
         }
     }
@@ -944,12 +980,13 @@ mod tests {
         std::fs::write(repo.join("old.txt"), "old\n")?;
         git::bytes(repo, &["add", "-A"])?;
         git::bytes(repo, &["commit", "-qm", "base"])?;
-        clean(repo, false, Retiring::Remove)?;
+        clean(repo, false, Retiring::Remove, &Value::Null)?;
 
         std::fs::write(repo.join("new.txt"), "new\n")?;
         git::bytes(repo, &["add", "new.txt"])?;
         git::bytes(repo, &["rm", "-q", "old.txt"])?;
-        let error = api::error_json(&clean(repo, false, Retiring::Merge).unwrap_err());
+        let error =
+            api::error_json(&clean(repo, false, Retiring::Merge, &Value::Null).unwrap_err());
         assert_eq!(
             error["details"],
             json!({"paths": [
@@ -966,7 +1003,8 @@ mod tests {
         std::fs::write(repo.join("notes.txt"), "untracked\n")?;
         std::fs::create_dir(repo.join("build"))?;
         std::fs::write(repo.join("build").join("out"), "ignored\n")?;
-        let error = api::error_json(&clean(repo, false, Retiring::Remove).unwrap_err());
+        let error =
+            api::error_json(&clean(repo, false, Retiring::Remove, &Value::Null).unwrap_err());
         assert_eq!(error["code"], "local_changes", "{error}");
         assert_eq!(
             error["details"],
@@ -988,11 +1026,11 @@ mod tests {
         );
 
         // A merge allowed to archive ignored files still names the others.
-        let error = api::error_json(&clean(repo, true, Retiring::Merge).unwrap_err());
+        let error = api::error_json(&clean(repo, true, Retiring::Merge, &Value::Null).unwrap_err());
         assert_eq!(error["details"]["count"], 2, "{error}");
         std::fs::write(repo.join("tracked.txt"), "tracked\n")?;
         std::fs::remove_file(repo.join("notes.txt"))?;
-        clean(repo, true, Retiring::Merge)?;
+        clean(repo, true, Retiring::Merge, &Value::Null)?;
         Ok(())
     }
 }
