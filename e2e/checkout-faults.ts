@@ -135,10 +135,10 @@ function details(error: ObjectResult) { return objectResult(error.details); }
 
 /**
  * Commit files the graft will change, start a graft and give it a change
- * that modifies, adds and deletes files. The smudge filter runs for the
- * `*.fault` files in index order: 0-added, a, b, z-added. Failing call 2
- * leaves the deletion and 0-added.fault written and a.fault, b.fault and
- * z-added.fault at their previous state.
+ * that modifies, adds and deletes files. The smudge filter runs first for
+ * the `*.fault` files `read-tree` rewrites, a then b, and then for those
+ * `checkout-index` adds, 0-added then z-added. Failing call 2 leaves the
+ * deletion and a.fault written, b.fault unlinked and neither added file.
  */
 export function prepareFaultedMerge(ctx: Context, name: string) {
   write(ctx.repo, 'a.fault', 'a before\n');
@@ -183,12 +183,12 @@ function assertInterrupted(ctx: Context, old: string, error: ObjectResult, index
   assertPartial(ctx);
 }
 
-/** Git stopped at a.fault: it had removed the deletion, written
- * 0-added.fault and unlinked a.fault to replace it. */
+/** Git stopped at b.fault: it had removed the deletion, written a.fault
+ * and unlinked b.fault to replace it. */
 function assertPartial(ctx: Context) {
-  assert.equal(read(ctx.repo, '0-added.fault'), 'added first\n');
-  assert.equal(existsSync(join(ctx.repo, 'a.fault')), false);
-  assert.equal(read(ctx.repo, 'b.fault'), 'b before\n');
+  assert.equal(read(ctx.repo, 'a.fault'), 'a merged\n');
+  assert.equal(existsSync(join(ctx.repo, 'b.fault')), false);
+  assert.equal(existsSync(join(ctx.repo, '0-added.fault')), false);
   assert.equal(existsSync(join(ctx.repo, 'z-added.fault')), false);
   assert.equal(existsSync(join(ctx.repo, 'gone.txt')), false);
 }

@@ -153,7 +153,7 @@ fn identity(
     Ok(found)
 }
 
-fn join(root: &Path, path: &[u8]) -> Result<PathBuf> {
+pub(crate) fn join(root: &Path, path: &[u8]) -> Result<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;

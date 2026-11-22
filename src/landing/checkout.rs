@@ -13,13 +13,14 @@
 //! Git finish the update or, for another merge's journal, return the files to
 //! the previous commit. Each changed path must still hold one of the two
 //! recorded versions, so neither direction replaces anyone's edits, and
-//! Git's own checks keep untracked and ignored files in place.
+//! Git's own checks keep untracked and ignored files in place: a file that
+//! appears where the update writes, even during the write, is refused.
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -410,7 +411,7 @@ impl Update {
             self.record.worker = None;
             self.save()?;
         }
-        let mut child = command
+        let child = command
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -421,11 +422,7 @@ impl Update {
             .spawn()?;
         self.record.worker = Some(child.id());
         let recorded = self.save();
-        let written = match (child.stdin.take(), input) {
-            (Some(mut stdin), Some(input)) => stdin.write_all(input),
-            _ => Ok(()),
-        };
-        let output = child.wait_with_output();
+        let (output, written) = feed_and_wait(child, input);
         recorded?;
         let output = output?;
         if output.status.success() {
@@ -434,32 +431,148 @@ impl Update {
         Ok(output)
     }
 
-    /// Move the files from one recorded commit to the other with Git's
-    /// two-tree merge, which keeps untracked and ignored files.
-    fn two_tree(
-        &mut self,
-        path: &Path,
-        objects: Option<&Path>,
-        forward: bool,
-        dry_run: bool,
-    ) -> Result<()> {
+    /// The recorded commits an update moves from and to.
+    fn sides(&self, forward: bool) -> (String, String) {
         let plan = &self.record.plan;
-        let (from, to) = if forward {
+        if forward {
             (plan.old.clone(), plan.new.clone())
         } else {
             (plan.new.clone(), plan.old.clone())
-        };
-        let mut command = self.index_command(path, objects)?;
-        command.args(["read-tree", "-m", "-u", "--no-recurse-submodules"]);
-        if dry_run {
-            command.arg("-n");
         }
-        command.args([&from, &to]);
+    }
+
+    /// Run Git's two-tree merge on the private index, with `args`.
+    fn read_tree(&mut self, path: &Path, objects: Option<&Path>, args: &[&str]) -> Result<()> {
+        let mut command = self.index_command(path, objects)?;
+        command
+            .args(["read-tree", "--no-recurse-submodules"])
+            .args(args);
         let output = self.run_private(command, None)?;
         if !output.status.success() {
             return Err(git_failure("update destination checkout", &output));
         }
         Ok(())
+    }
+
+    /// Check the move from one recorded commit to the other with Git's dry
+    /// run, which refuses to replace an edited tracked file or an untracked
+    /// one. Nothing is written.
+    fn dry_run(&mut self, path: &Path, objects: Option<&Path>, forward: bool) -> Result<()> {
+        let (from, to) = self.sides(forward);
+        self.read_tree(path, objects, &["-m", "-u", "-n", &from, &to])
+    }
+
+    /// Move the files from `from` to `to`, keeping untracked and ignored
+    /// files, and return the paths Git refused to write because a file
+    /// appeared there after the checks.
+    ///
+    /// Git's two-tree `read-tree -u` always treats ignored files as
+    /// expendable: it replaces any that lie where it writes, and has no
+    /// option to keep them, unlike `git merge --no-overwrite-ignore`. So it
+    /// only changes and removes paths `from` tracks. Each path `from` lacks is
+    /// then written by `checkout-index`, which without `--force` refuses to
+    /// replace anything there and creates each file exclusively, so a file
+    /// that appears at any moment is never overwritten.
+    fn write_files(
+        &mut self,
+        path: &Path,
+        objects: Option<&Path>,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<Vec<u8>>> {
+        let created: Vec<Vec<u8>> = self
+            .changes_between(path, objects, from, to)?
+            .into_iter()
+            .filter(|change| !change.old.present())
+            .map(|change| change.path)
+            .collect();
+        if created.is_empty() {
+            self.read_tree(path, objects, &["-m", "-u", from, to])?;
+            return Ok(Vec::new());
+        }
+        let tracked = self.tree_without(path, objects, to, &created)?;
+        self.read_tree(path, objects, &["-m", "-u", from, &tracked])?;
+        // Stage the new entries without touching the files.
+        self.read_tree(path, objects, &["-m", "-i", &tracked, to])?;
+        let mut input = Vec::new();
+        for name in &created {
+            input.extend_from_slice(name);
+            input.push(0);
+        }
+        // `read-tree -u` takes attributes from the index it builds, but
+        // `checkout-index` from the files first, which may hold uncommitted
+        // edits. Reading them from `to` writes what Git's own update would.
+        let mut command = self.index_command(path, objects)?;
+        command
+            .arg(format!("--attr-source={to}"))
+            .args(["checkout-index", "-u", "-z", "--stdin"]);
+        let output = self.run_private(command, Some(&input))?;
+        if output.status.success() {
+            return Ok(Vec::new());
+        }
+        // Git left the index unwritten. Paths it wrote match it once
+        // refreshed; the rest hold nothing yet, or what appeared there.
+        self.refresh(path, objects)?;
+        let differing = self.differing(path, objects)?;
+        let mut refused = Vec::new();
+        for name in created {
+            if differing.contains_key(&name) && occupied(path, &name)? {
+                refused.push(name);
+            }
+        }
+        if refused.is_empty() {
+            return Err(git_failure("write new checkout files", &output));
+        }
+        Ok(refused)
+    }
+
+    /// The tree `tree` without `paths`, built in a scratch index.
+    fn tree_without(
+        &self,
+        path: &Path,
+        objects: Option<&Path>,
+        tree: &str,
+        paths: &[Vec<u8>],
+    ) -> Result<String> {
+        let scratch = tempfile::tempdir()?;
+        let index = scratch.path().join("index");
+        let mut input = Vec::new();
+        for name in paths {
+            input.extend_from_slice(name);
+            input.push(0);
+        }
+        let steps: [(&[&str], Option<&[u8]>); 3] = [
+            (&["read-tree", tree], None),
+            (
+                &["update-index", "--force-remove", "-z", "--stdin"],
+                Some(&input),
+            ),
+            (&["write-tree"], None),
+        ];
+        let mut written = Vec::new();
+        for (args, stdin) in steps {
+            let mut command = self.index_command(path, objects)?;
+            command.env("GIT_INDEX_FILE", &index).args(args);
+            let output = match stdin {
+                None => command.output()?,
+                Some(bytes) => {
+                    let child = command
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()?;
+                    let (output, written) = feed_and_wait(child, Some(bytes));
+                    let output = output?;
+                    written?;
+                    output
+                }
+            };
+            if !output.status.success() {
+                return Err(git_failure("prepare checkout update", &output));
+            }
+            written = output.stdout;
+        }
+        Ok(String::from_utf8(written)?.trim_end().to_owned())
     }
 
     /// Refuse, before any file is written, when the person's uncommitted
@@ -528,6 +641,9 @@ impl Update {
         )
     }
 
+    /// Refuse, before any file is written, when an ignored file lies at, in
+    /// or above a path the update changes. One that appears later is kept by
+    /// `write_files`.
     fn protect_ignored(&self, path: &Path, objects: Option<&Path>) -> Result<()> {
         // List ignored files against the private index, which already tracks
         // any path a resumed update wrote before its interruption.
@@ -650,17 +766,20 @@ impl Update {
     /// Every path the update changes, with both sides' index entries.
     fn changes(&self, path: &Path, objects: Option<&Path>) -> Result<Vec<Change>> {
         let plan = &self.record.plan;
+        self.changes_between(path, objects, &plan.old, &plan.new)
+    }
+
+    /// Every path that differs from `from` to `to`, with both entries.
+    fn changes_between(
+        &self,
+        path: &Path,
+        objects: Option<&Path>,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<Change>> {
         let output = self
             .index_command(path, objects)?
-            .args([
-                "diff-tree",
-                "-r",
-                "--no-renames",
-                "--raw",
-                "-z",
-                &plan.old,
-                &plan.new,
-            ])
+            .args(["diff-tree", "-r", "--no-renames", "--raw", "-z", from, to])
             .output()?;
         if !output.status.success() {
             return Err(git_failure("list checkout changes", &output));
@@ -787,18 +906,20 @@ impl Update {
     /// update, so that `read-tree` can finish it (`forward`) or reverse it.
     /// Each changed path takes the entry whose version its file holds. Git
     /// removes a file before it writes the replacement, so a missing file
-    /// takes the entry of the side the update moves from, and is written
-    /// again. Staged entries for other paths are kept. A changed path with
+    /// takes the entry of the side without the path, if there is one, or else
+    /// of the side the update moves from, and is written again. Staged entries for other paths are kept. A changed path with
     /// any other content or staged version stops recovery before a file is
-    /// written.
+    /// written. Paths in `left` are left as the primary's index has them.
     fn rebuild(
         &mut self,
         path: &Path,
         admin: &Path,
         objects: Option<&Path>,
         forward: bool,
+        left: &[Vec<u8>],
     ) -> Result<()> {
-        let changes = self.changes(path, objects)?;
+        let mut changes = self.changes(path, objects)?;
+        changes.retain(|change| !left.contains(&change.path));
         let staged = staged_entries(git::command(path))?;
         let mut edited = Vec::new();
         for change in &changes {
@@ -856,11 +977,19 @@ impl Update {
             let old = (&change.old, &from_old, &from_new);
             let new = (&change.new, &from_new, &from_old);
             let (first, second) = if forward { (old, new) } else { (new, old) };
-            if let Some((entry, _, _)) = [first, second]
+            let holding: Vec<_> = [first, second]
                 .into_iter()
-                .find(|(entry, own, other)| holds(entry, own, other, name))
+                .filter(|(entry, own, other)| holds(entry, own, other, name))
+                .map(|(entry, _, _)| entry)
+                .collect();
+            // Both sides hold only a missing file. The side without the path
+            // cannot clash with a file or directory written in its place.
+            if let Some(entry) = holding
+                .iter()
+                .find(|entry| !entry.present())
+                .or(holding.first())
             {
-                chosen.push((&name[..], entry));
+                chosen.push((&name[..], *entry));
             } else {
                 edited.push(name.clone());
             }
@@ -907,7 +1036,7 @@ impl Update {
             // The files can hold a mix of both versions, and someone may
             // have edited or staged other paths since. Git finishes the
             // update from a private index that matches the files.
-            self.rebuild(path, admin, objects, true)?;
+            self.rebuild(path, admin, objects, true, &[])?;
         } else {
             self.refuse_overlapping_edits(path, objects)?;
             if let Some(current) = &current {
@@ -919,23 +1048,77 @@ impl Update {
         let fresh = !self.has_mutated_checkout();
         self.protect_ignored(path, objects)?;
         publish()?;
-        self.protect_ignored(path, objects)?;
         // Git's dry run checks each file it would replace against the private
         // index, so an edit made since the first check, while publishing for
         // instance, stops the update here: just before the journal records
         // that files may change, not after. Only then is the status read
         // again, to name the edited paths.
-        if let Err(error) = self.two_tree(path, objects, true, true) {
+        if let Err(error) = self.dry_run(path, objects, true) {
             if fresh {
                 self.refuse_overlapping_edits(path, objects)?;
             }
             return Err(error);
         }
         self.set_phase(Phase::Updating)?;
-        self.two_tree(path, objects, true, false)?;
+        before_write();
+        let (from, to) = self.sides(true);
+        let refused = self.write_files(path, objects, &from, &to)?;
+        if !refused.is_empty() {
+            return Err(self.appeared(path, admin, objects, fresh, &refused));
+        }
         let next = registry::regular(&next_path)?;
         registry::atomic(&index, &next)?;
         self.set_phase(Phase::Indexed)
+    }
+
+    /// Report files that appeared after the checks at paths the update
+    /// creates, which Git refused to replace. A fresh update first returns
+    /// every other path to the previous commit, so that it changed nothing.
+    fn appeared(
+        &mut self,
+        path: &Path,
+        admin: &Path,
+        objects: Option<&Path>,
+        fresh: bool,
+        refused: &[Vec<u8>],
+    ) -> anyhow::Error {
+        if fresh {
+            let backed_out = (|| -> Result<bool> {
+                self.rebuild(path, admin, objects, false, refused)?;
+                // The previous commit lacks the refused paths, and Git leaves
+                // a path alone that neither side of the move tracks.
+                let plan = self.record.plan.clone();
+                let from = self.tree_without(path, objects, &plan.new, refused)?;
+                if !self
+                    .write_files(path, objects, &from, &plan.old)?
+                    .is_empty()
+                {
+                    return Ok(false);
+                }
+                self.set_phase(Phase::Prepared)?;
+                Ok(true)
+            })();
+            match backed_out {
+                Ok(true) => {
+                    return self.local_changes(
+                        path,
+                        "Files written during the update",
+                        "would be overwritten by updating",
+                        "Git kept them as they are. Move them aside, then retry",
+                        refused,
+                    );
+                }
+                Ok(false) => (),
+                Err(error) => return self.explain(error),
+            }
+        }
+        self.stopped(
+            format!(
+                "files appeared after Graft checked the checkout, where the update writes: {}. Git kept them as they are. Move them aside, then retry",
+                listed(refused)
+            ),
+            refused,
+        )
     }
 
     /// Return the files and index to the previous commit after another
@@ -947,16 +1130,87 @@ impl Update {
         if !self.has_mutated_checkout() {
             return Ok(());
         }
-        self.rebuild(path, admin, None, false)?;
+        self.rebuild(path, admin, None, false, &[])?;
         self.protect_ignored(path, None)?;
-        self.two_tree(path, None, false, true)?;
+        self.dry_run(path, None, false)?;
         // Until the restore finishes, files can again hold either version,
         // and any later attempt resumes from them in either direction.
         self.set_phase(Phase::Updating)?;
-        self.two_tree(path, None, false, false)?;
+        before_write();
+        let (from, to) = self.sides(false);
+        let refused = self.write_files(path, None, &from, &to)?;
+        if !refused.is_empty() {
+            return Err(self.appeared(path, admin, None, false, &refused));
+        }
         let next = registry::regular(&self.directory.join("index.next"))?;
         registry::atomic(&admin.join("index"), &next)
     }
+}
+
+/// Wait for `child` while another thread writes `input` to it, so a child
+/// that fills its output pipes before it reads all of its input, such as
+/// `checkout-index` naming each path it refuses, cannot block both
+/// processes. Returns the output and whether all of the input was written.
+fn feed_and_wait(
+    mut child: Child,
+    input: Option<&[u8]>,
+) -> (std::io::Result<Output>, std::io::Result<()>) {
+    let stdin = child.stdin.take();
+    std::thread::scope(|scope| {
+        let writer = stdin
+            .zip(input)
+            .map(|(mut stdin, input)| scope.spawn(move || stdin.write_all(input)));
+        let output = child.wait_with_output();
+        let written = writer.map_or(Ok(()), |writer| {
+            writer
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("writing Git's input failed")))
+        });
+        (output, written)
+    })
+}
+
+/// Whether anything is at `name` in the checkout at `root`, or in place of
+/// one of its directories.
+fn occupied(root: &Path, name: &[u8]) -> Result<bool> {
+    let ends = name
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .map(|(end, _)| (end, true))
+        .chain([(name.len(), false)]);
+    for (end, directory) in ends {
+        match fs::symlink_metadata(crate::collision::join(root, &name[..end])?) {
+            Ok(metadata) if directory && metadata.is_dir() => (),
+            Ok(_) => return Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's action between Git's dry run and the first file written.
+    static BEFORE_WRITE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
+}
+
+fn before_write() {
+    #[cfg(test)]
+    BEFORE_WRITE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 }
 
 pub(super) fn index_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -1059,7 +1313,9 @@ mod tests {
     }
 
     /// A primary at `old` and a commit `new` that modifies, adds and
-    /// deletes files and turns the file `swap` into a directory.
+    /// deletes files and turns the file `swap` into a directory. It also
+    /// deletes `gone.local` and adds `late.local`, which match the primary's
+    /// ignore patterns.
     fn partial_fixture() -> Result<(tempfile::TempDir, Project, fs::File, Plan)> {
         let temp = tempfile::tempdir()?;
         let repo = temp.path().join("repository");
@@ -1075,7 +1331,8 @@ mod tests {
             git::bytes(&repo, &["config", key, value])?;
         }
         for (name, content) in [
-            (".gitignore", "ignored/\n"),
+            (".gitignore", "ignored/\n*.local\n"),
+            ("gone.local", "tracked though ignored\n"),
             ("a.txt", "a\n"),
             ("b.txt", "b\n"),
             ("gone.txt", "gone\n"),
@@ -1086,6 +1343,7 @@ mod tests {
             fs::write(repo.join(name), content)?;
         }
         git::bytes(&repo, &["add", "-A"])?;
+        git::bytes(&repo, &["add", "-f", "gone.local"])?;
         git::bytes(&repo, &["commit", "-qm", "old"])?;
         let old = git::oid(&repo, "HEAD")?;
         git::bytes(&repo, &["switch", "-qc", "incoming"])?;
@@ -1096,7 +1354,10 @@ mod tests {
         fs::remove_file(repo.join("swap"))?;
         fs::create_dir(repo.join("swap"))?;
         fs::write(repo.join("swap").join("inner"), "inner\n")?;
+        fs::remove_file(repo.join("gone.local"))?;
+        fs::write(repo.join("late.local"), "from the graft\n")?;
         git::bytes(&repo, &["add", "-A"])?;
+        git::bytes(&repo, &["add", "-f", "late.local"])?;
         git::bytes(&repo, &["commit", "-qm", "new"])?;
         let new = git::oid(&repo, "HEAD")?;
         git::bytes(&repo, &["switch", "-q", "main"])?;
@@ -1124,6 +1385,7 @@ mod tests {
         update.set_phase(Phase::Updating)?;
         let repo = &p.repo;
         fs::remove_file(repo.join("gone.txt"))?;
+        fs::remove_file(repo.join("gone.local"))?;
         fs::remove_file(repo.join("swap"))?;
         fs::write(repo.join("a.txt"), "A\n")?;
         fs::remove_file(repo.join("b.txt"))?;
@@ -1271,22 +1533,29 @@ mod tests {
         Ok(())
     }
 
+    /// The plan of an undo of the applied `plan`: a commit on top of it that
+    /// returns to the previous tree.
+    fn undo_plan(p: &Project, plan: &Plan) -> Result<Plan> {
+        let previous = git::text(&p.repo, &["rev-parse", &format!("{}^{{tree}}", plan.old)])?;
+        let reversal = git::text(
+            &p.repo,
+            &["commit-tree", &previous, "-p", &plan.new, "-m", "undo"],
+        )?;
+        Ok(Plan {
+            target: plan.target.clone(),
+            old: plan.new.clone(),
+            new: reversal,
+            tip: plan.new.clone(),
+        })
+    }
+
     #[test]
     fn an_undo_keeps_unrelated_edits() -> Result<()> {
         let (_temp, p, _lock, plan) = partial_fixture()?;
         apply(&p, &plan, || Ok(()))?;
         let repo = &p.repo;
-        let previous = git::text(repo, &["rev-parse", &format!("{}^{{tree}}", plan.old)])?;
-        let reversal = git::text(
-            repo,
-            &["commit-tree", &previous, "-p", &plan.new, "-m", "undo"],
-        )?;
-        let undo = Plan {
-            target: plan.target.clone(),
-            old: plan.new.clone(),
-            new: reversal.clone(),
-            tip: plan.new.clone(),
-        };
+        let undo = undo_plan(&p, &plan)?;
+        let reversal = undo.new.clone();
         fs::write(repo.join("b.txt"), "edited after the merge\n")?;
         assert_refused(&p, &undo, &["b.txt"])?;
         fs::write(repo.join("b.txt"), "B\n")?;
@@ -1476,6 +1745,239 @@ mod tests {
         Ok(())
     }
 
+    /// Run `action` with `hook` called between Git's dry run and the first
+    /// file the update writes, as when someone writes in the primary then.
+    fn with_late_write<T>(hook: impl FnMut() + 'static, action: impl FnOnce() -> T) -> T {
+        BEFORE_WRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let result = action();
+        BEFORE_WRITE.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
+
+    /// Write `mine` at `name` in the primary after Git's dry run of `plan`,
+    /// expect `destination_has_local_changes` naming `refused`, the path
+    /// the update would write there, and check that the file is kept and
+    /// nothing else in the primary changed.
+    fn assert_late_ignored_write_refused(
+        p: &Project,
+        plan: &Plan,
+        name: &str,
+        refused: &str,
+    ) -> Result<()> {
+        let (index, mut files) = snapshot(p)?;
+        let late = p.repo.join(name);
+        let error = with_late_write(
+            move || fs::write(&late, "mine\n").unwrap(),
+            || apply(p, plan, || Ok(())),
+        )
+        .unwrap_err();
+        let reported = crate::api::error_json(&error);
+        assert_eq!(
+            reported["code"], "destination_has_local_changes",
+            "{reported}"
+        );
+        assert_eq!(reported["details"]["paths"], json!([refused]), "{reported}");
+        files.insert(name.into(), b"mine\n".to_vec());
+        assert!(
+            snapshot(p)? == (index, files),
+            "the refused update changed the primary"
+        );
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.old);
+        assert!(Update::load(&p.common)?.is_none());
+        assert!(!p.common.join("index.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_merge_keeps_an_ignored_file_written_after_its_dry_run() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        assert_late_ignored_write_refused(&p, &plan, "late.local", "late.local")?;
+        fs::remove_file(p.repo.join("late.local"))?;
+        apply(&p, &plan, || Ok(()))?;
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.new);
+        assert_eq!(read(&p, "late.local")?, "from the graft\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_undo_keeps_an_ignored_file_written_after_its_dry_run() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        apply(&p, &plan, || Ok(()))?;
+        let undo = undo_plan(&p, &plan)?;
+        assert_late_ignored_write_refused(&p, &undo, "gone.local", "gone.local")?;
+        fs::remove_file(p.repo.join("gone.local"))?;
+        // The undo turns the directory `swap` back into a file.
+        assert_late_ignored_write_refused(&p, &undo, "swap/late.local", "swap")?;
+        assert_eq!(read(&p, "swap/inner")?, "inner\n");
+        fs::remove_file(p.repo.join("swap").join("late.local"))?;
+        apply(&p, &undo, || Ok(()))?;
+        assert_eq!(git::oid(&p.repo, "HEAD")?, undo.new);
+        assert_eq!(read(&p, "gone.local")?, "tracked though ignored\n");
+        assert_eq!(read(&p, "swap")?, "file\n");
+        assert!(!p.repo.join("late.local").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_retry_keeps_an_ignored_file_written_after_its_dry_run() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        drop(interrupt(&p, &plan)?);
+        let late = p.repo.join("late.local");
+        let mine = late.clone();
+        let error = with_late_write(
+            move || fs::write(&mine, "mine\n").unwrap(),
+            || apply(&p, &plan, || Ok(())),
+        )
+        .unwrap_err();
+        let reported = crate::api::error_json(&error);
+        assert_eq!(reported["code"], "checkout_recovery_required", "{reported}");
+        assert_eq!(reported["details"]["paths"], json!(["late.local"]));
+        assert_eq!(fs::read_to_string(&late)?, "mine\n");
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.old);
+
+        fs::remove_file(&late)?;
+        apply(&p, &plan, || Ok(()))?;
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.new);
+        assert_eq!(read(&p, "late.local")?, "from the graft\n");
+        assert_eq!(read(&p, "b.txt")?, "B\n");
+        Ok(())
+    }
+
+    #[test]
+    fn reversing_a_stopped_update_keeps_an_ignored_file_written_after_its_dry_run() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        let other = second_plan(&p, &plan)?;
+        drop(interrupt(&p, &plan)?);
+        let gone = p.repo.join("gone.local");
+        let mine = gone.clone();
+        let error = with_late_write(
+            move || fs::write(&mine, "mine\n").unwrap(),
+            || apply(&p, &other, || Ok(())),
+        )
+        .unwrap_err();
+        let reported = crate::api::error_json(&error);
+        assert_eq!(reported["code"], "checkout_recovery_required", "{reported}");
+        assert_eq!(reported["details"]["paths"], json!(["gone.local"]));
+        assert_eq!(fs::read_to_string(&gone)?, "mine\n");
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.old);
+
+        fs::remove_file(&gone)?;
+        apply(&p, &other, || Ok(()))?;
+        assert_eq!(git::oid(&p.repo, "HEAD")?, other.new);
+        assert_eq!(read(&p, "gone.local")?, "tracked though ignored\n");
+        assert!(!p.repo.join("late.local").exists());
+        Ok(())
+    }
+
+    /// A primary at `old` holding `before` and a commit `new` that adds
+    /// `added`, committed even where the ignore patterns match.
+    fn adding_fixture(
+        before: &[(String, String)],
+        added: &[(String, String)],
+    ) -> Result<(tempfile::TempDir, Project, fs::File, Plan)> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repository");
+        fs::create_dir(&repo)?;
+        git::bytes(&repo, &["init", "-q", "--template=", "-b", "main"])?;
+        for (key, value) in [
+            ("user.name", "Checkout Fixture"),
+            ("user.email", "checkout@example.invalid"),
+            ("core.autocrlf", "false"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", "disabled-hooks"),
+        ] {
+            git::bytes(&repo, &["config", key, value])?;
+        }
+        let write = |files: &[(String, String)]| -> Result<()> {
+            for (name, content) in files {
+                let file = repo.join(name);
+                fs::create_dir_all(file.parent().context("no parent")?)?;
+                fs::write(file, content)?;
+            }
+            git::bytes(&repo, &["add", "-A", "-f"])?;
+            Ok(())
+        };
+        write(before)?;
+        git::bytes(&repo, &["commit", "-qm", "old"])?;
+        let old = git::oid(&repo, "HEAD")?;
+        git::bytes(&repo, &["switch", "-qc", "incoming"])?;
+        write(added)?;
+        git::bytes(&repo, &["commit", "-qm", "new"])?;
+        let new = git::oid(&repo, "HEAD")?;
+        git::bytes(&repo, &["switch", "-q", "main"])?;
+        let (p, lock) = Project::open(&repo)?;
+        let plan = Plan {
+            target: "main".into(),
+            old,
+            tip: new.clone(),
+            new,
+        };
+        Ok((temp, p, lock, plan))
+    }
+
+    #[test]
+    fn a_new_file_is_written_with_the_attributes_git_merge_uses() -> Result<()> {
+        let attributes = |eol: &str| (".gitattributes".into(), format!("*.txt text eol={eol}\n"));
+        let (_temp, p, _lock, plan) = adding_fixture(
+            &[attributes("lf")],
+            &[("new.txt".into(), "one\ntwo\n".into())],
+        )?;
+        // An uncommitted edit the merge does not touch. Git's own checkout
+        // reads attributes from the index, never from this file.
+        let (name, content) = attributes("crlf");
+        fs::write(p.repo.join(name), content)?;
+        apply(&p, &plan, || Ok(()))?;
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.new);
+        assert_eq!(read(&p, "new.txt")?, "one\ntwo\n");
+        Ok(())
+    }
+
+    #[test]
+    fn many_files_written_after_the_dry_run_are_all_refused_without_a_hang() -> Result<()> {
+        let names: Vec<String> = (0..1500)
+            .map(|n| format!("many/{}-{n:04}.local", "x".repeat(80)))
+            .collect();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let body = || -> Result<()> {
+                let (_temp, p, _lock, plan) = adding_fixture(
+                    &[(".gitignore".into(), "*.local\n".into())],
+                    &names
+                        .iter()
+                        .map(|name| (name.clone(), "from the graft\n".into()))
+                        .collect::<Vec<_>>(),
+                )?;
+                let (repo, late) = (p.repo.clone(), names.clone());
+                let error = with_late_write(
+                    move || {
+                        fs::create_dir_all(repo.join("many")).unwrap();
+                        for name in &late {
+                            fs::write(repo.join(name), "mine\n").unwrap();
+                        }
+                    },
+                    || apply(&p, &plan, || Ok(())),
+                )
+                .unwrap_err();
+                let reported = crate::api::error_json(&error);
+                assert_eq!(
+                    reported["code"], "destination_has_local_changes",
+                    "{reported}"
+                );
+                assert_eq!(reported["details"]["paths"], json!(names));
+                for name in &names {
+                    assert_eq!(read(&p, name)?, "mine\n");
+                }
+                assert_eq!(git::oid(&p.repo, "HEAD")?, plan.old);
+                assert!(Update::load(&p.common)?.is_none());
+                Ok(())
+            };
+            let _ = sender.send(body());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(300))
+            .context("the update hung")?
+    }
+
     #[test]
     fn a_modified_submodule_blocks_only_a_merge_that_moves_it() -> Result<()> {
         let (_temp, p, _lock, _plan) = fixture("files")?;
@@ -1576,6 +2078,29 @@ mod tests {
     }
 
     #[test]
+    fn retry_finishes_an_update_stopped_after_a_directory_became_a_file() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        apply(&p, &plan, || Ok(()))?;
+        let undo = undo_plan(&p, &plan)?;
+        // The undo stopped after Git removed `swap/inner` and wrote `swap`.
+        let mut update = Update::begin(&p.common, &undo)?;
+        let index = fs::read(p.common.join("index"))?;
+        registry::atomic(&update.directory.join("index.before"), &index)?;
+        registry::atomic(&update.directory.join("index.next"), &index)?;
+        update.set_phase(Phase::Updating)?;
+        drop(update);
+        fs::remove_dir_all(p.repo.join("swap"))?;
+        fs::write(p.repo.join("swap"), "file\n")?;
+        apply(&p, &undo, || Ok(()))?;
+        assert_eq!(git::oid(&p.repo, "HEAD")?, undo.new);
+        assert_eq!(read(&p, "swap")?, "file\n");
+        assert_eq!(read(&p, "a.txt")?, "a\n");
+        assert!(git::changes(&p.repo)?.iter().all(|c| c.status == "!!"));
+        assert!(Update::load(&p.common)?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn retry_stops_without_writing_when_a_changed_file_was_edited() -> Result<()> {
         let (_temp, p, _lock, plan) = partial_fixture()?;
         drop(interrupt(&p, &plan)?);
@@ -1622,9 +2147,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn another_merge_restores_the_previous_commit_before_it_applies() -> Result<()> {
-        let (_temp, p, _lock, plan) = partial_fixture()?;
+    /// Another merge into the primary's branch at `plan.old`, adding
+    /// `second.txt`.
+    fn second_plan(p: &Project, plan: &Plan) -> Result<Plan> {
         let repo = &p.repo;
         git::bytes(repo, &["switch", "-qc", "second", &plan.old])?;
         fs::write(repo.join("second.txt"), "second\n")?;
@@ -1632,12 +2157,20 @@ mod tests {
         git::bytes(repo, &["commit", "-qm", "second"])?;
         let second = git::oid(repo, "HEAD")?;
         git::bytes(repo, &["switch", "-q", "main"])?;
-        let other = Plan {
+        Ok(Plan {
             target: "main".into(),
             old: plan.old.clone(),
             tip: second.clone(),
-            new: second.clone(),
-        };
+            new: second,
+        })
+    }
+
+    #[test]
+    fn another_merge_restores_the_previous_commit_before_it_applies() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        let repo = &p.repo;
+        let other = second_plan(&p, &plan)?;
+        let second = other.new.clone();
         drop(interrupt(&p, &plan)?);
         edit_primary(&p)?;
         // The interrupted update is reversed first. The new merge then
@@ -1686,7 +2219,7 @@ mod tests {
         let recorded =
             |update: &Update| -> Result<Option<u32>> { Ok(read_record(&update.directory)?.worker) };
         assert_eq!(recorded(&update)?, None);
-        update.two_tree(&p.repo, None, true, true)?;
+        update.dry_run(&p.repo, None, true)?;
         let dry_run = recorded(&update)?.context("the dry run was not recorded")?;
         let changes = update.changes(&p.repo, None)?;
         update.write_view(
