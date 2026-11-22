@@ -898,6 +898,13 @@ fn scan(p: &Project) -> Result<Registry> {
     Ok(registry)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once in [`upgrade_identity`] before it takes the graft lock.
+    static BEFORE_UPGRADE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Rewrite the identities of a graft's directories in a record an earlier
 /// build wrote, with a birth time or, on macOS, without the volume UUID.
 /// Such a record still verifies on its inodes (see
@@ -911,6 +918,37 @@ fn upgrade_identity(directory: &Path, r: &mut Record) {
     if !cfg!(unix) || r.identity.workspace.is_current() && r.identity.git.is_current() {
         return;
     }
+    // Most records need nothing; only those that do take the graft lock.
+    if upgraded_identity(r).is_none() {
+        return;
+    }
+    #[cfg(test)]
+    BEFORE_UPGRADE_LOCK.with_borrow_mut(|hook| hook.take().map(|hook| hook()));
+    let upgraded = (|| -> Result<Identity> {
+        let state = directory.parent().context("records have no parent")?;
+        let _lock = lock_in(state, &r.name)?;
+        let mut live = read_record(directory, &r.id)?;
+        // Rewrite only the record this command read; one that changed is
+        // checked again by the next command.
+        ensure!(
+            serde_json::to_value(&live)? == serde_json::to_value(&*r)?,
+            "graft record changed"
+        );
+        // Read the directories again under the lock: one moved or replaced
+        // since the read above is left for a later command.
+        let current = upgraded_identity(&live).context("graft directories changed")?;
+        live.identity = current.clone();
+        write_record(directory, &live)?;
+        Ok(current)
+    })();
+    if let Ok(current) = upgraded {
+        r.identity = current;
+    }
+}
+
+/// The identity of the directories at a path where `r` can hold them, in the
+/// current form, when `r`'s identity names them in an earlier form.
+fn upgraded_identity(r: &Record) -> Option<Identity> {
     let mut paths = vec![&r.path];
     paths.extend(&r.archive);
     match &r.transition {
@@ -923,29 +961,11 @@ fn upgrade_identity(directory: &Path, r: &mut Record) {
         ) => paths.push(from),
         _ => (),
     }
-    let Some(current) = paths.into_iter().find_map(|path| {
+    paths.into_iter().find_map(|path| {
         Identity::read(path)
             .ok()
             .filter(|current| r.identity.upgrades_to(current))
-    }) else {
-        return;
-    };
-    let upgraded = (|| -> Result<()> {
-        let state = directory.parent().context("records have no parent")?;
-        let _lock = lock_in(state, &r.name)?;
-        let mut live = read_record(directory, &r.id)?;
-        // Rewrite only the record this command read; one that changed is
-        // checked again by the next command.
-        ensure!(
-            serde_json::to_value(&live)? == serde_json::to_value(&*r)?,
-            "graft record changed"
-        );
-        live.identity = current.clone();
-        write_record(directory, &live)
-    })();
-    if upgraded.is_ok() {
-        r.identity = current;
-    }
+    })
 }
 
 /// Checks of one record against its project, beyond its own format.
@@ -3068,6 +3088,43 @@ mod tests {
         foreign["project_id"] = Uuid::new_v4().to_string().into();
         write(&marker, &foreign)?;
         assert!(state_dir(p, false).is_err());
+        Ok(())
+    }
+
+    /// A graft directory replaced after a command first reads it, before it
+    /// takes the graft lock to rewrite the record, is not recorded.
+    #[cfg(unix)]
+    #[test]
+    fn identity_upgrades_read_the_directories_again_under_the_graft_lock() -> Result<()> {
+        let f = Fixture::new()?;
+        let p = &f.project;
+        let r = f.workspace("agent")?;
+        let record = record_file(p, &r)?;
+        let read = |path: &Path| -> Result<Value> { Ok(serde_json::from_slice(&fs::read(path)?)?) };
+        // The record as the build before this one wrote it.
+        let mut stored = read(&record)?;
+        let born = serde_json::json!({"secs_since_epoch": 1, "nanos_since_epoch": 0});
+        for side in ["workspace", "git"] {
+            stored["identity"][side]["created"] = born.clone();
+        }
+        fs::write(&record, serde_json::to_vec(&stored)?)?;
+        let moved = r.path.with_file_name("moved-away");
+        let (path, away) = (r.path.clone(), moved.clone());
+        BEFORE_UPGRADE_LOCK.set(Some(Box::new(move || {
+            fs::rename(&path, &away).unwrap();
+            fs::create_dir_all(path.join(".git")).unwrap();
+        })));
+        let _ = load(p, &r.name);
+        assert_eq!(read(&record)?, stored);
+        // Once the graft is back, the next command rewrites the record.
+        fs::remove_dir_all(&r.path)?;
+        fs::rename(&moved, &r.path)?;
+        verify(p, &load(p, &r.name)?)?;
+        assert!(
+            read(&record)?["identity"]["workspace"]
+                .get("created")
+                .is_none()
+        );
         Ok(())
     }
 
