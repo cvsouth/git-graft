@@ -19,12 +19,118 @@ const OWNER: &str = ".git-graft-cache-id";
 pub(crate) const QUARANTINE_PREFIX: &str = ".purge-";
 const OWNER_LIMIT: u64 = 1024;
 
+/// The identity of a directory. Within one command it compares in full. A
+/// copy written to disk is checked later with [`DirectoryIdentity::names`].
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DirectoryIdentity {
     device: u64,
     file: u64,
     created: Option<SystemTime>,
+}
+
+impl DirectoryIdentity {
+    /// Whether this identity, read from disk, names the directory whose
+    /// identity is `current`. See [`persisted_match`].
+    pub(crate) fn names(&self, current: &Self) -> bool {
+        persisted_match(
+            (self.device, self.file, self.created),
+            (current.device, current.file, current.created),
+        )
+    }
+
+    /// The device number when this identity was read. On Unix it can change
+    /// across a reboot or remount.
+    #[cfg(unix)]
+    pub(crate) fn device(&self) -> u64 {
+        self.device
+    }
+}
+
+/// Whether a file identity written to disk, `(volume, file, created)`, names
+/// the file whose identity was just read as `current`.
+///
+/// A Unix device number is not stable: macOS APFS renumbers volumes across a
+/// reboot, and on Linux device-mapper, NVMe enumeration order, NFS and btrfs
+/// can renumber one across a reboot or remount. So on Unix the volume is
+/// recorded but never compared. A persisted identity names a file by inode
+/// and birth time where the filesystem records one: a copy, or a replacement
+/// on this or any other volume, has a new birth time, and on the same volume
+/// also a new inode. Where either side has no birth time (Graft 0.1.0 did not
+/// record one for graft directories, and some filesystems have none) the
+/// inode is compared alone; the fixed path, the project ID and the ownership
+/// markers inside each directory still have to match. Windows volume serial
+/// numbers survive reboots and are compared.
+fn persisted_match(
+    stored: (u64, u64, Option<SystemTime>),
+    current: (u64, u64, Option<SystemTime>),
+) -> bool {
+    let volume = cfg!(unix) || stored.0 == current.0;
+    let created = match (stored.2, current.2) {
+        (Some(stored), Some(current)) => stored == current,
+        _ => true,
+    };
+    volume && stored.1 == current.1 && created
+}
+
+/// The identity of a file or directory as Graft persists it in its own
+/// records and markers, which must keep naming it after a reboot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FileIdentity {
+    /// On Unix, the device number; recorded but not compared on disk (see
+    /// [`persisted_match`]). On Windows, the volume serial number.
+    volume: u64,
+    file: u64,
+    /// The birth time on Unix, where the filesystem records one. Graft 0.1.0
+    /// wrote none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created: Option<SystemTime>,
+}
+
+impl FileIdentity {
+    #[cfg(unix)]
+    pub(crate) fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+            created: metadata.created().ok(),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn windows(volume: u64, file: u64) -> Self {
+        Self {
+            volume,
+            file,
+            created: None,
+        }
+    }
+
+    /// Whether this identity, read from disk, names the file whose identity
+    /// is `current`. See [`persisted_match`].
+    pub(crate) fn names(&self, current: &Self) -> bool {
+        persisted_match(
+            (self.volume, self.file, self.created),
+            (current.volume, current.file, current.created),
+        )
+    }
+
+    /// Whether this identity names `current` and lacks the birth time that
+    /// `current` records, so writing `current` in its place strengthens it.
+    pub(crate) fn upgrades_to(&self, current: &Self) -> bool {
+        self.created.is_none() && current.created.is_some() && self.names(current)
+    }
+
+    /// Whether this identity records a birth time.
+    pub(crate) fn has_birth_time(&self) -> bool {
+        self.created.is_some()
+    }
+
+    /// Whether both identities, read in this command, are on one volume.
+    pub(crate) fn same_volume(&self, other: &Self) -> bool {
+        self.volume == other.volume
+    }
 }
 
 /// The volume serial number and file index of an ordinary Windows directory,
@@ -208,7 +314,7 @@ pub(crate) fn verify_package(
         let expected = read_binding(project, package)?;
         ensure!(
             read_private_file(&path.join(OWNER), OWNER_LIMIT)? == expected.nonce.as_bytes()
-                && directory_identity(path)? == expected.directory,
+                && expected.directory.names(&directory_identity(path)?),
             "package cache binding does not match this directory"
         );
         Ok(expected)
@@ -376,6 +482,94 @@ pub(crate) fn purge_directory(
 mod tests {
     use super::*;
     use crate::{engine::gc::purge_caches, git};
+    use std::time::Duration;
+
+    #[test]
+    fn persisted_identities_ignore_unix_device_numbers_only() {
+        let born = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_795_209_831_123_456_789);
+        let later = born + Duration::from_nanos(1);
+        let stored = (16_777_231, 977_754_921, Some(born));
+        // A reboot renumbered the device; nothing else changed.
+        let renumbered = (16_777_232, 977_754_921, Some(born));
+        assert_eq!(persisted_match(stored, renumbered), cfg!(unix));
+        assert!(persisted_match(stored, stored));
+        // Another directory has another inode or birth time.
+        assert!(!persisted_match(
+            stored,
+            (16_777_231, 977_754_922, Some(born))
+        ));
+        assert!(!persisted_match(
+            stored,
+            (16_777_231, 977_754_921, Some(later))
+        ));
+        // Without a birth time on either side, the inode decides.
+        assert_eq!(
+            persisted_match(
+                (16_777_231, 977_754_921, None),
+                (1, 977_754_921, Some(born))
+            ),
+            cfg!(unix)
+        );
+        assert!(!persisted_match(
+            (1, 977_754_921, None),
+            (1, 977_754_922, None)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_identities_gain_birth_times_only_for_the_same_file() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let current = FileIdentity::of(&fs::metadata(tmp.path())?);
+        if !current.has_birth_time() {
+            return Ok(());
+        }
+        let mut legacy = current.clone();
+        legacy.volume += 1;
+        legacy.created = None;
+        assert!(legacy.names(&current) && legacy.upgrades_to(&current));
+        assert!(!current.upgrades_to(&current));
+        let other = FileIdentity::of(&fs::metadata(tempfile::tempdir()?.path())?);
+        assert!(!legacy.names(&other) && !legacy.upgrades_to(&other));
+        // A legacy identity written in the 0.1.0 format still reads.
+        let old: FileIdentity = serde_json::from_value(serde_json::json!({
+            "volume": legacy.volume,
+            "file": legacy.file,
+        }))?;
+        assert_eq!(old, legacy);
+        Ok(())
+    }
+
+    #[test]
+    fn package_bindings_survive_a_renumbered_device() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        git::bytes(tmp.path(), &["init", "-q", "--template="])?;
+        let (project, _lock) = Project::open(tmp.path())?;
+        prepare_package_roots(&project)?;
+        let npm = project.state.join("cache/npm");
+        let record = owner_record(&project, "npm");
+        let original: serde_json::Value = serde_json::from_slice(&fs::read(&record)?)?;
+        let rewrite = |change: &dyn Fn(&mut serde_json::Value)| -> Result<()> {
+            let mut binding = original.clone();
+            change(&mut binding["directory"]);
+            registry::atomic(&record, &serde_json::to_vec(&binding)?)?;
+            Ok(())
+        };
+        let renumber = |directory: &mut serde_json::Value| {
+            directory["device"] = (directory["device"].as_u64().unwrap() + 1).into();
+        };
+        rewrite(&renumber)?;
+        assert_eq!(verify_package(&project, "npm", &npm).is_ok(), cfg!(unix));
+        #[cfg(unix)]
+        prepare_package_roots(&project)?;
+        rewrite(&|directory| {
+            renumber(directory);
+            directory["file"] = (directory["file"].as_u64().unwrap() + 1).into();
+        })?;
+        assert!(verify_package(&project, "npm", &npm).is_err());
+        assert!(prepare_package_roots(&project).is_err());
+        Ok(())
+    }
 
     #[test]
     fn existing_root_cannot_be_adopted_even_with_a_copied_marker() -> Result<()> {

@@ -24,11 +24,9 @@ struct Owner {
     snapshot: Option<Snapshot>,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-struct FileKey {
-    volume: u64,
-    file: u64,
-}
+/// A scratch file's identity. The owner marker persists it, and checks it
+/// with [`FileKey::names`] so that it survives a reboot.
+type FileKey = cache::FileIdentity;
 
 #[cfg(unix)]
 fn file_key(file: &File) -> Result<FileKey> {
@@ -38,10 +36,7 @@ fn file_key(file: &File) -> Result<FileKey> {
         m.is_file() && m.nlink() == 1,
         "merge scratch file is shared"
     );
-    Ok(FileKey {
-        volume: m.dev(),
-        file: m.ino(),
-    })
+    Ok(FileKey::of(&m))
 }
 
 #[cfg(windows)]
@@ -56,10 +51,10 @@ fn file_key(file: &File) -> Result<FileKey> {
             && i.nNumberOfLinks == 1,
         "merge scratch file is shared"
     );
-    Ok(FileKey {
-        volume: u64::from(i.dwVolumeSerialNumber),
-        file: (u64::from(i.nFileIndexHigh) << 32) | u64::from(i.nFileIndexLow),
-    })
+    Ok(FileKey::windows(
+        u64::from(i.dwVolumeSerialNumber),
+        (u64::from(i.nFileIndexHigh) << 32) | u64::from(i.nFileIndexLow),
+    ))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -90,15 +85,21 @@ fn owned(p: &Project, dir: &Path) -> Result<Owner> {
         "merge scratch directory has additional metadata or cannot be inspected"
     );
     let marker = objects::open_regular(&dir.join(OWNER))?;
-    let owner: Owner = serde_json::from_slice(&registry::regular(&dir.join(OWNER))?)?;
+    let mut owner: Owner = serde_json::from_slice(&registry::regular(&dir.join(OWNER))?)?;
+    let directory = cache::directory_identity(dir)?;
+    let key = file_key(&marker)?;
     ensure!(
         owner.project == p.id()
-            && cache::directory_identity(dir)? == owner.directory
+            && owner.directory.names(&directory)
             && recovery::no_extended_metadata(&dir.join(OWNER))
-            && file_key(&marker)? == owner.marker
-            && file_key(&objects::open_regular(&dir.join(OWNER))?)? == owner.marker,
+            && owner.marker.names(&key)
+            && file_key(&objects::open_regular(&dir.join(OWNER))?)? == key,
         "merge scratch ownership changed"
     );
+    // A reboot can renumber the device. Carry the current identities: the
+    // purge compares them within this command, and a checkpoint records them.
+    owner.directory = directory;
+    owner.marker = key;
     Ok(owner)
 }
 
@@ -144,10 +145,27 @@ fn allowed(path: &Path, directory: bool) -> bool {
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
 struct Snapshot {
     dirs: Vec<(PathBuf, DirectoryIdentity)>,
     files: Vec<(PathBuf, FileKey, String)>,
+}
+
+impl Snapshot {
+    /// Whether this checkpoint, read from disk, names the entries scanned
+    /// now as `current`, with the same file contents.
+    fn names(&self, current: &Self) -> bool {
+        self.dirs.len() == current.dirs.len()
+            && self.files.len() == current.files.len()
+            && self
+                .dirs
+                .iter()
+                .zip(&current.dirs)
+                .all(|(stored, now)| stored.0 == now.0 && stored.1.names(&now.1))
+            && self.files.iter().zip(&current.files).all(|(stored, now)| {
+                stored.0 == now.0 && stored.1.names(&now.1) && stored.2 == now.2
+            })
+    }
 }
 
 fn scan(root: &Path) -> Result<Snapshot> {
@@ -202,7 +220,10 @@ fn scan(root: &Path) -> Result<Snapshot> {
 }
 
 fn unchanged(root: &Path, snapshot: &Snapshot) -> Result<()> {
-    ensure!(scan(root)? == *snapshot, "merge scratch entries changed");
+    ensure!(
+        snapshot.names(&scan(root)?),
+        "merge scratch entries changed"
+    );
     Ok(())
 }
 
@@ -285,4 +306,62 @@ pub(super) fn recover(p: &Project, root: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// A reboot can renumber the device under unfinished merge scratch. Its
+    /// owner marker and checkpoint, written with the old device number and
+    /// in the 0.1.0 form, still verify, so recovery can purge it; a changed
+    /// file still blocks the purge.
+    #[test]
+    fn scratch_survives_a_renumbered_device() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        crate::git::bytes(tmp.path(), &["init", "-q", "--template="])?;
+        let (p, _lock) = Project::open(tmp.path())?;
+        let root = super::super::stores(&p, true)?;
+        let stage = tempfile::Builder::new()
+            .prefix(".pending-")
+            .tempdir_in(&root)?
+            .keep();
+        mark(&p, &stage)?;
+        fs::create_dir(stage.join("objects"))?;
+        fs::write(stage.join("HEAD"), "ref: refs/heads/main\n")?;
+        checkpoint(&p, &stage)?;
+        let marker = stage.join(OWNER);
+        let mut owner: Value = serde_json::from_slice(&fs::read(&marker)?)?;
+        // Directory identities always recorded birth times; file keys did not.
+        let renumber = |id: &mut Value, field: &str| {
+            id[field] = (id[field].as_u64().unwrap() + 1).into();
+            if field == "volume" {
+                id.as_object_mut().unwrap().remove("created");
+            }
+        };
+        renumber(&mut owner["directory"], "device");
+        renumber(&mut owner["marker"], "volume");
+        for entry in owner["snapshot"]["dirs"].as_array_mut().unwrap() {
+            renumber(&mut entry[1], "device");
+        }
+        for entry in owner["snapshot"]["files"].as_array_mut().unwrap() {
+            renumber(&mut entry[1], "volume");
+        }
+        let write = |owner: &Value| fs::write(&marker, serde_json::to_vec(owner)?);
+        let mut changed = owner.clone();
+        changed["snapshot"]["files"][0][2] = "0".repeat(64).into();
+        write(&changed)?;
+        let checked = owned(&p, &stage)?;
+        assert!(unchanged(&stage, checked.snapshot.as_ref().unwrap()).is_err());
+        assert!(purge(&p, &root, &stage).is_err());
+        assert!(stage.join("HEAD").is_file());
+
+        write(&owner)?;
+        let checked = owned(&p, &stage)?;
+        unchanged(&stage, checked.snapshot.as_ref().unwrap())?;
+        recover(&p, &root)?;
+        assert!(!stage.exists());
+        Ok(())
+    }
 }

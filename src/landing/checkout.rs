@@ -57,13 +57,17 @@ struct Record {
 
 fn read_record(directory: &Path) -> Result<Record> {
     let identity = directory_identity(directory)?;
-    let record: Record =
+    let mut record: Record =
         serde_json::from_slice(&registry::regular(&directory.join("record.json"))?)?;
     ensure!(
-        Uuid::parse_str(&record.token)?.to_string() == record.token && record.directory == identity,
+        Uuid::parse_str(&record.token)?.to_string() == record.token
+            && record.directory.names(&identity),
         "invalid checkout transition identity at {}",
         directory.display()
     );
+    // A reboot can renumber the device. Carry the current identity, which the
+    // next phase change records and later reads in this command compare.
+    record.directory = identity;
     Ok(record)
 }
 
@@ -1572,6 +1576,37 @@ mod tests {
         assert_eq!(changed, "unrelated.txt");
         assert!(Update::load(&p.common)?.is_none());
         assert!(!p.common.join("index.lock").exists());
+        Ok(())
+    }
+
+    /// A reboot can renumber the device between a crash and the retry. The
+    /// transition record still names its directory; one naming another
+    /// directory does not.
+    #[test]
+    fn retry_finishes_an_update_interrupted_before_a_reboot() -> Result<()> {
+        let (_temp, p, _lock, plan) = partial_fixture()?;
+        let update = interrupt(&p, &plan)?;
+        let path = update.directory.join("record.json");
+        drop(update);
+        let original: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let rewrite = |field: &str| -> Result<()> {
+            let mut record = original.clone();
+            let id = &mut record["directory"][field];
+            *id = (id.as_u64().context("missing identity")? + 1).into();
+            registry::atomic(&path, &serde_json::to_vec(&record)?)
+        };
+        rewrite("file")?;
+        assert!(Update::load(&p.common).is_err());
+        rewrite("device")?;
+        if cfg!(windows) {
+            assert!(Update::load(&p.common).is_err());
+            return Ok(());
+        }
+        apply(&p, &plan, || Ok(()))?;
+        assert_eq!(git::oid(&p.repo, "HEAD")?, plan.new);
+        assert_eq!(read(&p, "a.txt")?, "A\n");
+        assert_eq!(read(&p, "b.txt")?, "B\n");
+        assert!(Update::load(&p.common)?.is_none());
         Ok(())
     }
 

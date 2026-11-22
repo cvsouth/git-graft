@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Commands no longer fail after a reboot changes the disk's device number. macOS renumbers APFS volumes when it restarts, and Linux can after a reboot or remount, so every command, `list` included, could stop with `graft namespace ownership is unverified`. On macOS and Linux Graft now identifies its private directories by inode and birth time and no longer compares the device number it stored. Windows still compares the volume serial number, which does not change. State that 0.1.0 wrote keeps working with nothing to do: the first command that finds a graft's directories unchanged also records their birth times. A copied or replaced directory is still refused. Graft's caches verify across a reboot too, so they are reused instead of rebuilt.
 - `remove` and `merge` no longer report `local_changes` for the shared `node_modules` that Graft itself attached when the graft has not changed it. The attach receipt now records the verified `contents` digest, and the install counts as local work again once any file in it is added, edited or deleted. The archive keeps every file either way, and other ignored files still count.
 - `text=auto` with `core.autocrlf=true` no longer makes every file of a new graft come from Git.
 - Files Git writes during a cloned checkout record their stat data, so the first `git status` in a graft reads no file contents.

@@ -57,9 +57,12 @@ struct Artifact {
     digest: String,
 }
 
+/// A pack file's identity and change state. A receipt stores it, and a
+/// reboot can renumber the device under it, so it has no device number;
+/// earlier receipts' is ignored. A replaced file has a new inode or change
+/// time, and every restore checks the bytes against the receipt's digest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Stamp {
-    device: u64,
     inode: u64,
     size: u64,
     modified: [i64; 2],
@@ -80,7 +83,6 @@ impl Stamp {
             "expected an immutable regular Git pack file"
         );
         Ok(Self {
-            device: m.dev(),
             inode: m.ino(),
             size: m.len(),
             modified: [m.mtime(), m.mtime_nsec()],
