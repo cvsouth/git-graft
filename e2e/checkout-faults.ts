@@ -100,8 +100,10 @@ export class Running {
     const pid = this.child.pid;
     assert(pid, 'the merge has no process ID');
     if (process.platform === 'win32') {
-      const out = spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { windowsHide: true, encoding: 'utf8' });
-      assert.equal(out.status, 0, out.stderr);
+      // taskkill fails when a process in the tree exits while it walks it,
+      // even though it killed the rest, so its status proves nothing;
+      // `exit()` proves the merge is gone.
+      spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { windowsHide: true });
     } else {
       process.kill(-pid, 'SIGKILL');
     }
@@ -278,7 +280,8 @@ export const cases: Scenario[] = [
         merge.killWithWorker(ctx);
         await merge.exit();
       } finally {
-        if (merge.running()) merge.killCli();
+        // Cleanup only: never mask the error that brought us here.
+        if (merge.running()) merge.child.kill('SIGKILL');
         fault.release();
       }
       // Graft's own index lock and Git's private index lock are left behind.
@@ -311,7 +314,8 @@ export const cases: Scenario[] = [
         merge.killTree();
         await merge.exit();
       } finally {
-        if (merge.running()) merge.killCli();
+        // Cleanup only: never mask the error that brought us here.
+        if (merge.running()) merge.child.kill('SIGKILL');
         fault.release();
       }
       // Killing Git's ref transaction leaves its own lock files. Graft cannot
