@@ -460,6 +460,29 @@ pub(crate) fn open_lock(path: &Path) -> Result<File> {
     Ok(lock_options(path)?.open(path)?)
 }
 
+/// A held lock. A concurrent fork can share its open file description until
+/// exec closes the descriptor, so dropping it releases the lock explicitly.
+pub(crate) struct Held(pub(crate) File);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Wait for the lock file at `path`, shared or exclusive. See the lock
+/// ordering at [`Project::lock_builds`].
+pub(crate) fn hold(path: &Path, shared: bool) -> Result<Held> {
+    let file = open_lock(path)?;
+    let locked = if shared {
+        file.lock_shared()
+    } else {
+        file.lock()
+    };
+    locked.with_context(|| format!("lock {}", path.display()))?;
+    Ok(Held(file))
+}
+
 /// Open the lock at `path` without sharing it, or `None` while any other
 /// handle to it is open, including one a background process inherited.
 #[cfg(windows)]

@@ -36,7 +36,12 @@ pub(super) fn key(state: &Path, create: bool) -> Result<Key> {
         let mut temp = tempfile::NamedTempFile::new_in(state)?;
         temp.write_all(&secret)?;
         temp.as_file().sync_all()?;
-        temp.persist_noclobber(state.join(KEY))?;
+        // A concurrent first build may have stored the key first; use it.
+        if let Err(error) = temp.persist_noclobber(state.join(KEY))
+            && error.error.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(error.into());
+        }
     }
     let mut file = root.regular(Path::new(KEY))?;
     let metadata = file.metadata()?;

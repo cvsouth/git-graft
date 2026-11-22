@@ -350,15 +350,7 @@ fn record_directory(p: &Project, create: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub(super) struct WorkspaceLock(File);
-
-impl Drop for WorkspaceLock {
-    fn drop(&mut self) {
-        // A concurrent fork can share the open file description until exec
-        // closes its descriptor. Release the lock when the caller is done.
-        let _ = self.0.unlock();
-    }
-}
+pub(super) type WorkspaceLock = crate::registry::Held;
 
 fn lock_in(state: &Path, name: &str) -> Result<WorkspaceLock> {
     let path = state.join("locks");
@@ -429,7 +421,7 @@ fn busy(name: &str) -> anyhow::Error {
 
 fn try_lock(file: File, name: &str) -> Result<WorkspaceLock> {
     match file.try_lock() {
-        Ok(()) => Ok(WorkspaceLock(file)),
+        Ok(()) => Ok(crate::registry::Held(file)),
         Err(fs::TryLockError::WouldBlock) => Err(busy(name)),
         Err(error) => Err(io::Error::from(error).into()),
     }

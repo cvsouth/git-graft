@@ -1023,27 +1023,34 @@ fn prepare(checkout: &Checkout<'_>, state: &Path, primary: Option<&Path>) -> Res
     };
     staged.run(&["read-tree", oid], None)?;
     stage_parents(&tree, entries)?;
-    let (snapshot, installed) = match fs::symlink_metadata(&base) {
-        Ok(_) => {
-            receipt.warm = true;
-            (
-                cache::Snapshot::load(&base, &secret, oid, settings)?,
-                BTreeSet::new(),
-            )
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let parent = parent_candidate(checkout, &bases, settings, &secret);
-            build_snapshot(
-                &staged,
-                &secret,
-                &base,
-                parent.as_ref(),
-                primary,
-                mode,
-                &mut receipt,
-            )?
-        }
-        Err(error) => return Err(error.into()),
+    let published = || crate::registry::exists(&base);
+    // Grafts build concurrently. The first to find the base missing builds
+    // it under the fill lock; the others wait, then load what it published.
+    let fill = if published()? {
+        None
+    } else {
+        Some(crate::registry::hold(&state.join("fill.lock"), false)?)
+    };
+    let (snapshot, installed) = if published()? {
+        drop(fill);
+        receipt.warm = true;
+        (
+            cache::Snapshot::load(&base, &secret, oid, settings)?,
+            BTreeSet::new(),
+        )
+    } else {
+        let parent = parent_candidate(checkout, &bases, settings, &secret);
+        let built = build_snapshot(
+            &staged,
+            &secret,
+            &base,
+            parent.as_ref(),
+            primary,
+            mode,
+            &mut receipt,
+        )?;
+        drop(fill);
+        built
     };
     ensure!(
         snapshot

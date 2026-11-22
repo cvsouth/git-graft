@@ -387,18 +387,32 @@ impl<'a> Cache<'a> {
             check(stage.path())?;
             // An existing generation always wins. Check the actual winning
             // directory as well, since rename accepts a name, not an fd.
-            rename_exclusive(stage.path(), &self.key)?;
+            if !won(rename_exclusive(stage.path(), &self.key))? {
+                return Ok(0);
+            }
             let _ = stage.keep();
             root.sync()?;
             check(&self.key)?;
         } else {
             write_synced(&stage.path().join(RECEIPT), &data)?;
             sync_directory(stage.path())?;
-            rename_exclusive(stage.path(), &self.key)?;
+            if !won(rename_exclusive(stage.path(), &self.key))? {
+                return Ok(0);
+            }
             let _ = stage.keep();
             sync_directory(&self.root)?;
         }
         Ok(bytes)
+    }
+}
+
+/// Whether a publishing rename placed this generation. A concurrent build
+/// that published the same generation first wins, and its copy is kept.
+fn won(renamed: std::io::Result<()>) -> Result<bool> {
+    match renamed {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
