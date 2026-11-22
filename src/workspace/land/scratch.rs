@@ -36,7 +36,7 @@ fn file_key(file: &File) -> Result<FileKey> {
         m.is_file() && m.nlink() == 1,
         "merge scratch file is shared"
     );
-    Ok(FileKey::of(&m))
+    Ok(FileKey::of(file, &m))
 }
 
 #[cfg(windows)]
@@ -333,11 +333,15 @@ mod tests {
         checkpoint(&p, &stage)?;
         let marker = stage.join(OWNER);
         let mut owner: Value = serde_json::from_slice(&fs::read(&marker)?)?;
-        // Directory identities always recorded birth times; file keys did not.
+        // Earlier builds wrote no volume UUID. Directory identities recorded
+        // birth times, which are now ignored; file keys did not.
         let renumber = |id: &mut Value, field: &str| {
             id[field] = (id[field].as_u64().unwrap() + 1).into();
-            if field == "volume" {
-                id.as_object_mut().unwrap().remove("created");
+            let id = id.as_object_mut().unwrap();
+            id.remove("volume_uuid");
+            if field == "device" {
+                let born = serde_json::json!({"secs_since_epoch": 1, "nanos_since_epoch": 0});
+                id.insert("created".into(), born);
             }
         };
         renumber(&mut owner["directory"], "device");

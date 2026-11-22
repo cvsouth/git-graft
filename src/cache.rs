@@ -10,7 +10,6 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 use uuid::Uuid;
 
@@ -26,7 +25,12 @@ const OWNER_LIMIT: u64 = 1024;
 pub(crate) struct DirectoryIdentity {
     device: u64,
     file: u64,
-    created: Option<SystemTime>,
+    /// The volume's UUID on macOS, where the filesystem reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volume_uuid: Option<VolumeId>,
+    /// The birth time earlier versions recorded (see [`Legacy`]).
+    #[serde(default, rename = "created", skip_serializing)]
+    legacy: Legacy,
 }
 
 impl DirectoryIdentity {
@@ -34,8 +38,8 @@ impl DirectoryIdentity {
     /// identity is `current`. See [`persisted_match`].
     pub(crate) fn names(&self, current: &Self) -> bool {
         persisted_match(
-            (self.device, self.file, self.created),
-            (current.device, current.file, current.created),
+            (self.device, self.file, self.volume_uuid),
+            (current.device, current.file, current.volume_uuid),
         )
     }
 
@@ -47,30 +51,149 @@ impl DirectoryIdentity {
     }
 }
 
-/// Whether a file identity written to disk, `(volume, file, created)`, names
-/// the file whose identity was just read as `current`.
+/// Whether a file identity written to disk, `(volume, file, volume UUID)`,
+/// names the file whose identity was just read as `current`.
 ///
 /// A Unix device number is not stable: macOS APFS renumbers volumes across a
 /// reboot, and on Linux device-mapper, NVMe enumeration order, NFS and btrfs
-/// can renumber one across a reboot or remount. So on Unix the volume is
-/// recorded but never compared. A persisted identity names a file by inode
-/// and birth time where the filesystem records one: a copy, or a replacement
-/// on this or any other volume, has a new birth time, and on the same volume
-/// also a new inode. Where either side has no birth time (Graft 0.1.0 did not
-/// record one for graft directories, and some filesystems have none) the
-/// inode is compared alone; the fixed path, the project ID and the ownership
-/// markers inside each directory still have to match. Windows volume serial
-/// numbers survive reboots and are compared.
+/// can renumber one across a reboot or remount. So on Unix the device is
+/// recorded but never compared. Birth times are not compared either: setting
+/// a file's modification time before its birth time moves the birth time on
+/// macOS, as `touch -t`, `rsync -a`, `cp -a` and `tar` do.
+///
+/// A persisted identity names a file by inode, and on macOS also by the UUID
+/// of its volume, which survives reboots: a copy or replacement on the same
+/// volume has a new inode, and one on another volume has another UUID. Where
+/// either side has no volume UUID, the inode is compared alone. That covers
+/// Linux and other Unix systems, which have no stable and cheap filesystem
+/// UUID, identities written before Graft recorded one, and macOS filesystems
+/// that report none, such as some network and FUSE filesystems: refusing
+/// those would stop every command, while the fixed path, the project ID and
+/// the ownership markers inside each directory still have to match. Windows
+/// volume serial numbers survive reboots and are compared.
 fn persisted_match(
-    stored: (u64, u64, Option<SystemTime>),
-    current: (u64, u64, Option<SystemTime>),
+    stored: (u64, u64, Option<VolumeId>),
+    current: (u64, u64, Option<VolumeId>),
 ) -> bool {
-    let volume = cfg!(unix) || stored.0 == current.0;
-    let created = match (stored.2, current.2) {
+    let device = cfg!(unix) || stored.0 == current.0;
+    let volume = match (stored.2, current.2) {
         (Some(stored), Some(current)) => stored == current,
         _ => true,
     };
-    volume && stored.1 == current.1 && created
+    device && stored.1 == current.1 && volume
+}
+
+/// The UUID of a volume, as macOS reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VolumeId(Uuid);
+
+impl Serialize for VolumeId {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for VolumeId {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Uuid::parse_str(&text)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A field earlier versions wrote and Graft now reads and ignores: the birth
+/// time, which does not identify a file (see [`persisted_match`]). It records
+/// only whether the field was there, so that the identity is rewritten.
+#[derive(Debug, Clone, Copy, Default)]
+struct Legacy(bool);
+
+impl PartialEq for Legacy {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Legacy {}
+
+impl<'de> Deserialize<'de> for Legacy {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self(true))
+    }
+}
+
+/// The UUID of the volume holding `file`, or `None` where the filesystem
+/// reports none, such as some network and FUSE filesystems, or the call
+/// fails. Identities then compare inodes alone (see [`persisted_match`]).
+#[cfg(target_os = "macos")]
+fn volume_uuid(file: &fs::File) -> Option<VolumeId> {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct Reply {
+        length: u32,
+        returned: libc::attribute_set_t,
+        uuid: [u8; 16],
+    }
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_RETURNED_ATTRS,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut reply = std::mem::MaybeUninit::<Reply>::zeroed();
+    // The descriptor, request and reply buffer are live through this call,
+    // which writes at most the reply's size.
+    let status = unsafe {
+        libc::fgetattrlist(
+            file.as_raw_fd(),
+            (&raw mut request).cast(),
+            reply.as_mut_ptr().cast(),
+            std::mem::size_of::<Reply>(),
+            0,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    // Zeroed and then written by the call: every bit pattern is valid.
+    let reply = unsafe { reply.assume_init() };
+    (reply.length as usize >= std::mem::size_of::<Reply>()
+        && reply.returned.volattr & libc::ATTR_VOL_UUID != 0
+        && reply.uuid != [0; 16])
+        .then(|| VolumeId(Uuid::from_bytes(reply.uuid)))
+}
+
+/// The volume UUID of the file or directory at `path` whose metadata was
+/// just read as `metadata`, read on an open descriptor of that same file. A
+/// file that cannot be opened has none, as on a filesystem without UUIDs.
+#[cfg(target_os = "macos")]
+fn volume_uuid_at(path: &Path, metadata: &fs::Metadata) -> Result<Option<VolumeId>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return Ok(None);
+    };
+    let opened = file.metadata()?;
+    ensure!(
+        (opened.dev(), opened.ino()) == (metadata.dev(), metadata.ino()),
+        "{} changed while its identity was read",
+        path.display()
+    );
+    Ok(volume_uuid(&file))
 }
 
 /// The identity of a file or directory as Graft persists it in its own
@@ -81,20 +204,50 @@ pub(crate) struct FileIdentity {
     /// [`persisted_match`]). On Windows, the volume serial number.
     volume: u64,
     file: u64,
-    /// The birth time on Unix, where the filesystem records one. Graft 0.1.0
-    /// wrote none.
+    /// The volume's UUID on macOS, where the filesystem reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    created: Option<SystemTime>,
+    volume_uuid: Option<VolumeId>,
+    /// The birth time an earlier build recorded (see [`Legacy`]).
+    #[serde(default, rename = "created", skip_serializing)]
+    legacy: Legacy,
 }
 
 impl FileIdentity {
+    /// The identity of the file or directory at `path`, whose metadata was
+    /// just read as `metadata`.
     #[cfg(unix)]
-    pub(crate) fn of(metadata: &fs::Metadata) -> Self {
+    pub(crate) fn at(path: &Path, metadata: &fs::Metadata) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        let volume_uuid = volume_uuid_at(path, metadata)?;
+        #[cfg(not(target_os = "macos"))]
+        let volume_uuid = {
+            let _ = path;
+            None
+        };
+        Ok(Self::unix(metadata, volume_uuid))
+    }
+
+    /// The identity of the open `file`, whose metadata is `metadata`.
+    #[cfg(unix)]
+    pub(crate) fn of(file: &fs::File, metadata: &fs::Metadata) -> Self {
+        #[cfg(target_os = "macos")]
+        let volume_uuid = volume_uuid(file);
+        #[cfg(not(target_os = "macos"))]
+        let volume_uuid = {
+            let _ = file;
+            None
+        };
+        Self::unix(metadata, volume_uuid)
+    }
+
+    #[cfg(unix)]
+    fn unix(metadata: &fs::Metadata, volume_uuid: Option<VolumeId>) -> Self {
         use std::os::unix::fs::MetadataExt;
         Self {
             volume: metadata.dev(),
             file: metadata.ino(),
-            created: metadata.created().ok(),
+            volume_uuid,
+            legacy: Legacy::default(),
         }
     }
 
@@ -103,7 +256,8 @@ impl FileIdentity {
         Self {
             volume,
             file,
-            created: None,
+            volume_uuid: None,
+            legacy: Legacy::default(),
         }
     }
 
@@ -111,20 +265,23 @@ impl FileIdentity {
     /// is `current`. See [`persisted_match`].
     pub(crate) fn names(&self, current: &Self) -> bool {
         persisted_match(
-            (self.volume, self.file, self.created),
-            (current.volume, current.file, current.created),
+            (self.volume, self.file, self.volume_uuid),
+            (current.volume, current.file, current.volume_uuid),
         )
     }
 
-    /// Whether this identity names `current` and lacks the birth time that
-    /// `current` records, so writing `current` in its place strengthens it.
-    pub(crate) fn upgrades_to(&self, current: &Self) -> bool {
-        self.created.is_none() && current.created.is_some() && self.names(current)
+    /// Whether this identity is in the form Graft writes now. One an earlier
+    /// version wrote has a birth time, or, on macOS, no volume UUID.
+    pub(crate) fn is_current(&self) -> bool {
+        !self.legacy.0 && (self.volume_uuid.is_some() || !cfg!(target_os = "macos"))
     }
 
-    /// Whether this identity records a birth time.
-    pub(crate) fn has_birth_time(&self) -> bool {
-        self.created.is_some()
+    /// Whether this identity names `current` and is in an earlier form that
+    /// writing `current` in its place replaces: it drops a birth time, and
+    /// adds the volume UUID `current` has and this one lacks.
+    pub(crate) fn upgrades_to(&self, current: &Self) -> bool {
+        self.names(current)
+            && (self.legacy.0 || self.volume_uuid.is_none() && current.volume_uuid.is_some())
     }
 
     /// Whether both identities, read in this command, are on one volume.
@@ -167,11 +324,12 @@ pub(crate) fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
     let metadata = check_unmounted_directory(path, false)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        let identity = FileIdentity::at(path, &metadata)?;
         Ok(DirectoryIdentity {
-            device: metadata.dev(),
-            file: metadata.ino(),
-            created: metadata.created().ok(),
+            device: identity.volume,
+            file: identity.file,
+            volume_uuid: identity.volume_uuid,
+            legacy: Legacy::default(),
         })
     }
     #[cfg(windows)]
@@ -181,7 +339,8 @@ pub(crate) fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
         Ok(DirectoryIdentity {
             device,
             file,
-            created: None,
+            volume_uuid: None,
+            legacy: Legacy::default(),
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -482,61 +641,76 @@ pub(crate) fn purge_directory(
 mod tests {
     use super::*;
     use crate::{engine::gc::purge_caches, git};
-    use std::time::Duration;
 
     #[test]
     fn persisted_identities_ignore_unix_device_numbers_only() {
-        let born = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_795_209_831_123_456_789);
-        let later = born + Duration::from_nanos(1);
-        let stored = (16_777_231, 977_754_921, Some(born));
+        let volume = Some(VolumeId(Uuid::new_v4()));
+        let stored = (16_777_231, 977_754_921, volume);
         // A reboot renumbered the device; nothing else changed.
-        let renumbered = (16_777_232, 977_754_921, Some(born));
+        let renumbered = (16_777_232, 977_754_921, volume);
         assert_eq!(persisted_match(stored, renumbered), cfg!(unix));
         assert!(persisted_match(stored, stored));
-        // Another directory has another inode or birth time.
+        // Another directory has another inode or volume.
+        assert!(!persisted_match(stored, (16_777_231, 977_754_922, volume)));
+        let elsewhere = Some(VolumeId(Uuid::new_v4()));
         assert!(!persisted_match(
             stored,
-            (16_777_231, 977_754_922, Some(born))
+            (16_777_231, 977_754_921, elsewhere)
         ));
-        assert!(!persisted_match(
-            stored,
-            (16_777_231, 977_754_921, Some(later))
-        ));
-        // Without a birth time on either side, the inode decides.
-        assert_eq!(
-            persisted_match(
-                (16_777_231, 977_754_921, None),
-                (1, 977_754_921, Some(born))
-            ),
-            cfg!(unix)
-        );
-        assert!(!persisted_match(
-            (1, 977_754_921, None),
-            (1, 977_754_922, None)
-        ));
+        // Without a volume UUID on either side, as on Linux, in an identity
+        // written before Graft recorded one, or on a filesystem that reports
+        // none, the inode decides.
+        for (stored, current) in [(None, volume), (volume, None), (None, None)] {
+            assert_eq!(
+                persisted_match((16_777_231, 977_754_921, stored), (1, 977_754_921, current)),
+                cfg!(unix)
+            );
+            assert!(!persisted_match(
+                (1, 977_754_921, stored),
+                (1, 977_754_922, current)
+            ));
+        }
     }
 
+    /// Identities an earlier build wrote, with a birth time or without a
+    /// volume UUID, name the same file and are rewritten in the current form.
     #[cfg(unix)]
     #[test]
-    fn file_identities_gain_birth_times_only_for_the_same_file() -> Result<()> {
+    fn file_identities_upgrade_only_for_the_same_file() -> Result<()> {
         let tmp = tempfile::tempdir()?;
-        let current = FileIdentity::of(&fs::metadata(tmp.path())?);
-        if !current.has_birth_time() {
-            return Ok(());
+        let current = FileIdentity::at(tmp.path(), &fs::metadata(tmp.path())?)?;
+        assert!(current.is_current() && !current.upgrades_to(&current));
+        assert_eq!(
+            current.volume_uuid.is_some(),
+            cfg!(target_os = "macos"),
+            "a temporary directory's volume UUID"
+        );
+        let born = serde_json::json!({"secs_since_epoch": 1_795_209_831, "nanos_since_epoch": 7});
+        let other_path = tempfile::tempdir()?;
+        let other = FileIdentity::at(other_path.path(), &fs::metadata(other_path.path())?)?;
+        for created in [None, Some(born)] {
+            // Graft 0.1.0 wrote no birth time, and the build before this one
+            // wrote one; neither wrote a volume UUID.
+            let mut value = serde_json::json!({"volume": current.volume + 1, "file": current.file});
+            if let Some(created) = created {
+                value["created"] = created;
+            }
+            let legacy: FileIdentity = serde_json::from_value(value.clone())?;
+            assert!(legacy.names(&current));
+            assert_eq!(
+                legacy.upgrades_to(&current),
+                value.get("created").is_some() || cfg!(target_os = "macos"),
+                "{value}"
+            );
+            assert_eq!(
+                legacy.is_current(),
+                !legacy.upgrades_to(&current),
+                "{value}"
+            );
+            assert!(!legacy.names(&other) && !legacy.upgrades_to(&other));
         }
-        let mut legacy = current.clone();
-        legacy.volume += 1;
-        legacy.created = None;
-        assert!(legacy.names(&current) && legacy.upgrades_to(&current));
-        assert!(!current.upgrades_to(&current));
-        let other = FileIdentity::of(&fs::metadata(tempfile::tempdir()?.path())?);
-        assert!(!legacy.names(&other) && !legacy.upgrades_to(&other));
-        // A legacy identity written in the 0.1.0 format still reads.
-        let old: FileIdentity = serde_json::from_value(serde_json::json!({
-            "volume": legacy.volume,
-            "file": legacy.file,
-        }))?;
-        assert_eq!(old, legacy);
+        // The current form records no birth time.
+        assert!(serde_json::to_value(&current)?.get("created").is_none());
         Ok(())
     }
 
@@ -568,6 +742,32 @@ mod tests {
         })?;
         assert!(verify_package(&project, "npm", &npm).is_err());
         assert!(prepare_package_roots(&project).is_err());
+        Ok(())
+    }
+
+    /// A package cache whose modification time was set into the past, which
+    /// moves its birth time on macOS, is the same directory. One recorded on
+    /// another volume is not.
+    #[cfg(unix)]
+    #[test]
+    fn package_bindings_name_the_volume_not_the_birth_time() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        git::bytes(tmp.path(), &["init", "-q", "--template="])?;
+        let (project, _lock) = Project::open(tmp.path())?;
+        prepare_package_roots(&project)?;
+        let npm = project.state.join("cache/npm");
+        let past =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        fs::File::open(&npm)?.set_modified(past)?;
+        verify_package(&project, "npm", &npm)?;
+        prepare_package_roots(&project)?;
+        if cfg!(target_os = "macos") {
+            let record = owner_record(&project, "npm");
+            let mut binding: serde_json::Value = serde_json::from_slice(&fs::read(&record)?)?;
+            binding["directory"]["volume_uuid"] = Uuid::new_v4().to_string().into();
+            registry::atomic(&record, &serde_json::to_vec(&binding)?)?;
+            assert!(verify_package(&project, "npm", &npm).is_err());
+        }
         Ok(())
     }
 

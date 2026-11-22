@@ -9,7 +9,8 @@ import { objectResult, parseExact, type Context, type Scenario } from './harness
 /**
  * Rewrite Graft's identity markers and records as a reboot that renumbered
  * the device (as APFS does) leaves them, in the form Graft 0.1.0 wrote:
- * another device number and no birth times for graft directories.
+ * another device number, no volume UUID and no birth times for graft
+ * directories.
  */
 function renumberDevice(ctx: Context): number {
   let rewritten = 0;
@@ -21,6 +22,7 @@ function renumberDevice(ctx: Context): number {
       const number = id[key];
       if (typeof number === 'number' && (typeof id.file === 'number' || typeof id.inode === 'number')) {
         id[key] = number + 1;
+        delete id.volume_uuid;
         if (key === 'volume') delete id.created;
         rewritten++;
       }
@@ -142,13 +144,12 @@ export const cases: Scenario[] = [
       assert.equal(readFileSync(join(archived.path, 'owner.txt'), 'utf8'), 'archived before the reboot');
       assert.equal(ctx.cli(['status', 'fresh']).path, fresh.path);
 
-      // Where the filesystem records birth times, the old records gain them.
-      if (objectResult(record(fresh.result.id).workspace).created !== undefined) {
-        const owner = objectResult(objectResult(parseExact(readFileSync(marker, 'utf8'))).directory);
-        assert.notEqual(owner.created, undefined);
-        for (const side of ['workspace', 'git']) {
-          assert.notEqual(objectResult(record(archived.result.id)[side]).created, undefined, side);
-        }
+      // On macOS the old records gain the volume UUID; none has a birth time.
+      const owner = objectResult(objectResult(parseExact(readFileSync(marker, 'utf8'))).directory);
+      const identities = [owner, ...['workspace', 'git'].map(side => objectResult(record(archived.result.id)[side]))];
+      for (const id of [objectResult(record(fresh.result.id).workspace), ...identities]) {
+        assert.equal(id.created, undefined);
+        assert.equal(typeof id.volume_uuid, process.platform === 'darwin' ? 'string' : 'undefined');
       }
     },
   },
