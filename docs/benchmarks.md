@@ -66,12 +66,13 @@ A graft's `node_modules` shares its data with the primary's install, so it costs
 
 ## Where the time goes
 
-A graft is a standalone repository, so creating one does more than a linked worktree: it reserves a recoverable graft, snapshots the Git object store, and proves every reused file. Graft keeps this ahead of `git worktree add` with four techniques:
+A graft is a standalone repository, so creating one does more than a linked worktree: it reserves a recoverable graft, snapshots the Git object store, and proves every reused file. Graft keeps this ahead of `git worktree add` with these techniques:
 
 - **Directory clones.** A directory whose tracked contents are all reusable, and which holds nothing else in the primary, is cloned with one `clonefileat` call. On Homebrew this covers 3,442 of 3,484 entries and takes about 30 ms, against about 160 ms for per-file clones. Every cloned entry is then verified and anything unexpected is discarded.
 - **Git's stat test instead of hashing.** A primary file whose stat data matches its non-racy index entry and whose size matches its blob holds the staged bytes, by the same test `git status` relies on. Its stat must also be unchanged across the clone. Other files are hashed.
 - **Recorded stat data.** Graft writes each cloned file's stat into the new index, exactly as Git's checkout does, so the first `git status` reads no file contents.
 - **Concurrent Git queries.** Independent read-only Git commands run in parallel instead of one after another.
+- **Parallel builds.** Simultaneous adds hold the project's lock only to reserve their names and record the finished grafts, so they build at the same time.
 - **Loose object headers.** Right after a commit, the newest objects are loose files, and Git looks up their types and sizes one inflated header at a time. Graft reads the headers of the checkout's loose blobs itself, with several workers, from the primary's cached copies whose stat proves they are the files it cloned, while the checkout writes HEAD and its index.
 
 Set `GIT_GRAFT_TRACE=1` to print the duration of each phase of a command to standard error.

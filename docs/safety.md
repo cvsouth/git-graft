@@ -56,6 +56,10 @@ On macOS, Graft rejects extended allow ACL entries on its primary private regist
 
 On Windows, Graft relies on inherited ACLs and does not verify private DACLs. Use a private Git administrative directory and a graft parent whose ACLs allow only trusted users; apply the same care to custom graft destinations.
 
+### Commands running at once
+
+Grafts build in parallel. An `add` holds the project's registry lock only while it reserves its name and while it records the finished graft, and the first build to need a missing shared cache fills it while the others wait to reuse it. `merge`, `remove`, `prune --apply`, `restore`, `move`, `repair`, `exec`, dependency and cache commands wait until the builds in progress finish, so none of them changes the primary, a parent graft or a shared cache under a build. `list`, `status`, lease renewal, `lock` and `unlock` do not wait; `list` shows a graft still being built with the phase `creating`. Retrying an `add` while its first attempt is still building reports `workspace_busy`.
+
 ### Processes left running in a graft
 
 `exec` shares the graft's lock with the process it starts, and that process passes the lock on to the processes it starts in turn. While any of them still holds it, `merge`, `remove`, `prune`, `move`, `lock` and dependency changes report `workspace_busy`, even after `exec` has returned. A job left running in the background, such as `nohup npm run dev &`, keeps the graft busy until it exits; further `exec` calls and lease renewals still work. Stop the job before you merge or archive the graft.
