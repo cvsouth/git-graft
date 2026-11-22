@@ -1434,6 +1434,15 @@ mod tests {
         Ok(update)
     }
 
+    /// Make Git compare names exactly, as it does where they do not fold.
+    /// Where they fold, Git finds a file written in place of a directory in
+    /// the index under another spelling, and accepts what elsewhere it
+    /// refuses, so tests of that run alike on every filesystem.
+    fn compare_names_exactly(p: &Project) -> Result<()> {
+        git::bytes(&p.repo, &["config", "core.ignorecase", "false"])?;
+        Ok(())
+    }
+
     fn read(p: &Project, name: &str) -> Result<String> {
         Ok(fs::read_to_string(p.repo.join(name))?)
     }
@@ -1888,6 +1897,7 @@ mod tests {
     #[test]
     fn reversing_a_stopped_update_keeps_an_ignored_file_written_after_its_dry_run() -> Result<()> {
         let (_temp, p, _lock, plan) = partial_fixture()?;
+        compare_names_exactly(&p)?;
         let other = second_plan(&p, &plan)?;
         drop(interrupt(&p, &plan)?);
         let gone = p.repo.join("gone.local");
@@ -2153,6 +2163,7 @@ mod tests {
     #[test]
     fn retry_finishes_an_update_stopped_after_a_directory_became_a_file() -> Result<()> {
         let (_temp, p, _lock, plan) = partial_fixture()?;
+        compare_names_exactly(&p)?;
         apply(&p, &plan, || Ok(()))?;
         let undo = undo_plan(&p, &plan)?;
         // The undo stopped after Git removed `swap/inner` and wrote `swap`.
