@@ -1,8 +1,30 @@
 name: Native filesystem verification
 
+# Docs-only changes skip the build. A release tag is verified on its commit
+# before tagging, so tag pushes don't run this again. The manual page is
+# checked against the CLI, so changes to it still run.
 on:
   push:
+    branches: ['**']
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!docs/**'
+      - 'docs/man/**'
+      - '!LICENSE'
+      - '!.github/ISSUE_TEMPLATE/**'
+      - '!.github/pull_request_template.md'
+      - '!.github/dependabot.yml'
   pull_request:
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!docs/**'
+      - 'docs/man/**'
+      - '!LICENSE'
+      - '!.github/ISSUE_TEMPLATE/**'
+      - '!.github/pull_request_template.md'
+      - '!.github/dependabot.yml'
   workflow_dispatch:
     inputs:
       filesystems:
