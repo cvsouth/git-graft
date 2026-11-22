@@ -435,16 +435,6 @@ impl Update {
         Ok(output)
     }
 
-    /// The recorded commits an update moves from and to.
-    fn sides(&self, forward: bool) -> (String, String) {
-        let plan = &self.record.plan;
-        if forward {
-            (plan.old.clone(), plan.new.clone())
-        } else {
-            (plan.new.clone(), plan.old.clone())
-        }
-    }
-
     /// Run Git's two-tree merge on the private index, with `args`.
     fn read_tree(&mut self, path: &Path, objects: Option<&Path>, args: &[&str]) -> Result<()> {
         let mut command = self.index_command(path, objects)?;
@@ -458,12 +448,11 @@ impl Update {
         Ok(())
     }
 
-    /// Check the move from one recorded commit to the other with Git's dry
-    /// run, which refuses to replace an edited tracked file or an untracked
-    /// one. Nothing is written.
-    fn dry_run(&mut self, path: &Path, objects: Option<&Path>, forward: bool) -> Result<()> {
-        let (from, to) = self.sides(forward);
-        self.read_tree(path, objects, &["-m", "-u", "-n", &from, &to])
+    /// Check the move from tree `from` to `to` with Git's dry run, which
+    /// refuses to replace an edited tracked file or an untracked one.
+    /// Nothing is written.
+    fn dry_run(&mut self, path: &Path, objects: Option<&Path>, from: &str, to: &str) -> Result<()> {
+        self.read_tree(path, objects, &["-m", "-u", "-n", from, to])
     }
 
     /// Move the files from `from` to `to`, keeping untracked and ignored
@@ -538,19 +527,53 @@ impl Update {
         tree: &str,
         paths: &[Vec<u8>],
     ) -> Result<String> {
-        let scratch = tempfile::tempdir()?;
-        let index = scratch.path().join("index");
         let mut input = Vec::new();
         for name in paths {
             input.extend_from_slice(name);
             input.push(0);
         }
+        self.edited_tree(
+            path,
+            objects,
+            tree,
+            &["update-index", "--force-remove", "-z", "--stdin"],
+            &input,
+        )
+    }
+
+    /// The tree `tree` with the given entry for each path, built in a
+    /// scratch index.
+    fn tree_with<'a>(
+        &self,
+        path: &Path,
+        objects: Option<&Path>,
+        tree: &str,
+        entries: impl IntoIterator<Item = (&'a [u8], &'a Entry)>,
+    ) -> Result<String> {
+        self.edited_tree(
+            path,
+            objects,
+            tree,
+            &["update-index", "-z", "--index-info"],
+            &index_info(entries),
+        )
+    }
+
+    /// The tree `tree` after the Git command `edit` reads `input`, built in
+    /// a scratch index.
+    fn edited_tree(
+        &self,
+        path: &Path,
+        objects: Option<&Path>,
+        tree: &str,
+        edit: &[&str],
+        input: &[u8],
+    ) -> Result<String> {
+        let scratch = tempfile::tempdir()?;
+        let index = scratch.path().join("index");
         let steps: [(&[&str], Option<&[u8]>); 3] = [
             (&["read-tree", tree], None),
-            (
-                &["update-index", "--force-remove", "-z", "--stdin"],
-                Some(&input),
-            ),
+            (edit, Some(input)),
             (&["write-tree"], None),
         ];
         let mut written = Vec::new();
@@ -842,24 +865,11 @@ impl Update {
         entries: impl IntoIterator<Item = (&'a [u8], &'a Entry)>,
     ) -> Result<()> {
         self.seed(index)?;
-        // Removals go first so a file can give way to a directory.
-        let mut removals = Vec::new();
-        let mut additions = Vec::new();
-        for (name, entry) in entries {
-            let list = if entry.present() {
-                &mut additions
-            } else {
-                &mut removals
-            };
-            list.extend_from_slice(format!("{} {}\t", entry.mode, entry.oid).as_bytes());
-            list.extend_from_slice(name);
-            list.push(0);
-        }
-        removals.append(&mut additions);
-        if !removals.is_empty() {
+        let input = index_info(entries);
+        if !input.is_empty() {
             let mut command = self.index_command(path, objects)?;
             command.args(["update-index", "-z", "--index-info"]);
-            let output = self.run_private(command, Some(&removals))?;
+            let output = self.run_private(command, Some(&input))?;
             if !output.status.success() {
                 return Err(git_failure("build recovery index", &output));
             }
@@ -913,7 +923,17 @@ impl Update {
     /// takes the entry of the side without the path, if there is one, or else
     /// of the side the update moves from, and is written again. Staged entries for other paths are kept. A changed path with
     /// any other content or staged version stops recovery before a file is
-    /// written. Paths in `left` are left as the primary's index has them.
+    /// written. Paths in `left` are left as the primary's index has them,
+    /// and as the previous commit has them in the returned tree.
+    ///
+    /// Returns the tree the files now hold: the previous commit with each
+    /// changed path's chosen entry. Git must finish or reverse the update
+    /// from this tree, not from either recorded commit. Merging from the
+    /// commit the update moved away from, Git removes each of its paths the
+    /// index no longer has, and refuses when a file written in place of a
+    /// directory lies on that path, such as `swap` for `swap/inner`, as an
+    /// untracked file it would lose. Only where names fold case does it
+    /// find the file in the index and go on.
     fn rebuild(
         &mut self,
         path: &Path,
@@ -921,7 +941,7 @@ impl Update {
         objects: Option<&Path>,
         forward: bool,
         left: &[Vec<u8>],
-    ) -> Result<()> {
+    ) -> Result<String> {
         let mut changes = self.changes(path, objects)?;
         changes.retain(|change| !left.contains(&change.path));
         let staged = staged_entries(git::command(path))?;
@@ -1008,7 +1028,9 @@ impl Update {
                 &edited,
             ));
         }
-        self.write_view(path, objects, index, chosen)
+        let held = self.tree_with(path, objects, &self.record.plan.old, chosen.iter().copied())?;
+        self.write_view(path, objects, index, chosen)?;
+        Ok(held)
     }
 
     pub(super) fn update_index_and_files(
@@ -1023,6 +1045,7 @@ impl Update {
         let next_path = self.directory.join("index.next");
         self.settle_worker()?;
         let current = index_bytes(&index)?;
+        let (mut from, to) = (self.record.plan.old.clone(), self.record.plan.new.clone());
         if self.has_mutated_checkout() {
             let next = index_bytes(&next_path)?;
             let unchanged = current == index_bytes(&before_path)? || current == next;
@@ -1040,7 +1063,7 @@ impl Update {
             // The files can hold a mix of both versions, and someone may
             // have edited or staged other paths since. Git finishes the
             // update from a private index that matches the files.
-            self.rebuild(path, admin, objects, true, &[])?;
+            from = self.rebuild(path, admin, objects, true, &[])?;
         } else {
             self.refuse_overlapping_edits(path, objects)?;
             if let Some(current) = &current {
@@ -1057,7 +1080,7 @@ impl Update {
         // instance, stops the update here: just before the journal records
         // that files may change, not after. Only then is the status read
         // again, to name the edited paths.
-        if let Err(error) = self.dry_run(path, objects, true) {
+        if let Err(error) = self.dry_run(path, objects, &from, &to) {
             if fresh {
                 self.refuse_overlapping_edits(path, objects)?;
             }
@@ -1065,7 +1088,6 @@ impl Update {
         }
         self.set_phase(Phase::Updating)?;
         before_write();
-        let (from, to) = self.sides(true);
         let refused = self.write_files(path, objects, &from, &to)?;
         if !refused.is_empty() {
             return Err(self.appeared(path, admin, objects, fresh, &refused));
@@ -1088,15 +1110,12 @@ impl Update {
     ) -> anyhow::Error {
         if fresh {
             let backed_out = (|| -> Result<bool> {
-                self.rebuild(path, admin, objects, false, refused)?;
-                // The previous commit lacks the refused paths, and Git leaves
-                // a path alone that neither side of the move tracks.
-                let plan = self.record.plan.clone();
-                let from = self.tree_without(path, objects, &plan.new, refused)?;
-                if !self
-                    .write_files(path, objects, &from, &plan.old)?
-                    .is_empty()
-                {
+                // The previous commit lacks the refused paths, so the tree the
+                // files hold does too, and Git leaves a path alone that
+                // neither side of the move tracks.
+                let from = self.rebuild(path, admin, objects, false, refused)?;
+                let old = self.record.plan.old.clone();
+                if !self.write_files(path, objects, &from, &old)?.is_empty() {
                     return Ok(false);
                 }
                 self.set_phase(Phase::Prepared)?;
@@ -1134,14 +1153,14 @@ impl Update {
         if !self.has_mutated_checkout() {
             return Ok(());
         }
-        self.rebuild(path, admin, None, false, &[])?;
+        let from = self.rebuild(path, admin, None, false, &[])?;
+        let to = self.record.plan.old.clone();
         self.protect_ignored(path, None)?;
-        self.dry_run(path, None, false)?;
+        self.dry_run(path, None, &from, &to)?;
         // Until the restore finishes, files can again hold either version,
         // and any later attempt resumes from them in either direction.
         self.set_phase(Phase::Updating)?;
         before_write();
-        let (from, to) = self.sides(false);
         let refused = self.write_files(path, None, &from, &to)?;
         if !refused.is_empty() {
             return Err(self.appeared(path, admin, None, false, &refused));
@@ -1149,6 +1168,25 @@ impl Update {
         let next = registry::regular(&self.directory.join("index.next"))?;
         registry::atomic(&admin.join("index"), &next)
     }
+}
+
+/// `update-index --index-info` input setting each path to its entry.
+/// Removals go first so a file can give way to a directory.
+fn index_info<'a>(entries: impl IntoIterator<Item = (&'a [u8], &'a Entry)>) -> Vec<u8> {
+    let mut removals = Vec::new();
+    let mut additions = Vec::new();
+    for (name, entry) in entries {
+        let list = if entry.present() {
+            &mut additions
+        } else {
+            &mut removals
+        };
+        list.extend_from_slice(format!("{} {}\t", entry.mode, entry.oid).as_bytes());
+        list.extend_from_slice(name);
+        list.push(0);
+    }
+    removals.append(&mut additions);
+    removals
 }
 
 /// Wait for `child` while another thread writes `input` to it, so a child
@@ -2254,7 +2292,7 @@ mod tests {
         let recorded =
             |update: &Update| -> Result<Option<u32>> { Ok(read_record(&update.directory)?.worker) };
         assert_eq!(recorded(&update)?, None);
-        update.dry_run(&p.repo, None, true)?;
+        update.dry_run(&p.repo, None, &plan.old, &plan.new)?;
         let dry_run = recorded(&update)?.context("the dry run was not recorded")?;
         let changes = update.changes(&p.repo, None)?;
         update.write_view(
