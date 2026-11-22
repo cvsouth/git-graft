@@ -6,7 +6,7 @@
 //! and graph completeness rely on the donor's Git database being consistent.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File, Metadata},
     io,
@@ -28,22 +28,35 @@ use super::{checked, clone_file, open_regular, optional_config, output_text, run
 const PARTIAL_CONFIG: &str =
     r"^(extensions\.(partialclone|compatobjectformat)|remote\..*\.(promisor|partialclonefilter))$";
 
+/// Loose objects can number in the thousands; their fan-out directories are
+/// independent, so several workers handle them.
+const WORKERS: usize = 4;
+
 pub(super) fn bootstrap(
     primary: &Path,
     root: &Path,
     format: &str,
     base: &str,
 ) -> Result<Option<Value>> {
+    match snapshot(primary, root, format, base) {
+        Some(snapshot) => snapshot.publish(root),
+        None => Ok(None),
+    }
+}
+
+/// Clone the primary's object store into a staging directory of the graft.
+/// Nothing reads it until [`Snapshot::publish`] installs it.
+pub(super) fn snapshot(primary: &Path, root: &Path, format: &str, base: &str) -> Option<Snapshot> {
     // An unstable inventory gets one fresh attempt. All input stays in the
     // disposable directory until a complete attempt passes validation.
     for _ in 0..2 {
         match prepare(primary, root, format, base) {
-            Ok(Some(snapshot)) => return snapshot.publish(root),
+            Ok(Some(snapshot)) => return Some(snapshot),
             Ok(None) => {}
             Err(_) => break,
         }
     }
-    Ok(None)
+    None
 }
 
 fn prepare(primary: &Path, root: &Path, format: &str, base: &str) -> Result<Option<Snapshot>> {
@@ -85,22 +98,59 @@ fn prepare(primary: &Path, root: &Path, format: &str, base: &str) -> Result<Opti
         return Ok(None);
     }
     Ok(Some(Snapshot {
-        _staging: staging,
+        staging,
         stage_dir,
         admin,
+        donor: source.path.join(".git").join("objects"),
+        inventory: before,
         receipt,
     }))
 }
 
-struct Snapshot {
-    _staging: tempfile::TempDir,
+pub(super) struct Snapshot {
+    staging: tempfile::TempDir,
     stage_dir: Directory,
     admin: Directory,
+    /// The donor's object directory.
+    donor: PathBuf,
+    inventory: Inventory,
     receipt: Value,
 }
 
 impl Snapshot {
-    fn publish(self, root: &Path) -> Result<Option<Value>> {
+    /// The staged object directory.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(super) fn objects(&self) -> PathBuf {
+        self.staging.path().join("objects")
+    }
+
+    /// The sizes of the `blobs` the snapshot holds as loose blobs.
+    ///
+    /// Each loose object in the inventory was cloned as an independent plain
+    /// file, and the inventory was unchanged after the clone. A donor file
+    /// that still has its inventoried stamp after its header is read held
+    /// the cloned bytes, so its header gives the staged object's type and
+    /// size as Git reads them. The donor's copy is read because it is
+    /// usually cached; a fresh clone is not.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(super) fn loose_blob_sizes<'a>(
+        &self,
+        blobs: impl Iterator<Item = &'a str>,
+    ) -> HashMap<String, u64> {
+        let inventoried = |blob: &str, file: &File| {
+            let stamp = blob.split_at_checked(2).and_then(|(prefix, name)| {
+                let listing = self.inventory.directories.get(OsStr::new(prefix))?;
+                (listing.kind == Kind::Loose).then_some(listing.entries.get(OsStr::new(name))?)
+            });
+            stamp.is_some_and(|stamp| {
+                file.metadata()
+                    .is_ok_and(|metadata| Stamp::from(&metadata) == *stamp)
+            })
+        };
+        crate::git::loose::blob_sizes(&self.donor, blobs, inventoried)
+    }
+
+    pub(super) fn publish(self, root: &Path) -> Result<Option<Value>> {
         let current = Directory::absolute(&root.canonicalize()?.join(".git"))?;
         ensure!(
             self.admin.stamp()? == current.stamp()?,
@@ -270,18 +320,38 @@ impl Source {
                 "unsupported Git repository state ({name})"
             );
         }
-        let mut directories = BTreeMap::new();
-        for name in self.objects.names()? {
-            let kind = match name.as_bytes() {
-                b"info" => Kind::Info,
-                b"pack" => Kind::Pack,
-                bytes if lower_hex(bytes, 2) => Kind::Loose,
-                _ => bail!("unsupported entry in Git object directory"),
-            };
-            let child = self.objects.directory(&name)?;
-            let listing = child.inventory(kind, objects.device, width)?;
-            directories.insert(name, listing);
-        }
+        let names = self.objects.names()?;
+        // Fan-out directories are listed independently, by several workers.
+        let chunk = names.len().div_ceil(WORKERS).max(1);
+        let directories = std::thread::scope(|scope| {
+            let workers: Vec<_> = names
+                .chunks(chunk)
+                .map(|batch| {
+                    scope.spawn(move || {
+                        batch
+                            .iter()
+                            .map(|name| {
+                                let kind = match name.as_bytes() {
+                                    b"info" => Kind::Info,
+                                    b"pack" => Kind::Pack,
+                                    bytes if lower_hex(bytes, 2) => Kind::Loose,
+                                    _ => bail!("unsupported entry in Git object directory"),
+                                };
+                                let child = self.objects.directory(name)?;
+                                Ok((name.clone(), child.inventory(kind, objects.device, width)?))
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(crate::workspace::joined)
+                .collect::<Result<Vec<_>>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeMap<_, _>>();
         ensure!(
             directories.contains_key(OsStr::new("pack"))
                 && directories.contains_key(OsStr::new("info")),
@@ -332,9 +402,6 @@ impl Source {
             }
             sync_snapshot_entry(&File::open(&target)?)?;
         }
-        // Loose objects can number in the thousands; their fan-out directories
-        // are independent, so several workers clone them.
-        const WORKERS: usize = 4;
         let chunk = loose.len().div_ceil(WORKERS).max(1);
         let loose_totals = std::thread::scope(|scope| -> Result<Vec<Totals>> {
             let workers: Vec<_> = loose
@@ -447,19 +514,38 @@ impl Source {
             source.stamp()? == listing.stamp && names.iter().eq(listing.entries.keys()),
             "Git object directory changed during cloning"
         );
+        // Opening each fresh clone costs more than the clone itself, so the
+        // checks read its stat and attribute names without opening it. macOS
+        // has no descriptor-relative listxattr, so the names come from the
+        // absolute path; that path is inside this graft's private staging
+        // directory, which nothing else writes, so it names the entry the
+        // descriptor-relative stat checked.
+        //
+        // No object is fsynced on its own. A clone has no data to write back:
+        // its blocks are the donor's. This relies on APFS committing all
+        // earlier namespace changes, these cloned entries included, together
+        // with the fan-out directory's fsync below, the staging directory's
+        // write barrier and the final F_FULLFSYNC when the graft finishes.
+        // Linux, which copies objects with FICLONE into new files, still
+        // syncs each file in `clone_entries`.
         let mut totals = Totals::default();
+        let mut path = target.as_os_str().as_bytes().to_vec();
+        path.push(b'/');
+        let prefix = path.len();
         for (filename, entry) in &listing.entries {
-            let file = cloned.open(filename, libc::O_RDONLY | libc::O_NONBLOCK)?;
-            let metadata = file.metadata()?;
+            let info = cloned.stat(filename)?;
+            let stamp = Stamp::from_stat(info);
+            path.truncate(prefix);
+            path.extend_from_slice(filename.as_bytes());
+            let path = CString::new(path.as_slice())?;
             ensure!(
-                metadata.is_file()
-                    && metadata.len() == entry.size
-                    && (metadata.dev(), metadata.ino()) != (entry.device, entry.inode)
-                    && metadata.nlink() == 1
-                    && crate::storage::plain_file(&file, &metadata),
+                stamp.regular()
+                    && stamp.size == entry.size
+                    && (stamp.device, stamp.inode) != (entry.device, entry.inode)
+                    && info.st_nlink == 1
+                    && crate::storage::plain_path(&path, info.st_flags),
                 "Git object changed during cloning"
             );
-            sync_snapshot_entry(&file)?;
             totals.add(Kind::Loose, filename, entry.size);
         }
         sync_snapshot_entry(&cloned.0)?;
@@ -646,25 +732,26 @@ impl Directory {
     }
 
     fn entry(&self, name: &OsStr) -> io::Result<Option<Stamp>> {
+        match self.stat(name) {
+            Ok(info) => Ok(Some(Stamp::from_stat(info))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Stat `name` without following a symbolic link.
+    fn stat(&self, name: &OsStr) -> io::Result<libc::stat> {
         let name = CString::new(name.as_bytes())?;
         let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe {
+        os_result(unsafe {
             libc::fstatat(
                 self.0.as_raw_fd(),
                 name.as_ptr(),
                 info.as_mut_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
             )
-        } == 0
-        {
-            return Ok(Some(Stamp::from_stat(unsafe { info.assume_init() })));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            Ok(None)
-        } else {
-            Err(error)
-        }
+        })?;
+        Ok(unsafe { info.assume_init() })
     }
 
     fn required_regular(&self, name: &OsStr) -> Result<Stamp> {
@@ -1133,6 +1220,35 @@ mod tests {
         fs::rename(&objects, fixture.path().join("unused-objects"))?;
         std::os::unix::fs::symlink(&moved, &objects)?;
         assert!(Source::open(&primary).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn loose_blob_sizes_come_only_from_inventoried_loose_blobs() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let primary = fixture.path().join("primary");
+        let workspace = fixture.path().join("workspace");
+        let base = make_repo(&primary, "sha1")?;
+        fs::create_dir(&workspace)?;
+        run(&workspace, &["init", "--quiet", "--template="])?;
+        let blob = git::text(&primary, &["rev-parse", "HEAD:content"])?;
+        let tree = git::text(&primary, &["rev-parse", "HEAD^{tree}"])?;
+        let missing = "0".repeat(40);
+        let snapshot = snapshot(&primary, &workspace, "sha1", &base).context("snapshot")?;
+        let ids = [blob.as_str(), tree.as_str(), missing.as_str(), "x"];
+        assert_eq!(
+            snapshot.loose_blob_sizes(ids.into_iter()),
+            HashMap::from([(blob.clone(), 5)])
+        );
+        // A donor object whose stamp moved on since the inventory proves nothing.
+        let loose = primary
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        File::open(&loose)?
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))?;
+        assert!(snapshot.loose_blob_sizes(ids.into_iter()).is_empty());
         Ok(())
     }
 

@@ -12,6 +12,8 @@ use std::{
 
 use crate::api::fault;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) mod loose;
 #[cfg(target_os = "macos")]
 pub(crate) mod optional;
 

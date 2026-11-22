@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { deflateSync } from 'node:zlib';
 import { assertSeparateRegularFiles, objectResult, type Context, type Scenario } from './harness.ts';
 import { assertNoRecord, packRecords } from './pack-records.ts';
 import { killedAdd } from './process-faults.ts';
@@ -321,6 +322,29 @@ exec "$GRAFT_TEST_GIT" "$@"
       assert.equal(read(ctx.repo, 'selected'), 'content missing from the export\n');
       assert.equal(ctx.git(['rev-parse', 'HEAD']), tip);
       assert.equal(ctx.git(['status', '--porcelain']), '');
+    },
+  },
+  {
+    name: 'a local graft refuses a loose blob whose header Git cannot parse',
+    run(ctx) {
+      const tip = commitFile(ctx, ctx.repo, 'selected', 'hello');
+      const blob = ctx.git(['rev-parse', tip + ':selected']);
+      const loose = join(ctx.repo, '.git', 'objects', blob.slice(0, 2), blob.slice(2));
+      const original = readFileSync(loose);
+      // Git requires a canonical decimal size: "05" has a leading zero.
+      unlinkSync(loose);
+      writeFileSync(loose, deflateSync(Buffer.from('blob 05\0hello')), { mode: 0o444 });
+      let failure;
+      try {
+        assert.notEqual(ctx.command('git', ['cat-file', '-t', blob]).status, 0);
+        failure = ctx.fail(['add', 'leading-zero', '--base', tip, '--history', 'local']);
+      } finally {
+        unlinkSync(loose);
+        writeFileSync(loose, original, { mode: 0o444 });
+      }
+      assert.equal(failure.code, 'spawn_incomplete');
+      assert(!existsSync(join(String(objectResult(failure.details).path), '.git', 'index')));
+      assert.equal(ctx.git(['cat-file', '-t', blob]), 'blob');
     },
   },
   {

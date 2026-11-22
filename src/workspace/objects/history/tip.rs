@@ -102,21 +102,29 @@ pub(in crate::workspace) fn needs_tip_proof(state: &Path, base: &str) -> bool {
         && !cache::Cache::new(state, format, &key).has_entry()
 }
 
-pub(in crate::workspace::objects) fn checkout(
+/// Check out `plan` while a worker runs `transfer` beside it. Until the
+/// checkout is ready to publish its index, Git in the graft reads only the
+/// plan's proof store. `publish` then completes the transfer's result.
+/// `sizes` receives blob sizes the transfer proves for the checkout.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::workspace::objects) fn checkout<T: Send>(
     source: &Primary<'_>,
     root: &Path,
     state: &Path,
     base: &str,
     reference: &str,
     plan: LoosePlan,
-    transfer: impl FnOnce() -> Result<Value> + Send,
+    sizes: Option<crate::storage::KnownSizes>,
+    transfer: impl FnOnce(&LoosePlan) -> Result<T> + Send,
+    publish: impl FnOnce(T, &LoosePlan) -> Result<Value>,
 ) -> Result<(Value, Option<Value>)> {
     thread::scope(|scope| {
-        let worker = thread::Builder::new().spawn_scoped(scope, transfer)?;
+        let worker = thread::Builder::new().spawn_scoped(scope, || transfer(&plan))?;
         let wait = || {
-            worker
+            let transferred = worker
                 .join()
-                .map_err(|_| anyhow::anyhow!("Git history worker failed"))?
+                .map_err(|_| anyhow::anyhow!("Git history worker failed"))??;
+            publish(transferred, &plan)
         };
         // This optional proof may miss when the primary is repacked. A full
         // verified pack is sufficient to use the normal checkout in that case.
@@ -134,6 +142,7 @@ pub(in crate::workspace::objects) fn checkout(
             source.path,
             Some(proof.path()),
             Some(&plan.index),
+            sizes,
             || {
                 receipt = Some(wait()?);
                 Ok(())
@@ -197,13 +206,13 @@ mod tests {
         let objects = repo.join(".git/objects");
         #[cfg(target_os = "macos")]
         {
-            plan.verify_local(repo)?;
+            plan.verify_local(repo, &objects, Ok)?;
             let subtree = run(repo, &["rev-parse", "HEAD:part"])?;
             for object in [other, output_text(&subtree)?] {
                 let source = objects.join(&object[..2]).join(&object[2..]);
                 let held = tmp.path().join("held-object");
                 fs::rename(&source, &held)?;
-                assert!(plan.verify_local(repo).is_err());
+                assert!(plan.verify_local(repo, &objects, Ok).is_err());
                 fs::rename(held, source)?;
             }
         }
@@ -215,7 +224,7 @@ mod tests {
         )?;
         assert!(prepare_checkout_proof(repo, base, None).is_err());
         #[cfg(target_os = "macos")]
-        assert!(plan.verify_local(repo).is_err());
+        assert!(plan.verify_local(repo, &objects, Ok).is_err());
         Ok(())
     }
 }

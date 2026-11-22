@@ -59,37 +59,45 @@ impl Drop for CheckoutDiscovery {
 }
 
 impl LoosePlan {
+    /// Check the object store at `objects` against this plan: the commit, its
+    /// attribute blobs and its flattened tree, and that every checkout blob
+    /// resolves. `unproven` removes the blobs the caller already proved and
+    /// returns the rest, which Git must resolve as blobs.
     #[cfg(target_os = "macos")]
-    pub(in crate::workspace::objects) fn verify_local(&self, root: &Path) -> Result<()> {
-        let metadata = || read_metadata(root, &self.base, &self.index, None, |_, _, _| Ok(()));
+    pub(in crate::workspace::objects) fn verify_local<'s>(
+        &'s self,
+        root: &Path,
+        objects: &Path,
+        unproven: impl FnOnce(Vec<&'s str>) -> Result<Vec<&'s str>> + Send,
+    ) -> Result<()> {
+        let git = || {
+            let mut command = transfer_git(root);
+            command.env("GIT_OBJECT_DIRECTORY", objects);
+            command
+        };
+        let metadata = || read_metadata(git, &self.base, &self.index, None, |_, _, _| Ok(()));
         if self.index.blobs().nth(127).is_none() {
-            self.verify_tree_rows(root)?;
-            self.verify_blob_types(root)?;
+            self.verify_tree_rows(git())?;
+            self.verify_blob_types(git, unproven)?;
             return metadata();
         }
 
         // Both queries read the installed store. Join the type check even if
         // the tree walk or the commit and attribute checks fail.
         std::thread::scope(|scope| {
-            let worker =
-                std::thread::Builder::new().spawn_scoped(scope, || self.verify_blob_types(root));
-            let tree = self.verify_tree_rows(root).and_then(|()| metadata());
-            let blobs = match worker {
-                Ok(worker) => worker
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("Git blob check worker failed"))?,
-                Err(_) => self.verify_blob_types(root),
-            };
+            let worker = std::thread::Builder::new()
+                .spawn_scoped(scope, || self.verify_blob_types(git, unproven))?;
+            let tree = self.verify_tree_rows(git()).and_then(|()| metadata());
+            let blobs = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("Git blob check worker failed"))?;
             tree.and(blobs)
         })
     }
 
     #[cfg(target_os = "macos")]
-    fn verify_tree_rows(&self, root: &Path) -> Result<()> {
-        let rows = git::bounded_stdout(
-            transfer_git(root).args(["ls-tree", "-r", "-z", &self.base]),
-            PROOF_LIMIT,
-        )?;
+    fn verify_tree_rows(&self, mut git: Command) -> Result<()> {
+        let rows = git::bounded_stdout(git.args(["ls-tree", "-r", "-z", &self.base]), PROOF_LIMIT)?;
         ensure!(
             self.index.matches_rows(&rows),
             "installed Git tree differs from checkout plan"
@@ -98,8 +106,16 @@ impl LoosePlan {
     }
 
     #[cfg(target_os = "macos")]
-    fn verify_blob_types(&self, root: &Path) -> Result<()> {
-        git::require_blobs(transfer_git(root), self.index.blobs())
+    fn verify_blob_types<'s>(
+        &'s self,
+        git: impl Fn() -> Command,
+        unproven: impl FnOnce(Vec<&'s str>) -> Result<Vec<&'s str>>,
+    ) -> Result<()> {
+        let blobs = unproven(self.index.blobs().collect())?;
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        git::require_blobs(git(), blobs.into_iter())
     }
 
     pub(super) fn install(&self, root: &Path, base: &str) -> Result<tempfile::TempDir> {
@@ -130,10 +146,16 @@ pub(in crate::workspace) fn prepare_checkout_proof(
     )?;
     let index = TipIndex::new(rows, width)?;
     let mut objects = Vec::new();
-    read_metadata(primary, base, &index, cancelled, |id, kind, bytes| {
-        objects.push((id.to_owned(), loose(kind, bytes)?));
-        Ok(())
-    })?;
+    read_metadata(
+        || transfer_git(primary),
+        base,
+        &index,
+        cancelled,
+        |id, kind, bytes| {
+            objects.push((id.to_owned(), loose(kind, bytes)?));
+            Ok(())
+        },
+    )?;
     Ok(LoosePlan {
         base: base.to_owned(),
         index,
@@ -157,7 +179,7 @@ fn metadata_output(
 }
 
 fn read_metadata(
-    primary: &Path,
+    git: impl Fn() -> Command,
     base: &str,
     index: &TipIndex,
     cancelled: Option<&AtomicBool>,
@@ -179,7 +201,7 @@ fn read_metadata(
     names.rewind()?;
     // Check the declared sizes before asking Git to materialize object bodies.
     let headers = metadata_output(
-        transfer_git(primary)
+        git()
             .args(["cat-file", "--batch-check"])
             .stdin(names.try_clone()?),
         128 * 1024,
@@ -205,9 +227,7 @@ fn read_metadata(
     );
     names.rewind()?;
     let raw = metadata_output(
-        transfer_git(primary)
-            .args(["cat-file", "--batch"])
-            .stdin(names),
+        git().args(["cat-file", "--batch"]).stdin(names),
         PROOF_LIMIT,
         cancelled,
     )?;
