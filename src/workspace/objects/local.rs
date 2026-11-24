@@ -4,6 +4,10 @@
 //! around the clone and check each open file's generation before and after
 //! cloning. This checks stability and pack/index pairing. Object contents
 //! and graph completeness rely on the donor's Git database being consistent.
+//!
+//! Where the filesystem cannot clone files, Linux hard-links the same object
+//! files instead (see [`Sharing`]). The snapshot then names the donor's own
+//! files, so the checks compare identity in place of independence.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -71,7 +75,8 @@ fn prepare(primary: &Path, root: &Path, format: &str, base: &str) -> Result<Opti
         .tempdir_in(&admin_path)?;
     let stage_dir = admin.directory(staging.path().file_name().context("missing stage name")?)?;
     let objects = staging.path().join("objects");
-    let receipt = source.clone_objects(&before, &objects, format, width)?;
+    let sharing = source.sharing(staging.path())?;
+    let receipt = source.clone_objects(&before, &objects, format, width, sharing)?;
 
     let mut cat = transfer_git(root);
     cat.env("GIT_OBJECT_DIRECTORY", &objects)
@@ -94,7 +99,7 @@ fn prepare(primary: &Path, root: &Path, format: &str, base: &str) -> Result<Opti
         output_text(&kind?)? == "commit",
         "the selected commit is missing from the independent object snapshot"
     );
-    if before != current? {
+    if !before.unchanged(&current?, sharing) {
         return Ok(None);
     }
     Ok(Some(Snapshot {
@@ -241,6 +246,18 @@ struct Source {
     objects: Directory,
 }
 
+/// How a snapshot gives the graft its own name for each donor object file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sharing {
+    /// A copy-on-write clone: a new file that shares the donor's blocks.
+    Clone,
+    /// A hard link: a second name for the donor's file. Used where the
+    /// filesystem cannot clone, as `git clone --local` does. Git never
+    /// rewrites a published object file, so both names stay readable, and
+    /// each repository removes only its own name when it repacks or prunes.
+    Link,
+}
+
 impl Source {
     fn open(primary: &Path) -> Result<Self> {
         let path = primary.canonicalize()?;
@@ -380,6 +397,7 @@ impl Source {
         destination: &Path,
         format: &str,
         width: usize,
+        sharing: Sharing,
     ) -> Result<Value> {
         fs::create_dir(destination)?;
         let mut totals = Totals::default();
@@ -390,7 +408,7 @@ impl Source {
         for (name, listing) in other {
             let target = destination.join(name);
             fs::create_dir(&target)?;
-            totals.merge(self.clone_entries(name, listing, &target)?);
+            totals.merge(self.clone_entries(name, listing, &target, sharing)?);
             if listing.kind == Kind::Pack {
                 for name in listing
                     .entries
@@ -414,6 +432,7 @@ impl Source {
                                 name,
                                 listing,
                                 &destination.join(name),
+                                sharing,
                             )?);
                         }
                         Ok(totals)
@@ -428,7 +447,11 @@ impl Source {
         crate::registry::order(&File::open(destination)?)?;
         let bytes = totals.pack_bytes + totals.index_bytes + totals.loose_bytes;
         Ok(json!({
-            "method": if cfg!(target_os = "macos") { "clonefile" } else { "reflink" },
+            "method": match sharing {
+                Sharing::Link => "hardlink",
+                Sharing::Clone if cfg!(target_os = "macos") => "clonefile",
+                Sharing::Clone => "reflink",
+            },
             "source": "local-snapshot",
             "bytes": bytes,
             "pack_bytes": totals.pack_bytes,
@@ -442,9 +465,40 @@ impl Source {
         }))
     }
 
-    /// Clone each inventoried file of one object directory into `target`,
-    /// checking every source file's generation before and after.
-    fn clone_entries(&self, name: &OsStr, listing: &Listing, target: &Path) -> Result<Totals> {
+    /// Decide once per snapshot how donor object files are shared. A clone
+    /// is preferred. Where the filesystem cannot clone, Linux hard-links
+    /// instead; any other failure leaves the snapshot to the export path.
+    /// Other platforms always clone, and a refused clone ends the snapshot.
+    fn sharing(&self, staging: &Path) -> Result<Sharing> {
+        if !cfg!(target_os = "linux") {
+            return Ok(Sharing::Clone);
+        }
+        let config = self
+            .admin
+            .open(OsStr::new("config"), libc::O_RDONLY | libc::O_NONBLOCK)?;
+        let probe = staging.join("clone-probe");
+        let cloned = clone_file(&config, &probe);
+        // A refused Linux clone leaves the empty file it created.
+        match fs::remove_file(&probe) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+        match cloned {
+            Ok(()) => Ok(Sharing::Clone),
+            Err(error) if clone_unsupported(&error) => Ok(Sharing::Link),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Give `target` its own name for each inventoried file of one object
+    /// directory, checking every source file's generation before and after.
+    fn clone_entries(
+        &self,
+        name: &OsStr,
+        listing: &Listing,
+        target: &Path,
+        sharing: Sharing,
+    ) -> Result<Totals> {
         let mut totals = Totals::default();
         let directory = self.objects.directory(name)?;
         ensure!(
@@ -459,17 +513,25 @@ impl Source {
             };
             let file = directory.open(filename, libc::O_RDONLY | libc::O_NONBLOCK)?;
             ensure!(
-                *entry == Stamp::from(&file.metadata()?),
+                entry.unchanged(&Stamp::from(&file.metadata()?), sharing),
                 "Git object changed before cloning"
             );
-            clone_file(&file, &copy)?;
+            match sharing {
+                Sharing::Clone => clone_file(&file, &copy)?,
+                Sharing::Link => directory.link(filename, &copy)?,
+            }
             let cloned = open_regular(&copy)?;
             let cloned_meta = cloned.metadata()?;
+            let same_inode = (cloned_meta.dev(), cloned_meta.ino()) == (entry.device, entry.inode);
             ensure!(
                 cloned_meta.len() == entry.size
-                    && (cloned_meta.dev(), cloned_meta.ino()) != (entry.device, entry.inode)
-                    && cloned_meta.nlink() == 1
-                    && *entry == Stamp::from(&file.metadata()?),
+                    && match sharing {
+                        // An independent file that shares only data blocks.
+                        Sharing::Clone => !same_inode && cloned_meta.nlink() == 1,
+                        // The inventoried file itself, under a second name.
+                        Sharing::Link => same_inode,
+                    }
+                    && entry.unchanged(&Stamp::from(&file.metadata()?), sharing),
                 "Git object changed during cloning"
             );
             sync_snapshot_entry(&cloned)?;
@@ -485,7 +547,13 @@ impl Source {
     /// plain file of the inventoried size. The inventory taken again after
     /// cloning rejects any source object that changed meanwhile.
     #[cfg(target_os = "macos")]
-    fn clone_loose(&self, name: &OsStr, listing: &Listing, target: &Path) -> Result<Totals> {
+    fn clone_loose(
+        &self,
+        name: &OsStr,
+        listing: &Listing,
+        target: &Path,
+        _sharing: Sharing,
+    ) -> Result<Totals> {
         const CLONE_NOFOLLOW: u32 = 0x0001;
         const CLONE_NOOWNERCOPY: u32 = 0x0002;
         let source = self.objects.directory(name)?;
@@ -553,9 +621,15 @@ impl Source {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn clone_loose(&self, name: &OsStr, listing: &Listing, target: &Path) -> Result<Totals> {
+    fn clone_loose(
+        &self,
+        name: &OsStr,
+        listing: &Listing,
+        target: &Path,
+        sharing: Sharing,
+    ) -> Result<Totals> {
         fs::create_dir(target)?;
-        let totals = self.clone_entries(name, listing, target)?;
+        let totals = self.clone_entries(name, listing, target, sharing)?;
         sync_snapshot_entry(&File::open(target)?)?;
         Ok(totals)
     }
@@ -627,6 +701,36 @@ struct Inventory {
     directories: BTreeMap<OsString, Listing>,
 }
 
+impl Inventory {
+    /// Whether `current` lists the same object database. A hard link changes
+    /// the change time of the file it names, so linked files are compared
+    /// without it; see [`Stamp::unchanged`].
+    fn unchanged(&self, current: &Self, sharing: Sharing) -> bool {
+        if sharing == Sharing::Clone {
+            return self == current;
+        }
+        self.root == current.root
+            && self.admin == current.admin
+            && self.objects == current.objects
+            && self.config == current.config
+            && self.worktree_config == current.worktree_config
+            && self.directories.len() == current.directories.len()
+            && self.directories.iter().zip(&current.directories).all(
+                |((name, listing), (current_name, current))| {
+                    name == current_name
+                        && listing.kind == current.kind
+                        && listing.stamp == current.stamp
+                        && listing.entries.len() == current.entries.len()
+                        && listing.entries.iter().zip(&current.entries).all(
+                            |((name, entry), (current_name, current))| {
+                                name == current_name && entry.unchanged(current, sharing)
+                            },
+                        )
+                },
+            )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Info,
@@ -665,6 +769,21 @@ impl From<&Metadata> for Stamp {
 }
 
 impl Stamp {
+    /// Whether `current` is the same generation of this entry. Creating a
+    /// hard link updates the change time of the linked file, here or in a
+    /// concurrent snapshot of the same donor, so a linked regular file is
+    /// compared by identity, size, mode and modification time alone. Any
+    /// write to its contents moves the modification time or the size.
+    fn unchanged(&self, current: &Self, sharing: Sharing) -> bool {
+        if sharing == Sharing::Link && self.regular() {
+            return Self {
+                changed: current.changed,
+                ..*self
+            } == *current;
+        }
+        self == current
+    }
+
     // libc stat field widths differ between these targets.
     #[allow(clippy::unnecessary_cast)]
     fn from_stat(info: libc::stat) -> Self {
@@ -725,6 +844,22 @@ impl Directory {
 
     fn directory(&self, name: &OsStr) -> io::Result<Self> {
         Ok(Self(self.open(name, libc::O_RDONLY | libc::O_DIRECTORY)?))
+    }
+
+    /// Hard-link this directory's entry `name` at the vacant path
+    /// `destination`, without following a symbolic link.
+    fn link(&self, name: &OsStr, destination: &Path) -> io::Result<()> {
+        let name = CString::new(name.as_bytes())?;
+        let destination = CString::new(destination.as_os_str().as_bytes())?;
+        os_result(unsafe {
+            libc::linkat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                0,
+            )
+        })
     }
 
     fn stamp(&self) -> io::Result<Stamp> {
@@ -836,6 +971,15 @@ impl Directory {
             entries,
         })
     }
+}
+
+/// Whether a failed clone means only that this filesystem cannot clone files.
+fn clone_unsupported(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+        || matches!(
+            error.raw_os_error(),
+            Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::ENOSYS | libc::EINVAL)
+        )
 }
 
 fn lower_hex(name: &[u8], width: usize) -> bool {
@@ -1051,13 +1195,16 @@ mod tests {
             assert!(!workspace.join("staged").exists());
             assert!(!workspace.join("unstaged").exists());
 
-            if !can_clone {
+            // Linux hard-links the object files where it cannot clone them.
+            let links = !can_clone && cfg!(target_os = "linux");
+            if !can_clone && !links {
                 assert_ne!(receipt["source"], "local-snapshot");
                 assert!(run(&workspace, &["cat-file", "-e", &other]).is_err());
                 continue;
             }
 
             assert_eq!(receipt["source"], "local-snapshot", "{receipt}");
+            assert_eq!(receipt["method"] == "hardlink", links, "{receipt}");
             assert_eq!(receipt["pack_count"], 1);
             assert_eq!(receipt["shared_bytes"], receipt["bytes"]);
             let local_objects = workspace.join(".git/objects");
@@ -1069,8 +1216,9 @@ mod tests {
                 (source_objects.join(&loose), local_objects.join(&loose)),
             ] {
                 let (source, target) = (fs::metadata(source)?, fs::metadata(target)?);
-                assert_ne!((source.dev(), source.ino()), (target.dev(), target.ino()));
-                assert_eq!(target.nlink(), 1);
+                let same_file = (source.dev(), source.ino()) == (target.dev(), target.ino());
+                assert_eq!(same_file, links);
+                assert_eq!(target.nlink(), if links { 2 } else { 1 });
                 assert_eq!(source.len(), target.len());
             }
             assert!(!local_objects.join("info/alternates").exists());
@@ -1099,6 +1247,71 @@ mod tests {
             assert_eq!(git::text(&moved, &["rev-parse", ":staged"])?, staged);
             run(&workspace, &["fsck", "--full"])?;
         }
+        Ok(())
+    }
+
+    /// A hard link changes the change time of the donor's object files, so
+    /// snapshots of one donor taken at the same time must not mistake each
+    /// other's links for a changed object database.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_hard_link_snapshots_of_one_donor_all_succeed() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let primary = fixture.path().join("primary");
+        make_repo(&primary, "sha1")?;
+        run(&primary, &["repack", "-adq"])?;
+        let base = commit(&primary, "second")?;
+        for index in 0..40 {
+            fs::write(primary.join("loose"), format!("loose object {index}"))?;
+            run(&primary, &["hash-object", "-w", "loose"])?;
+        }
+        let donor = fs::read_dir(primary.join(".git/objects/pack"))?
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "pack"))
+            .context("missing donor pack")?;
+        if clone_file(&open_regular(&donor)?, &fixture.path().join("probe")).is_ok() {
+            // This filesystem clones; hard links are not used here.
+            return Ok(());
+        }
+        let source = preflight(&primary)?;
+        let receipts = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|index| {
+                    let workspace = fixture.path().join(format!("workspace-{index}"));
+                    let state = fixture.path().join(format!("state-{index}"));
+                    let (source, base) = (&source, &base);
+                    scope.spawn(move || -> Result<(PathBuf, Value)> {
+                        fs::create_dir(&workspace)?;
+                        fs::create_dir(&state)?;
+                        let receipt = initialize(
+                            source,
+                            &workspace,
+                            &state,
+                            Some(base),
+                            Some("topic"),
+                            History::Local,
+                            None,
+                        )?
+                        .0;
+                        Ok((workspace, receipt))
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(crate::workspace::joined)
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for (workspace, receipt) in receipts {
+            assert_eq!(receipt["source"], "local-snapshot", "{receipt}");
+            assert_eq!(receipt["method"], "hardlink", "{receipt}");
+            assert_eq!(git::oid(&workspace, "HEAD")?, base);
+            run(&workspace, &["fsck", "--full"])?;
+        }
+        assert_eq!(fs::metadata(&donor)?.nlink(), 5);
+        run(&primary, &["fsck", "--full"])?;
         Ok(())
     }
 
