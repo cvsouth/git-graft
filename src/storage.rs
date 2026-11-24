@@ -1537,6 +1537,33 @@ pub fn doctor(state: &Path) -> Result<Value> {
     )
 }
 
+/// Whether a graft with local history can share the primary's Git object
+/// files, and how. Object files are immutable once published, so where the
+/// filesystem cannot clone them Linux hard-links them instead, as
+/// `git clone --local` does. Probed on the state filesystem, like `doctor`.
+pub fn history_sharing(state: &Path, native_clone: bool) -> Value {
+    if native_clone {
+        let method = if cfg!(target_os = "macos") {
+            "clonefile"
+        } else {
+            "reflink"
+        };
+        json!({"shared": true, "method": method})
+    } else if cfg!(target_os = "linux") && hard_links(state).unwrap_or(false) {
+        json!({"shared": true, "method": "hardlink"})
+    } else {
+        json!({"shared": false, "reason": "the filesystem cannot clone or hard-link files"})
+    }
+}
+
+fn hard_links(dir: &Path) -> Result<bool> {
+    let source = tempfile::NamedTempFile::new_in(dir)?;
+    let target = tempfile::Builder::new()
+        .prefix(".graft-probe-")
+        .tempdir_in(dir)?;
+    Ok(fs::hard_link(source.path(), target.path().join("link")).is_ok())
+}
+
 /// Whether new grafts can share the primary's file data blocks, and if not, why.
 /// Line-ending settings no longer stop sharing: a graft mirrors the primary's
 /// line endings wherever Git's clean of a file gives its blob (see `eol`).
@@ -1569,6 +1596,20 @@ mod tests {
     fn file_sharing_depends_only_on_cloning() {
         assert_eq!(file_sharing(false)["shared"], false);
         assert_eq!(file_sharing(true)["shared"], true);
+    }
+
+    #[test]
+    fn history_sharing_falls_back_to_hard_links_on_linux() {
+        let state = tempfile::tempdir().unwrap();
+        let cloned = history_sharing(state.path(), true);
+        assert_eq!(cloned["shared"], true);
+        assert_ne!(cloned["method"], "hardlink");
+        // Without cloning, only Linux shares history, by hard links.
+        let linked = history_sharing(state.path(), false);
+        assert_eq!(linked["shared"], cfg!(target_os = "linux"));
+        if cfg!(target_os = "linux") {
+            assert_eq!(linked["method"], "hardlink");
+        }
     }
 
     #[test]

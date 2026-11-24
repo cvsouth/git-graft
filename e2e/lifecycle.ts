@@ -83,6 +83,7 @@ export const cases: Scenario[] = [
       const doctor = ctx.cli(['doctor']);
       assert.ok(doctor.git && doctor.common_dir && doctor.source_storage);
       assert.equal(typeof objectResult(doctor.file_sharing).shared, 'boolean', 'doctor reports whether grafts share files');
+      assert.equal(typeof objectResult(doctor.history_sharing).shared, 'boolean', 'doctor reports whether grafts share Git history');
       assert.equal(doctor.git, ctx.git(['--version']));
       assert.equal(doctor.git_minimum, '2.46.0');
       assert.equal(doctor.git_supported, true);

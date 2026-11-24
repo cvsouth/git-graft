@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { deflateSync } from 'node:zlib';
@@ -550,8 +550,14 @@ exec "$GRAFT_TEST_GIT" "$@"
       const selected = closure(ctx, base);
       assert([side, staged, orphan].every(id => donorObjects.includes(id) && !selected.includes(id)));
 
-      const probe = objectResult(ctx.cli(['doctor']).source_storage);
+      const doctor = ctx.cli(['doctor']);
+      const probe = objectResult(doctor.source_storage);
       assert.equal(typeof probe.native_clone, 'boolean');
+      // Local history snapshots the primary's object files by cloning them, or
+      // on Linux by hard-linking them where the filesystem cannot clone.
+      const history = objectResult(doctor.history_sharing);
+      assert.equal(typeof history.shared, 'boolean');
+      if (probe.native_clone) assert.equal(history.method, probe.backend);
       const a = ctx.spawn('local-a', ['--history', 'local', '--base', 'main', '--branch', 'work']);
       ctx.command('git', ['config', '--local', '--unset-all', 'graft.history'], ctx.repo);
       const retry = ['--base', 'main', '--detach', '--request-id', randomUUID()];
@@ -562,20 +568,22 @@ exec "$GRAFT_TEST_GIT" "$@"
       const configured = ctx.spawn('configured-isolated', legacyRetry);
       assert.deepEqual(objects(ctx, configured.path), selected, 'project default must exclude unrelated objects');
       const overridden = ctx.spawn('override-local', ['--history', 'local', '--base', 'main']);
-      assert.deepEqual(objects(ctx, overridden.path), probe.native_clone ? donorObjects : selected, 'explicit policy must override project default');
+      assert.deepEqual(objects(ctx, overridden.path), history.shared ? donorObjects : selected, 'explicit policy must override project default');
       ctx.git(['config', '--local', 'graft.history', 'local']);
       assert.equal(ctx.spawn('configured-isolated', legacyRetry).lease, configured.lease, 'legacy isolated reservation must retry after reconfiguration');
       const isolated = ctx.spawn('exact', ['--history', 'isolated', '--base', 'main', '--branch', 'work']);
       ctx.git(['config', '--local', '--unset', 'graft.history']);
       const workspaces = [a, b, isolated];
       for (const ws of workspaces) {
-        const local = ws !== isolated && probe.native_clone;
+        const local = ws !== isolated && history.shared;
+        // Working files mirror the primary only where they can be cloned.
+        const mirrored = ws !== isolated && probe.native_clone;
         const receipt = objectResult(objectResult(ws.result.storage).objects);
         assert.equal(receipt.object_format, 'sha1');
         assert.equal(typeof receipt.source, 'string');
         if (local) {
           assert.equal(receipt.source, 'local-snapshot');
-          assert.equal(receipt.method, probe.backend);
+          assert.equal(receipt.method, history.method);
           assert(typeof receipt.pack_count === 'number' && receipt.pack_count > 0);
           assert(typeof receipt.loose_count === 'number' && receipt.loose_count >= 2);
           assert.equal(ctx.git(['cat-file', '-p', staged], ws.path), 'primary staged');
@@ -591,7 +599,7 @@ exec "$GRAFT_TEST_GIT" "$@"
         assert.equal(read(ws.path, 'tracked.txt'), 'initial\r\n');
         // Local grafts mirror the primary's LF file, which Git cleans to its
         // blob; an isolated graft holds Git's own checkout.
-        assert.equal(read(ws.path, 'converted.txt'), local ? 'one\ntwo\n' : 'one\r\ntwo\r\n');
+        assert.equal(read(ws.path, 'converted.txt'), mirrored ? 'one\ntwo\n' : 'one\r\ntwo\r\n');
         assert.equal(read(ws.path, 'forced.lf'), 'explicit\nLF\n');
         assert.equal(read(ws.path, 'binary.raw'), '\0binary\r\nbytes\n');
         assert.equal(existsSync(join(ws.path, 'donor-untracked.txt')), false);
@@ -605,8 +613,22 @@ exec "$GRAFT_TEST_GIT" "$@"
         for (const file of objectFiles) {
           assertSeparateRegularFiles([ctx.repo, a.path, b.path].map(path => join(path, store, file)));
         }
+      } else if (history.shared) {
+        // Hard-linked snapshots name the primary's own immutable object files.
+        const store = join('.git', 'objects');
+        const packed = readdirSync(join(ctx.repo, store, 'pack')).filter(name => /\.(pack|idx)$/.test(name));
+        assert(packed.length > 0);
+        for (const file of [join(orphan.slice(0, 2), orphan.slice(2)), ...packed.map(name => join('pack', name))]) {
+          const donor = statSync(join(ctx.repo, store, file));
+          assert(donor.isFile() && donor.nlink >= 3, file + ' is not shared by both local grafts');
+          for (const ws of [a, b]) {
+            const linked = statSync(join(ws.path, store, file));
+            assert.deepEqual([linked.dev, linked.ino], [donor.dev, donor.ino], file);
+          }
+        }
       }
       ctx.measure('native_object_snapshot', probe.native_clone);
+      ctx.measure('object_snapshot_method', history.shared ? history.method : 'export');
 
       // Both workspaces can stage and commit different edits to the same path at once.
       writeFileSync(join(a.path, 'tracked.txt'), 'first agent\r\n');
@@ -654,7 +676,7 @@ exec "$GRAFT_TEST_GIT" "$@"
           assert.equal(ctx.git(['show', `${base}:tracked.txt`], ws.path), 'initial');
           assert(!objects(ctx, ws.path).includes(advanced), 'post-spawn primary object leaked into the snapshot');
         }
-        if (probe.native_clone) {
+        if (history.shared) {
           for (const ws of [a, b]) {
             assert.equal(ctx.git(['cat-file', '-p', orphan], ws.path), 'unreferenced donor blob');
             assert.equal(ctx.git(['show', `${side}:side.txt`], ws.path), 'packed side branch');

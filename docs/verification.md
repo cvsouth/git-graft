@@ -14,7 +14,7 @@ Every push runs the suites on four native filesystems, each with the copy-on-wri
 | --- | --- | --- |
 | macOS 15 | APFS | `clonefile` |
 | Ubuntu 24.04 | Btrfs (dedicated loop volume) | `reflink` |
-| Ubuntu 24.04 | ext4 (dedicated loop volume) | Git checkout, with Git 2.46.0 built from source to test the minimum version |
+| Ubuntu 24.04 | ext4 (dedicated loop volume) | Git checkout, with local history shared through hard links, and Git 2.46.0 built from source to test the minimum version |
 | Windows Server 2025 | NTFS | Git checkout |
 
 A separate job builds the locked sources with Rust 1.89, the minimum supported version. Tagged releases build and smoke-test the installers on macOS, Linux and Windows. [Release workflow](../.github/workflows/release.yml)
