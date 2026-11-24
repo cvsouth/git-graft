@@ -1527,22 +1527,27 @@ pub(crate) fn clones_between(source: &Path, destination: &Path) -> bool {
     fs::create_dir_all(source).is_ok() && probe(source, destination).unwrap_or(false)
 }
 
+/// What a `doctor` probe covers: it runs on the state filesystem alone.
+const STATE_SCOPE: &str = "state filesystem only";
+
 /// Probe native cloning on the state filesystem. A worktree on another volume
 /// can still require the Git fallback; materialize checks the actual pair.
 pub fn doctor(state: &Path) -> Result<Value> {
     fs::create_dir_all(state)?;
     let supported = probe(state, state)?;
     Ok(
-        json!({"native_clone":supported, "backend": if supported { if cfg!(target_os="macos") {"clonefile"} else {"reflink"} } else {"git"}, "scope":"state filesystem only"}),
+        json!({"native_clone":supported, "backend": if supported { if cfg!(target_os="macos") {"clonefile"} else {"reflink"} } else {"git"}, "scope":STATE_SCOPE}),
     )
 }
 
 /// Whether a graft with local history can share the primary's Git object
 /// files, and how. Object files are immutable once published, so where the
 /// filesystem cannot clone them Linux hard-links them instead, as
-/// `git clone --local` does. Probed on the state filesystem, like `doctor`.
+/// `git clone --local` does. Probed on the state filesystem, like `doctor`:
+/// a primary on another volume can still require the export at `add`, so the
+/// result carries the same `scope` as `source_storage`.
 pub fn history_sharing(state: &Path, native_clone: bool) -> Value {
-    if native_clone {
+    let mut sharing = if native_clone {
         let method = if cfg!(target_os = "macos") {
             "clonefile"
         } else {
@@ -1553,7 +1558,9 @@ pub fn history_sharing(state: &Path, native_clone: bool) -> Value {
         json!({"shared": true, "method": "hardlink"})
     } else {
         json!({"shared": false, "reason": "the filesystem cannot clone or hard-link files"})
-    }
+    };
+    sharing["scope"] = json!(STATE_SCOPE);
+    sharing
 }
 
 fn hard_links(dir: &Path) -> Result<bool> {
@@ -1603,10 +1610,12 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let cloned = history_sharing(state.path(), true);
         assert_eq!(cloned["shared"], true);
+        assert_eq!(cloned["scope"], "state filesystem only");
         assert_ne!(cloned["method"], "hardlink");
         // Without cloning, only Linux shares history, by hard links.
         let linked = history_sharing(state.path(), false);
         assert_eq!(linked["shared"], cfg!(target_os = "linux"));
+        assert_eq!(linked["scope"], "state filesystem only");
         if cfg!(target_os = "linux") {
             assert_eq!(linked["method"], "hardlink");
         }
