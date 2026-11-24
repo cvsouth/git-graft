@@ -1,5 +1,8 @@
 //! MCP stdio adapter for grafts.
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
@@ -14,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 
-use crate::api::{self, AddDep, DropWorkspace, Exec, Land, Name, Owned};
+use crate::api::{self, AddDep, DropWorkspace, Exec, Land, Name, Owned, TurnRelease, TurnTake};
 use crate::workspace::{self, Command, Spawn};
 
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -48,8 +51,23 @@ fn tool<T: JsonSchema>(
 }
 
 fn parse<T: DeserializeOwned>(args: Map<String, Value>) -> Result<T, ErrorData> {
-    serde_json::from_value(Value::Object(args))
-        .map_err(|e| ErrorData::invalid_params(format!("Invalid tool arguments: {e}"), None))
+    serde_json::from_value(Value::Object(args)).map_err(invalid)
+}
+
+fn invalid(error: impl std::fmt::Display) -> ErrorData {
+    ErrorData::invalid_params(format!("Invalid tool arguments: {error}"), None)
+}
+
+impl Server {
+    /// Run one operation off the async thread.
+    async fn run(&self, op: Command) -> Result<anyhow::Result<Value>, ErrorData> {
+        let repo = self.repo.clone();
+        tokio::task::spawn_blocking(move || workspace::run(&repo, op))
+            .await
+            .map_err(|e| {
+                ErrorData::internal_error(format!("Graft operation failed to join: {e}"), None)
+            })
+    }
 }
 
 impl ServerHandler for Server {
@@ -65,7 +83,7 @@ impl ServerHandler for Server {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(format!(
-                "{instructions} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for just the ones to bring. Prefer naming them: [\"*\"] copies all of them, including build output and directories such as target/ and .venv/, which can be large. Omitting include uses the project's .worktreeinclude file if it has one, and copies nothing otherwise. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
+                "{instructions} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. Before using something every graft shares, such as a development server on a fixed port, call graft_turn_take, and graft_turn_release when done. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for just the ones to bring. Prefer naming them: [\"*\"] copies all of them, including build output and directories such as target/ and .venv/, which can be large. Omitting include uses the project's .worktreeinclude file if it has one, and copies nothing otherwise. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
             ))
     }
 
@@ -139,6 +157,24 @@ impl ServerHandler for Server {
                 false,
                 false,
             ),
+            tool::<TurnTake>(
+                "graft_turn_take",
+                "Take a turn on something the grafts share and cannot each have a copy of, such as a development server on a fixed port or a local database. resource is a name the project chooses. granted true means this graft holds the turn. Otherwise it is queued and position is its place in line, 1 being next: call again within 300 seconds to keep the place, or set wait to keep asking, for less time than your client allows a tool call. Call again while you hold the turn to renew it before expires_at. Graft does nothing to the resource: a turn is a promise between cooperating grafts. Give it up with graft_turn_release as soon as you finish.",
+                false,
+                false,
+            ),
+            tool::<TurnRelease>(
+                "graft_turn_release",
+                "Give up this graft's turn on a shared resource, or leave its queue. next names the graft now first in line; it gets the turn when it next calls graft_turn_take.",
+                false,
+                false,
+            ),
+            tool::<Empty>(
+                "graft_turn_list",
+                "List the shared resources that have a holder or a queue: who holds each turn, when it expires and who waits, in order.",
+                true,
+                false,
+            ),
         ]);
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -146,7 +182,7 @@ impl ServerHandler for Server {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let name = request.name.as_ref();
         let refuse = |message: String| -> Result<CallToolResponse, ErrorData> {
@@ -163,9 +199,7 @@ impl ServerHandler for Server {
             "graft_list" => parse::<Empty>(args).map(|_| Command::List)?,
             "graft_local_files" => parse::<Empty>(args).map(|_| Command::LocalFiles)?,
             "graft_add" => {
-                Command::Spawn(Spawn::from_mcp(args, !self.allow_exec).map_err(|e| {
-                    ErrorData::invalid_params(format!("Invalid tool arguments: {e}"), None)
-                })?)
+                Command::Spawn(Spawn::from_mcp(args, !self.allow_exec).map_err(invalid)?)
             }
             "graft_status" => Command::Status(parse(args)?),
             "graft_renew" => Command::Heartbeat(parse(args)?),
@@ -175,9 +209,7 @@ impl ServerHandler for Server {
             "graft_merge" => {
                 let explicit_into = args.contains_key("into");
                 let land: Land = parse(args)?;
-                land.check_undo(explicit_into).map_err(|e| {
-                    ErrorData::invalid_params(format!("Invalid tool arguments: {e}"), None)
-                })?;
+                land.check_undo(explicit_into).map_err(invalid)?;
                 if land.reconcile && !self.allow_exec {
                     return refuse(
                         "Lockfile reconciliation requires the host to start with --allow-exec"
@@ -187,6 +219,13 @@ impl ServerHandler for Server {
                 Command::land(land)
             }
             "graft_remove" => Command::Drop(parse(args)?),
+            "graft_turn_take" => {
+                let take: TurnTake = parse(args)?;
+                take.check().map_err(invalid)?;
+                Command::TurnTake(take)
+            }
+            "graft_turn_release" => Command::TurnRelease(parse(args)?),
+            "graft_turn_list" => parse::<Empty>(args).map(|_| Command::TurnList)?,
             _ => {
                 return Err(ErrorData::invalid_params(
                     format!("Unknown tool: {name}"),
@@ -194,12 +233,28 @@ impl ServerHandler for Server {
                 ));
             }
         };
-        let repo = self.repo.clone();
-        let result = tokio::task::spawn_blocking(move || workspace::run(&repo, op))
-            .await
-            .map_err(|e| {
-                ErrorData::internal_error(format!("Graft operation failed to join: {e}"), None)
-            })?;
+        let result = match op {
+            // A waiting take asks from here, one whole operation at a time,
+            // so it stops asking when the client cancels the request or
+            // disconnects instead of taking a turn nobody will use.
+            Command::TurnTake(mut take) => {
+                let deadline = Instant::now() + Duration::from_secs(take.wait);
+                take.wait = 0;
+                loop {
+                    let reply = self.run(Command::TurnTake(take.clone())).await?;
+                    let pause = reply
+                        .as_ref()
+                        .ok()
+                        .and_then(|reply| workspace::turn_pause(reply, deadline));
+                    let Some(pause) = pause else { break reply };
+                    let cancelled = tokio::time::timeout(pause, context.ct.cancelled());
+                    if cancelled.await.is_ok() {
+                        break reply;
+                    }
+                }
+            }
+            op => self.run(op).await?,
+        };
         Ok(match result {
             Ok(value) if value.get("success") == Some(&Value::Bool(false)) => {
                 CallToolResult::structured_error(value)

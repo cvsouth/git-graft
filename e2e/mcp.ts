@@ -20,11 +20,11 @@ const requestTimeoutMs = 30_000;
 const maxRequestBytes = 256 * 1024;
 const executionTools = ['graft_exec', 'graft_add_dependency'];
 const defaultTools = ['graft_list', 'graft_local_files', 'graft_add', 'graft_status', 'graft_renew', 'graft_merge', 'graft_remove',
-  'graft_restore'];
+  'graft_restore', 'graft_turn_take', 'graft_turn_release', 'graft_turn_list'];
 const spawnOptions = ['base', 'branch', 'detach', 'history', 'include', 'lock', 'name', 'no_checkout', 'no_deps', 'orphan',
   'reason', 'request_id', 'sparse'];
 const leaseTools = new Set(['graft_add_dependency', 'graft_remove', 'graft_exec', 'graft_renew', 'graft_merge',
-  'graft_restore']);
+  'graft_restore', 'graft_turn_take', 'graft_turn_release']);
 
 function isObject(value: unknown): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -157,7 +157,7 @@ class McpClient {
   }
 }
 
-async function withClient(
+export async function withClient(
   ctx: Context,
   allowExec: boolean,
   run: (client: McpClient) => Promise<void>,
@@ -176,7 +176,7 @@ function result(reply: JsonObject): JsonObject {
   return object(reply.result, 'JSON-RPC result');
 }
 
-async function initialize(client: McpClient, version = protocol): Promise<JsonObject> {
+export async function initialize(client: McpClient, version = protocol): Promise<JsonObject> {
   const info = result(await client.request('initialize', {
     protocolVersion: version,
     capabilities: {},
@@ -188,7 +188,7 @@ async function initialize(client: McpClient, version = protocol): Promise<JsonOb
   return info;
 }
 
-async function discover(client: McpClient, allowExec: boolean): Promise<Map<string, JsonObject>> {
+export async function discover(client: McpClient, allowExec: boolean): Promise<Map<string, JsonObject>> {
   const { tools } = result(await client.request('tools/list', {}));
   assert(Array.isArray(tools));
   const expected = [...defaultTools];
@@ -225,7 +225,7 @@ async function discover(client: McpClient, allowExec: boolean): Promise<Map<stri
   return catalog;
 }
 
-async function call(client: McpClient, name: string, args: JsonObject = {}, isError = false): Promise<JsonObject> {
+export async function call(client: McpClient, name: string, args: JsonObject = {}, isError = false): Promise<JsonObject> {
   const tool = result(await client.request('tools/call', { name, arguments: args }));
   assert.equal(tool.isError, isError, `${name}: ${JSON.stringify(tool)}`);
   const structured = object(tool.structuredContent, `${name} structured content`);
@@ -236,7 +236,7 @@ async function call(client: McpClient, name: string, args: JsonObject = {}, isEr
   return structured;
 }
 
-async function invalidCall(client: McpClient, name: string, args: JsonObject): Promise<void> {
+export async function invalidCall(client: McpClient, name: string, args: JsonObject): Promise<void> {
   const reply = await client.request('tools/call', { name, arguments: args });
   const error = object(reply.error, `${name} JSON-RPC error`);
   assert.equal(error.code, -32602);

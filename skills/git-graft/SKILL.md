@@ -1,6 +1,6 @@
 ---
 name: git-graft
-description: Give an agent task its own graft of a Git repository through the CLI or MCP, then merge, recover or remove it. Covers lease handling, request retries, package-manager reuse and undoing a merge.
+description: Give an agent task its own graft of a Git repository through the CLI or MCP, then merge, recover or remove it. Covers lease handling, request retries, package-manager reuse, taking turns on a shared resource and undoing a merge.
 ---
 
 # Use Graft for an agent task
@@ -13,6 +13,17 @@ A graft is an independent copy of the repository for one task. For routine work 
 4. Keep the returned `recovery_lease` private. Archives can retain sensitive user files. Use `graft_restore` to reopen an archived graft and receive a new active lease. Use `graft_remove` to archive a graft you no longer need, and `graft_renew` to keep a long task's lease from expiring. Call `graft_merge` with `undo` only when asked to reverse the merge; it requires the destination still to point at the recorded merge commit.
 
 Use cache-only registration for package downloads. For installed-file reuse, a user can register a trusted relocatable directory with every tracked install input and a key for external toolchain settings. Use the registration result and the next compatible `graft_add` attachment receipt to verify reuse. [Registration arguments and examples](../../docs/operations.md#register-a-package-manager). `deps share` needs a single-package npm project whose lockfile pins registry packages only; workspaces, overrides and linked or bundled packages are refused with `dependencies_not_shareable`. [What can be shared](../../docs/operations.md#what-can-be-shared)
+
+## Take turns on something every graft shares
+
+A graft has its own files, but a project can have one development server on a fixed port, one local database or one device. Before you use such a thing, take a turn on it. Graft does nothing to the resource itself: it only records whose turn it is, so the turn works when every agent asks.
+
+1. Call `graft_turn_take` with your graft's `name` and `lease` and a `resource` name. Use the name the project's instructions give, so that every agent asks for the same one.
+2. `granted: true` means the turn is yours until `expires_at`. During long use, call `graft_turn_take` again before then to renew it.
+3. `granted: false` means another graft holds the turn or is ahead of you, and `position` is your place in line. Do not use the resource. Call again within 300 seconds to keep your place, or pass `wait` in seconds, shorter than your limit for one tool call, to keep asking in a single call.
+4. Stop what you started and call `graft_turn_release` as soon as you finish, and also when you stop waiting. If you stop without releasing, the others wait until your turn expires.
+
+`graft_turn_list` shows who holds and who waits for each resource. On the CLI these are `git graft turn take`, `turn release` and `turn list`. [Rules for turns](../../docs/operations.md#take-turns-on-a-shared-resource)
 
 ## When Graft keeps work instead of finishing
 
