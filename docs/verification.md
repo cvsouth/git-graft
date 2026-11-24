@@ -8,7 +8,7 @@
 
 ## Continuous integration
 
-Every push runs the suites on four native filesystems, each with the copy-on-write backend it must use. [Workflow](../.github/workflows/ci.yml)
+Every push to main and every pull request runs the suites on four native filesystems, each with the copy-on-write backend it must use. [Workflow](../.github/workflows/ci.yml)
 
 | Runner | Filesystem | Expected backend |
 | --- | --- | --- |

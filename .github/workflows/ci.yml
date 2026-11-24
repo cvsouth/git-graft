@@ -2,10 +2,12 @@ name: Native filesystem verification
 
 # Docs-only changes skip the build. A release tag is verified on its commit
 # before tagging, so tag pushes don't run this again. The manual page is
-# checked against the CLI, so changes to it still run.
+# checked against the CLI, so changes to it still run. Pushes run on main
+# only: a branch with a pull request is verified once, by pull_request, and
+# workflow_dispatch verifies any other branch on request.
 on:
   push:
-    branches: ['**']
+    branches: [main]
     paths:
       - '**'
       - '!**/*.md'
