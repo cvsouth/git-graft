@@ -69,6 +69,31 @@ pub fn command(dir: &Path) -> Command {
     cmd
 }
 
+/// Start Git in `dir` as the user would from a terminal there. Their
+/// configuration, credential helpers, SSH settings and hooks all apply, and
+/// a partial clone may fetch the objects it lacks. Only `push` uses this: it
+/// talks to the user's remote. Every other caller wants [`command`].
+///
+/// The variables that select another repository are dropped, and so is the
+/// lease, so no hook or helper sees it. [`clear_location`] also drops
+/// configuration given on the command line. `git -c http.extraHeader=... graft
+/// push` is how a caller supplies credentials for one push, so that is handed
+/// back. Git must fail instead of waiting for an answer nobody can type.
+pub(crate) fn user_command(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    clear_location(&mut cmd);
+    for key in ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd.arg("-C")
+        .arg(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null());
+    cmd
+}
+
 /// Read optional Git metadata within a fixed memory budget. Closing the pipe
 /// before waiting also releases a writer whose output exceeded the limit.
 pub(crate) fn bounded_stdout(command: &mut Command, limit: u64) -> Result<Vec<u8>> {

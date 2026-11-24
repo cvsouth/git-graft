@@ -1,6 +1,7 @@
 //! Graft creation, inspection, integration and recoverable retirement.
 mod land;
 mod objects;
+mod push;
 mod registry;
 
 use std::path::{Path, PathBuf};
@@ -38,6 +39,7 @@ pub enum Command {
     /// Save, restore or forget; the string is the action.
     Layer(&'static str, api::Layer),
     Land(api::Land),
+    Push(api::Push),
     Drop(api::DropWorkspace),
     Restore(api::Owned),
     UndoLand(api::Owned),
@@ -964,6 +966,7 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
         Command::AddDep(a) => (&a.name, &a.lease),
         Command::Heartbeat(a) => (&a.name, &a.lease),
         Command::Layer(_, a) => (&a.name, &a.lease),
+        Command::Push(a) => (&a.name, &a.lease),
     };
     let mut r = registry::authenticate(p, name, lease)?;
     ensure!(
@@ -1006,6 +1009,7 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             drop((lock, builds));
             runtime.install(&a.manager, &a.packages, a.offline, attached)
         }
+        Command::Push(a) => push::run(p, &r, &a, (lock, builds)),
         _ => unreachable!(),
     }
 }

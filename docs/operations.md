@@ -4,7 +4,7 @@
 
 `git graft add NAME --base REV` creates a graft: a standalone repository with its own Git objects, refs, index and working files. Routine CLI and MCP calls honor the primary repository's `graft.history` setting and default to local history. Set `graft.history=isolated` when unrelated objects must be excluded, or choose `tip` for a shallow graft containing only the starting commit and its files. The result gives its `path` and an active `lease`. A name can be reused, so keep the lease with the task and share it only with trusted local tools. Avoid including leases in shared logs or reports. CLI commands that change a graft accept `--lease` or `GIT_GRAFT_LEASE`; MCP tools take `lease`. Use `git graft list` and `git graft status NAME` to inspect grafts, and `git graft status NAME --env` to see a graft's runtime and cache paths. Run `git graft --help` (the manual page) or `git graft -h`, and `git graft COMMAND --help`, for the available options.
 
-Ordinary Git commands operate on the graft's private repository. A branch or stash created there is local to it; `merge` transfers the selected committed work into the original repository. A nested `add` can use a parent graft's private commit as its base. Shallow repositories retain the selected commit’s locally available history and relevant Git shallow boundaries. Graft does not fetch missing history. Merging uses the destination’s existing boundaries and fails before changing it if ancestry cannot be resolved. Replacement refs, legacy Git grafts and repository-local checkout filters are declined.
+Ordinary Git commands operate on the graft's private repository. A branch or stash created there is local to it; `merge` transfers the selected committed work into the original repository, and `push` sends it to one of that repository's remotes instead. A nested `add` can use a parent graft's private commit as its base. Shallow repositories retain the selected commit’s locally available history and relevant Git shallow boundaries. Graft does not fetch missing history. Merging uses the destination’s existing boundaries and fails before changing it if ancestry cannot be resolved. Replacement refs, legacy Git grafts and repository-local checkout filters are declined.
 
 Use `lock` and `unlock` to protect an active graft from moves, removal and pruning. `move` changes its path on the same filesystem. After a manual rename, `repair` verifies its recorded identity before accepting the new path. `remove NAME` archives one graft. `prune` previews the expired grafts that can be archived and `prune --apply` archives them.
 
@@ -167,6 +167,44 @@ Recovery stops before writing any file, and names the paths in `paths`, when a c
 
 If the destination branch moved or is no longer checked out, the update can no longer finish. Graft returns `checkout_update_set_aside`, changes no further file and keeps the journal at the reported `recovery_path`. Files the stopped update had already written stay as they are and show in `git status`. Check `git status` in the primary, then retry the merge, which plans again against the current branch. The graft cannot be pruned while its checkout update is pending.
 
+## Push to a remote
+
+A graft has no remotes of its own. `push` sends its commits to a remote of the primary repository without merging them into a local branch:
+
+```sh
+git graft push task --lease "<lease>"
+git graft push task --lease "<lease>" --to fix/parser
+git graft push task --lease "<lease>" --remote fork --to fix/parser
+```
+
+Use `merge` when the work should land on a local branch of the primary. Use `push` when a branch on a remote is the destination, for example to open a pull request from it.
+
+The source is the graft's `HEAD` commit. The destination is the branch named by `--to`, or otherwise a branch with the name of the graft's current branch, which is `graft/NAME` unless `add --branch` chose another. A graft with a detached `HEAD` is refused with `detached_head` unless `--to` is given, and a graft with no commits is refused with `nothing_to_push`. `--remote` takes the name of a remote configured in the primary and defaults to `origin`. It does not take a URL or a path: any other value is refused with `remote_not_found`, and `details.remotes` lists the primary's remote names.
+
+Graft copies the commits into the primary's object store under a private ref, runs `git push REMOTE COMMIT:refs/heads/BRANCH` in the primary, then removes the private ref whether or not the push succeeded. The copy is the same protected transfer a merge uses and runs no hook. The push is the primary's own Git with your configuration and environment, so the remote's URL, `pushurl` and `insteadOf` rewrites, credential helpers, SSH settings and the primary's `pre-push` hook all apply. The lease is not passed to them. Git is run with `GIT_TERMINAL_PROMPT=0`, so a push that needs a typed answer fails instead of waiting. Tags and submodules are not pushed, even where `push.followTags` or `push.recurseSubmodules` is set. The primary's branches, `HEAD`, index and files do not change. Git updates the primary's remote-tracking ref for the pushed branch, such as `refs/remotes/origin/graft/task`, as it does after any push.
+
+Nothing is forced. If the remote branch has commits the graft lacks, or the remote refuses the update for another reason such as a protected branch or a server hook, the error is `push_rejected` and `details.reason` gives the reason. Any other failure, such as an unreachable remote, failed authentication or a `pre-push` hook that declines, is `push_failed`. Both carry `details.remote`, `details.branch` and Git's messages in `details.stderr`, with the user and password part of any URL removed. Graft itself never prints a remote's URL. After a rejection the remote, the primary's branches and the graft are as they were.
+
+```json
+{"action":"push","name":"task","remote":"origin","branch":"graft/task","commit":"<oid>","uncommitted_changes":0}
+```
+
+Only commits are pushed. `uncommitted_changes` counts the staged, unstaged and untracked files that stayed in the graft. Commit them and push again if they belong to the work.
+
+The graft stays active with the same lease. To continue after a push, for example to answer a review, commit in the graft and run the same `push` again; it fast-forwards the remote branch. To take in commits that reached the remote branch from elsewhere, fetch the remote in the primary, then fetch its remote-tracking ref from the primary into the graft and merge it:
+
+```sh
+git -C /absolute/path/to/primary fetch origin
+git fetch --no-tags /absolute/path/to/primary refs/remotes/origin/fix/parser
+git merge FETCH_HEAD
+```
+
+Graft does not treat pushed commits as merged, because no local branch of the primary contains them. `remove` therefore still reports `unmerged_work` after a push. To finish, archive the graft with `remove --discard` and keep the `recovery_lease`; `restore` reopens it if more work is needed. Plain `remove` works once a local branch of the primary contains the pushed commits, for example after the pull request was merged and the primary pulled it. A squash or rebase merge creates other commits, so it does not count.
+
+While a push runs, `merge`, `remove`, `exec` and lease renewal on the same graft report `workspace_busy`, and a graft with a background job started by `exec` cannot be pushed until the job exits. Other grafts are not held while Git talks to the remote. If a push is killed, its private ref can stay in the primary under `refs/graft/`. It only keeps the pushed commits from garbage collection, and the graft's next push removes it.
+
+Over MCP the tool is `graft_push`, with `name`, `lease` and optional `remote` and `to`. It is offered only by a host started with `--allow-push`, which is separate from `--allow-exec`.
+
 ## Safety error codes and receipt fields
 
 These codes and fields tell you that Graft kept something instead of deleting or overwriting it. Every error here leaves the graft, its archive and the primary's files as they were. Error codes appear as `code` in CLI JSON errors and MCP tool results.
@@ -190,6 +228,11 @@ These codes and fields tell you that Graft kept something instead of deleting or
 | `dependencies_not_shareable` | `deps share` found a project whose install is not plain, lockfile-pinned registry packages, such as npm workspaces. `details.reason` says why, `details.field` and `details.path` name the offending key and file when known, and `details.fallback` gives the alternative. Nothing was registered. | Install in each graft: run `npm ci` there, or `git graft deps add NAME --lease TOKEN --manager npm`. See [what can be shared](#what-can-be-shared). |
 | `checkout_recovery_required` | A checkout update of the primary was interrupted. `details.paths` lists files that need attention. | Retry the same merge or undo with the same lease. See [interrupted checkout update](#interrupted-checkout-update). |
 | `checkout_update_set_aside` | An interrupted checkout update can no longer finish because its branch moved or is no longer checked out. The journal stays at `details.recovery_path`. | Check `git status` in the primary, then retry the merge. |
+| `push_rejected` | `push` was refused by the remote: the remote branch has commits the graft lacks, the branch is protected or a server hook declined. `details.reason` gives the reason, with `details.remote`, `details.branch` and Git's messages in `details.stderr`. Nothing was pushed or forced. | Merge the remote branch into the graft and push again, or push to another branch with `--to`. See [push to a remote](#push-to-a-remote). |
+| `push_failed` | `push` could not be completed: the remote was unreachable, authentication failed, the primary's `pre-push` hook declined, or Git failed in another way. `details.stderr` has Git's messages. If the connection was lost after the remote accepted the update, the remote branch may already hold the commit. | Fix the cause in the primary, where the remote and its credentials are configured, then push again. Pushing a commit the remote already has succeeds. |
+| `remote_not_found` | `push` was given a remote name the primary does not configure. `details.remotes` lists the names it has. | Choose one of them, or add the remote in the primary with `git remote add`. |
+| `detached_head` | `push` found the graft's `HEAD` detached, so there is no branch name to push. `details.commit` is that commit. | Name the remote branch with `--to`. |
+| `nothing_to_push` | `push` found a graft with no commits. | Commit in the graft, then push again. |
 | `git_busy` | A Git lock or an unreadable index in the graft or primary is held by a command Graft did not start, or cannot prove has exited. | Wait for the Git command to finish. Remove a lock only once no Git command is running. |
 | `workspace_busy` | Another Graft command, or a process started by `exec` (including background jobs), holds the graft. | Wait, or stop the background job, then retry. |
 | `kept` | A `gc --purge-cache` field listing saved layers (`saved_layer`) and the registered shared layer (`registered_shared_layer`) it did not delete. | Retire them with `deps layer remove` when no longer needed. |
