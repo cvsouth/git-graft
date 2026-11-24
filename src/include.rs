@@ -320,12 +320,16 @@ fn exclude(graft: &Path, names: &[Vec<u8>]) -> Result<()> {
 
 /// Copy what `patterns` match from `origin` into the new graft at `graft`,
 /// returning the receipt recorded as `storage.included`. With a sparse
-/// checkout, paths the graft's index tracks are left out too.
+/// checkout, paths the graft's index tracks are left out too. Nothing is
+/// copied into an `attached` install directory: the primary's install can
+/// hold caches or extra packages the attached one lacks, and adding them
+/// would make the install count as the graft's own changes.
 pub(crate) fn copy(
     origin: &Path,
     graft: &Path,
     patterns: &Patterns,
     sparse: bool,
+    attached: &[&str],
 ) -> Result<Value> {
     let names = candidates(origin, patterns)?;
     let tracked: HashSet<Vec<u8>> = if sparse && !names.is_empty() {
@@ -341,7 +345,18 @@ pub(crate) fn copy(
     let mut skip = |name: &[u8], reason: &str| {
         skipped.push(json!({"path": String::from_utf8_lossy(name), "reason": reason}));
     };
+    let mut reported = HashSet::new();
     for name in names {
+        if let Some(directory) = attached.iter().find(|directory| {
+            name.strip_prefix(directory.as_bytes())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
+        }) {
+            // One entry per install, not one per file inside it.
+            if reported.insert(*directory) {
+                skip(format!("{directory}/").as_bytes(), "attached_install");
+            }
+            continue;
+        }
         if name.ends_with(b"/") {
             skip(&name, "nested_repository");
             continue;
@@ -647,6 +662,7 @@ mod tests {
             &graft,
             &requested(&[".env", "notes.txt", "src/*"]),
             false,
+            &[],
         )
         .unwrap();
         assert_eq!(receipt["files"], 2, "{receipt}");
@@ -679,7 +695,7 @@ mod tests {
     #[test]
     fn everything_copies_with_a_star_and_unchanged_copies_are_not_local_work() {
         let (_root, primary, graft) = fixture();
-        let receipt = copy(&primary, &graft, &requested(&["*"]), false).unwrap();
+        let receipt = copy(&primary, &graft, &requested(&["*"]), false, &[]).unwrap();
         assert_eq!(receipt["files"], 4, "{receipt}");
         let storage = json!({"included": receipt});
         let found = git::changes(&graft).unwrap();
@@ -695,11 +711,43 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_copied_into_an_attached_install() {
+        let (_root, primary, graft) = fixture();
+        write(&primary, "node_modules/pkg/index.js", "primary\n");
+        write(&primary, "node_modules/.cache/entry", "cache\n");
+        write(&primary, "node_modules_notes.txt", "kept\n");
+        // The graft's attached install has the package but not the cache.
+        write(&graft, "node_modules/pkg/index.js", "attached\n");
+        let receipt = copy(
+            &primary,
+            &graft,
+            &requested(&["*"]),
+            false,
+            &["node_modules"],
+        )
+        .unwrap();
+        assert!(!graft.join("node_modules/.cache").exists(), "{receipt}");
+        assert_eq!(
+            fs::read_to_string(graft.join("node_modules/pkg/index.js")).unwrap(),
+            "attached\n"
+        );
+        assert!(graft.join("node_modules_notes.txt").exists());
+        let attached: Vec<_> = receipt["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["reason"] == "attached_install")
+            .collect();
+        assert_eq!(attached.len(), 1, "{receipt}");
+        assert_eq!(attached[0]["path"], "node_modules/");
+    }
+
+    #[test]
     fn setup_file_supplies_the_default() {
         let (_root, primary, graft) = fixture();
         write(&primary, SETUP_FILE, "# local secrets\n*.log\n");
         let patterns = select(&primary, None).unwrap().unwrap();
-        let receipt = copy(&primary, &graft, &patterns, false).unwrap();
+        let receipt = copy(&primary, &graft, &patterns, false, &[]).unwrap();
         assert_eq!(receipt["source"], SETUP_FILE);
         assert_eq!(receipt["files"], 1, "{receipt}");
         assert!(graft.join("debug.log").is_file());
@@ -712,7 +760,7 @@ mod tests {
         let outside = root.path().join("outside");
         fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, graft.join("build")).unwrap();
-        let receipt = copy(&primary, &graft, &requested(&["build/"]), false).unwrap();
+        let receipt = copy(&primary, &graft, &requested(&["build/"]), false, &[]).unwrap();
         assert_eq!(receipt["files"], 0);
         assert_eq!(receipt["skipped"][0]["reason"], "blocked");
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);

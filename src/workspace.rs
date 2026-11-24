@@ -414,7 +414,9 @@ fn create(
         && !c.no_checkout
         && let Some(patterns) = c.include
     {
-        checkout["included"] = include::copy(origin, &r.path, patterns, !c.sparse.is_empty())?;
+        let attached = crate::package_manager::attached_directories(&checkout)?;
+        checkout["included"] =
+            include::copy(origin, &r.path, patterns, !c.sparse.is_empty(), &attached)?;
         crate::trace::mark("include");
     }
     r.storage = checkout;
