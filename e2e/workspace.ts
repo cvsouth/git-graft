@@ -387,6 +387,59 @@ export const cases: Scenario[] = [
       assert.equal(ctx.git(['branch', '--list', 'new-root']), '');
     },
   },
+  {
+    name: 'include copies chosen untracked and ignored files, by request or .worktreeinclude',
+    run(ctx) {
+      write(ctx.repo, '.env', 'SECRET=1\n');
+      write(ctx.repo, 'ignored/local.json', '{}\n');
+      write(ctx.repo, 'ignored/deep/cache.bin', 'cache\n');
+      write(ctx.repo, 'notes.txt', 'scratch\n');
+
+      const local = ctx.cli(['local-files']);
+      assert.deepEqual(local.entries, [
+        { path: '.env', status: 'untracked', kind: 'file' },
+        { path: 'ignored/', status: 'ignored', kind: 'directory' },
+        { path: 'notes.txt', status: 'untracked', kind: 'file' },
+      ]);
+
+      const none = spawn(ctx, 'none');
+      for (const name of ['.env', 'ignored', 'notes.txt']) assert(!existsSync(join(none.path, name)));
+
+      // A setup file is the default; the copies do not show as changes.
+      write(ctx.repo, '.worktreeinclude', '# local configuration\n.env\nignored/*.json\n');
+      const setup = spawn(ctx, 'setup');
+      const receipt = objectResult(objectResult(setup.result.storage).included);
+      assert.equal(receipt.source, '.worktreeinclude');
+      assert.equal(receipt.files, 2);
+      assert.equal(read(setup.path, '.env'), 'SECRET=1\n');
+      assert.equal(read(setup.path, 'ignored/local.json'), '{}\n');
+      assert(!existsSync(join(setup.path, 'ignored', 'deep')));
+      assert(!existsSync(join(setup.path, 'notes.txt')));
+      assert.deepEqual(ctx.cli(['status', setup.name]).changes, []);
+      ctx.cli(owned('remove', setup));
+
+      // A request replaces the setup file.
+      const picked = spawn(ctx, 'picked', ['--include', 'notes.txt']);
+      assert.equal(read(picked.path, 'notes.txt'), 'scratch\n');
+      assert(!existsSync(join(picked.path, '.env')));
+
+      // Copies never replace tracked files, and a deleted copy is local work.
+      write(ctx.repo, 'tracked.txt', 'primary edit\n');
+      const all = spawn(ctx, 'all', ['--include', '*']);
+      assert.equal(read(all.path, 'tracked.txt'), 'initial\n');
+      assert.equal(read(all.path, 'ignored/deep/cache.bin'), 'cache\n');
+      rmSync(join(all.path, 'ignored', 'deep', 'cache.bin'));
+      write(all.path, 'ignored/deep/other.bin', 'other\n');
+      const refused = ctx.fail(owned('remove', all));
+      assert.equal(refused.code, 'local_changes');
+      ctx.cli(owned('remove', all, '--discard'));
+      ctx.git(['checkout', '--', 'tracked.txt']);
+
+      const orphan = ctx.command(ctx.bin, ['--repo', ctx.repo, 'add', 'bad', '--orphan', 'x', '--include', '.env']);
+      assert.notEqual(orphan.status, 0);
+      assert.equal(read(ctx.repo, '.env'), 'SECRET=1\n');
+    },
+  },
   ...['sha1', 'sha256'].map((format): Scenario => ({
     name: `checkout and landing from a bare ${format} primary`,
     run(ctx) {

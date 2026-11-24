@@ -19,9 +19,9 @@ const protocol = '2025-06-18';
 const requestTimeoutMs = 30_000;
 const maxRequestBytes = 256 * 1024;
 const executionTools = ['graft_exec', 'graft_add_dependency'];
-const defaultTools = ['graft_list', 'graft_add', 'graft_status', 'graft_renew', 'graft_merge', 'graft_remove',
+const defaultTools = ['graft_list', 'graft_local_files', 'graft_add', 'graft_status', 'graft_renew', 'graft_merge', 'graft_remove',
   'graft_restore'];
-const spawnOptions = ['base', 'branch', 'detach', 'history', 'lock', 'name', 'no_checkout', 'no_deps', 'orphan',
+const spawnOptions = ['base', 'branch', 'detach', 'history', 'include', 'lock', 'name', 'no_checkout', 'no_deps', 'orphan',
   'reason', 'request_id', 'sparse'];
 const leaseTools = new Set(['graft_add_dependency', 'graft_remove', 'graft_exec', 'graft_renew', 'graft_merge',
   'graft_restore']);
@@ -463,6 +463,65 @@ export const cases: Scenario[] = [
       assert(existsSync(workspace.path));
       assert.equal(ctx.git(['symbolic-ref', 'HEAD'], workspace.path), 'refs/heads/graft/wire');
       assert.equal(ctx.git(['rev-parse', 'refs/heads/main']), workspace.result.base);
+    }),
+  },
+  {
+    name: 'MCP agents choose which untracked and ignored files a graft copies',
+    run: async (ctx) => withClient(ctx, false, async (client) => {
+      await initialize(client);
+      writeFileSync(join(ctx.repo, '.env'), 'SECRET=primary\n');
+      mkdirSync(join(ctx.repo, 'ignored', 'cache'), { recursive: true });
+      writeFileSync(join(ctx.repo, 'ignored', 'cache', 'blob'), 'cached\n');
+
+      // Discovery names both kinds, and matches the CLI.
+      const local = await call(client, 'graft_local_files');
+      assert.deepEqual(local, ctx.cli(['local-files']));
+      assert.deepEqual(local.entries, [
+        { path: '.env', status: 'untracked', kind: 'file' },
+        { path: 'ignored/', status: 'ignored', kind: 'directory' },
+      ]);
+      assert.equal(local.setup_file_present, false);
+      ctx.coverTool('graft_local_files');
+
+      // Nothing is copied unless the agent asks.
+      const plain = await call(client, 'graft_add', { name: 'plain' });
+      assert(!existsSync(join(workspacePath(plain), '.env')));
+      assert.equal(object(plain.storage, 'plain storage').included, undefined);
+
+      // Cherry-picked: only .env, and an unchanged copy does not block the merge.
+      const picked = await call(client, 'graft_add', { name: 'picked', include: ['.env'] });
+      const pickedPath = workspacePath(picked);
+      const included = object(object(picked.storage, 'picked storage').included, 'included receipt');
+      assert.equal(included.source, 'request');
+      assert.deepEqual(included.patterns, ['.env']);
+      assert.equal(included.files, 1);
+      assert.equal(readFileSync(join(pickedPath, '.env'), 'utf8'), 'SECRET=primary\n');
+      assert(!existsSync(join(pickedPath, 'ignored')));
+      // The copy is excluded, so committing everything leaves it out.
+      assert.equal(ctx.git(['status', '--porcelain'], pickedPath), '');
+      writeFileSync(join(pickedPath, 'feature.txt'), 'feature\n');
+      const merged = await call(client, 'graft_merge', {
+        name: 'picked', lease: string(picked.lease, 'picked lease'), commit: 'Add feature',
+      });
+      assert.equal(ctx.git(['show', `${string(merged.commit, 'merge commit')}:feature.txt`]), 'feature');
+      assert.equal(ctx.command('git', ['cat-file', '-e', 'main:.env']).status, 128);
+      assert.equal(readFileSync(join(ctx.repo, '.env'), 'utf8'), 'SECRET=primary\n');
+
+      // Everything with a star; an edited copy counts as local work again.
+      const all = await call(client, 'graft_add', { name: 'all', include: ['*'] });
+      const allPath = workspacePath(all);
+      assert.equal(object(object(all.storage, 'all storage').included, 'all receipt').files, 2);
+      assert.equal(readFileSync(join(allPath, 'ignored', 'cache', 'blob'), 'utf8'), 'cached\n');
+      writeFileSync(join(allPath, '.env'), 'SECRET=graft\n');
+      const owned = { name: 'all', lease: string(all.lease, 'all lease') };
+      const refused = await call(client, 'graft_remove', owned, true);
+      assert.equal(refused.code, 'local_changes');
+      assert.deepEqual(object(refused.details, 'refusal details').paths, [{ path: '.env', status: 'ignored' }]);
+      await call(client, 'graft_remove', { ...owned, discard: true });
+      assert.equal(readFileSync(join(ctx.repo, '.env'), 'utf8'), 'SECRET=primary\n');
+
+      await invalidCall(client, 'graft_add', { name: 'orphaned', orphan: 'fresh', include: ['.env'] });
+      await invalidCall(client, 'graft_add', { name: 'multiline', include: ['a\nb'] });
     }),
   },
   {

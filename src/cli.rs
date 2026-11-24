@@ -13,10 +13,17 @@ pub enum Cmd {
 Examples:
   git graft add fix-parser                     From the current HEAD, on branch graft/fix-parser
   git graft add hotfix --base v1.2.0           From another commit or tag
-  git graft add docs --sparse docs             Check out only the docs directory")]
+  git graft add docs --sparse docs             Check out only the docs directory
+  git graft add api --include .env             Copy the untracked .env file too
+  git graft add api --include '*'              Copy every untracked and ignored file
+
+Untracked and ignored files stay behind unless --include names them, or the
+checkout has a .worktreeinclude file listing .gitignore-style patterns.")]
     Add(api::Spawn),
     /// List active and recoverable grafts.
     List,
+    /// List the checkout's untracked and ignored files, which add --include can copy.
+    LocalFiles,
     /// Show a graft's HEAD and changed files, or its environment with --env.
     Status(api::StatusArgs),
     /// Check Git support and whether grafts can share files.
@@ -154,6 +161,7 @@ impl From<Cmd> for workspace::Command {
         match cmd {
             Cmd::Add(args) => Op::Spawn(args),
             Cmd::List => Op::List,
+            Cmd::LocalFiles => Op::LocalFiles,
             Cmd::Status(api::StatusArgs { name, env: false }) => Op::Status(api::Name { name }),
             Cmd::Status(api::StatusArgs { name, env: true }) => Op::Env(api::Name { name }),
             Cmd::Doctor => Op::Doctor,

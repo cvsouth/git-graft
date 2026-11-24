@@ -8,6 +8,23 @@ Ordinary Git commands operate on the graft's private repository. A branch or sta
 
 Use `lock` and `unlock` to protect an active graft from moves, removal and pruning. `move` changes its path on the same filesystem. After a manual rename, `repair` verifies its recorded identity before accepting the new path. `remove NAME` archives one graft. `prune` previews the expired grafts that can be archived and `prune --apply` archives them.
 
+## Copy untracked and ignored files
+
+A graft starts with only the files of its commit. Untracked and ignored files in the checkout, such as `.env`, local configuration or build output, stay behind unless the request names them:
+
+```sh
+git graft add api --include .env --include 'config/*.local.json'
+git graft add api --include '*'      # every untracked and ignored file
+```
+
+Over MCP, `graft_add` takes the same patterns as `include`, and `graft_local_files` (CLI `git graft local-files`) lists the checkout's untracked and ignored files and directories, so an agent can choose what its task needs. Patterns use `.gitignore` syntax and match only files Git does not track; a nested repository is skipped. `*` also brings build output and environments such as `target/` and `.venv/`, which can be large where files cannot be cloned, so name what the task needs where you can. To leave a directory out of `*`, exclude both the directory and its contents: `--include '*' --include '!target/' --include '!target/**'`.
+
+When a request names no patterns, a `.worktreeinclude` file at the root of the invoking checkout supplies them, in the same syntax, so a project can set a default once. Without one, nothing is copied. Patterns in a request replace the file's, and an empty MCP `include` list copies nothing.
+
+Copies are clones on a filesystem that supports them, and full copies elsewhere. A copy never replaces a file of the checkout, nothing is copied into an attached dependency install, and a copy is never written through a symlink; such paths are listed in the receipt's `skipped` with a reason (`exists`, `blocked`, `tracked`, `attached_install` (one entry for the whole install), `nested_repository`, `vanished`, `unreadable`, `symlink` on Windows, or `special`). The `add` receipt records them as `storage.included`: `source` (`request` or `.worktreeinclude`), `patterns`, `files`, `bytes`, `skipped_count` and up to 50 `skipped` entries.
+
+A copied file that is untracked in the graft is added to the graft's `.git/info/exclude`, so `merge --commit` never commits it; commit one deliberately with `git add -f`. `status`, `merge` and `remove` do not count a copy as a change while it is the file Graft installed. Once the graft edits, replaces or deletes it, it is listed as `ignored` again. Copies stay in the graft's archive, like every other file.
+
 ## Run commands and install dependencies
 
 ```sh
@@ -169,7 +186,7 @@ These codes and fields tell you that Graft kept something instead of deleting or
 | `archived_attempts` | Named in `add`, `status`, merge, remove, `restore` and `prune` replies about a graft whose request was retried: archives of its unfinished attempts, each with `archive_path` and `lease`. | Copy what you need from `archive_path`. |
 | `unfinished_creation` | `restore` was asked for an archive of a creation that never finished. `details.archive_path` names it; nothing was changed. | Copy what you need from the archive, or run `add` again. |
 | `destination_has_local_changes` | Uncommitted edits in the primary checkout touch paths the merge or undo changes. `details.paths` lists them; nothing changed. | Commit those edits or move them aside, then retry. See [uncommitted edits in the primary checkout](#uncommitted-edits-in-the-primary-checkout). |
-| `local_changes` | `merge` or `remove` found uncommitted, untracked or ignored files in the graft. `details.paths` lists up to 200 of them, each with `status` `added`, `deleted`, `modified`, `untracked` or `ignored`, and `details.count` gives the total. On `remove`, `details.discard_archives` is `true`: `remove --discard` archives every one of them with the graft. | Commit them and retry, or archive the graft with `remove --discard` and keep the `recovery_lease`. A shared install that Graft attached and the graft has not changed is not listed. |
+| `local_changes` | `merge` or `remove` found uncommitted, untracked or ignored files in the graft. `details.paths` lists up to 200 of them, each with `status` `added`, `deleted`, `modified`, `untracked` or `ignored`, and `details.count` gives the total. On `remove`, `details.discard_archives` is `true`: `remove --discard` archives every one of them with the graft. | Commit them and retry, or archive the graft with `remove --discard` and keep the `recovery_lease`. A shared install that Graft attached, and files `add` copied with `include`, are not listed while the graft has not changed them. |
 | `dependencies_not_shareable` | `deps share` found a project whose install is not plain, lockfile-pinned registry packages, such as npm workspaces. `details.reason` says why, `details.field` and `details.path` name the offending key and file when known, and `details.fallback` gives the alternative. Nothing was registered. | Install in each graft: run `npm ci` there, or `git graft deps add NAME --lease TOKEN --manager npm`. See [what can be shared](#what-can-be-shared). |
 | `checkout_recovery_required` | A checkout update of the primary was interrupted. `details.paths` lists files that need attention. | Retry the same merge or undo with the same lease. See [interrupted checkout update](#interrupted-checkout-update). |
 | `checkout_update_set_aside` | An interrupted checkout update can no longer finish because its branch moved or is no longer checked out. The journal stays at `details.recovery_path`. | Check `git status` in the primary, then retry the merge. |

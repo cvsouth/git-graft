@@ -90,6 +90,16 @@ git graft deps share --key node24
 
 Every graft you create afterwards gets a writable `node_modules` that takes almost no extra space, without running `npm ci` again.
 
+### Bringing local files
+
+A graft starts with only the files Git tracks. To bring untracked or ignored files such as `.env`, name them with `.gitignore`-style patterns:
+
+```sh
+git graft add fix-parser --include .env --include 'config/*.local.json'
+```
+
+`--include '*'` brings every one of them, and `git graft local-files` lists what's there. Agents make this choice themselves through the MCP server. For a default, list patterns in a `.worktreeinclude` file at the root of your checkout; `--include` replaces it. Copies are clones where the filesystem supports it, never replace a tracked file, and don't count as changes in `merge` or `remove` until you edit them.
+
 ## Using it with coding agents
 
 git-graft includes an MCP server. Give your agent the path to your repository.
@@ -144,7 +154,7 @@ git-graft runs on macOS, Linux and Windows. Disk sharing needs a filesystem that
 
 `git graft add` creates a standalone Git repository next to your checkout and asks the filesystem to clone its files instead of writing them. The clones share data blocks with your checkout until you edit them. A graft mirrors your checkout: before reusing a file, git-graft proves that Git's own line-ending conversion of it, the one `git status` and `git add` apply, gives exactly the committed content, using Git's own index check or a hash of the converted bytes. The graft keeps your checkout's line endings, and Git in the graft agrees every file is unchanged. Files with a filter, `ident` or a working-tree encoding, and anything git-graft cannot prove, come from Git. It also records each file's metadata in the new index, so the first `git status` reads no file contents.
 
-Creating a graft never changes your checkout, and never copies untracked or ignored files into the graft. Merging reports conflicts before it changes anything, and `merge`, `remove` and `prune` archive a graft instead of deleting it. See [safety and recovery](docs/safety.md) for the details.
+Creating a graft never changes your checkout, and copies untracked or ignored files into the graft only when you or the agent [ask for them](#bringing-local-files). Merging reports conflicts before it changes anything, and `merge`, `remove` and `prune` archive a graft instead of deleting it. See [safety and recovery](docs/safety.md) for the details.
 
 ## FAQ
 
@@ -152,7 +162,7 @@ Creating a graft never changes your checkout, and never copies untracked or igno
 A worktree writes a full copy of every file, shares your repository's object store, refs and stash, and allows one checkout per branch. A graft is a standalone repository with its own objects, branches, reflog, stash and index, so any branch name works and your repository isn't written to while the graft is in use. On a filesystem that can clone files, it stores only the files you change.
 
 **Why not `cp -c` or `cp --reflink`?**
-Cloning a directory copies everything in it, including untracked and ignored files, local edits and Git's internal state, and nothing checks the files against a commit. A graft starts from the commit you choose, leaves untracked and ignored files behind, verifies every reused file, and adds merging, archives and the MCP server.
+Cloning a directory copies everything in it, including untracked and ignored files, local edits and Git's internal state, and nothing checks the files against a commit. A graft starts from the commit you choose, brings only the untracked and ignored files you ask for, verifies every reused file, and adds merging, archives and the MCP server.
 
 **Why not `git clone --shared` or `--reference`?**
 Both borrow Git objects from the original repository but still write every working file in full, and the clone breaks if the original's objects move or are garbage-collected. A graft shares file data through the filesystem and keeps its own snapshot of the objects it needs.

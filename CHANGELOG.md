@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `add --include PATTERN` and MCP `include` copy chosen untracked or ignored files, such as `.env`, into a new graft; `'*'` copies all of them. Nothing is copied by default.
+- A `.worktreeinclude` file at the root of the checkout sets default include patterns for every graft.
+- `git graft local-files` and the MCP tool `graft_local_files` list the checkout's untracked and ignored files, so an agent can choose what to bring.
+- `status`, `merge` and `remove` don't count included copies as changes until the graft edits them.
+
 ### Changed
 
 - On Linux filesystems that cannot clone files, such as ext4, a graft with local history now hard-links the primary's Git object files instead of exporting a copy of them, as `git clone --local` does. On a repository with 186 MB of objects, `add` takes 1.0 s instead of 16 s and a graft uses 80 MB instead of 324 MB. The graft and its primary then name the same object files, which Git never rewrites in place. Such a graft can read every object in the primary, as local history already does on Btrfs, XFS and APFS; set `graft.history` to `isolated` to keep the previous contents.
