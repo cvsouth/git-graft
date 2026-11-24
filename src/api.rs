@@ -197,6 +197,25 @@ pub struct ManagerName {
     pub manager: String,
 }
 
+/// Arguments of `hook set`: the command to run for one event.
+#[derive(Debug, Args)]
+pub struct SetHook {
+    /// When the command runs.
+    #[arg(value_enum)]
+    pub event: crate::workspace::hook::Event,
+    /// Program and arguments, started without a shell in the graft. Use -- before the program.
+    #[arg(last = true, num_args = 1.., required = true)]
+    pub argv: Vec<String>,
+}
+
+/// Arguments of `hook remove`: the event whose hook to unregister.
+#[derive(Debug, Args)]
+pub struct HookEvent {
+    /// The event whose hook to unregister.
+    #[arg(value_enum)]
+    pub event: crate::workspace::hook::Event,
+}
+
 #[cfg(test)]
 mod manager_tests {
     use super::*;

@@ -222,6 +222,9 @@ pub struct Summary {
     /// For prune, the archived unfinished attempts of the graft's request.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub archived_attempts: Vec<Value>,
+    /// For prune, the report of the `pre-archive` hook it ran for the graft.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<Value>,
 }
 
 fn summary(r: &Record, available: bool, reason: Option<&'static str>) -> Summary {
@@ -258,6 +261,7 @@ fn summary(r: &Record, available: bool, reason: Option<&'static str>) -> Summary
         reason,
         error: None,
         archived_attempts: Vec::new(),
+        hooks: Vec::new(),
     }
 }
 
@@ -2225,7 +2229,20 @@ pub fn retire(
     Ok(r)
 }
 
+#[cfg(test)]
 pub fn restore(p: &Project, name: &str, lease: &str) -> Result<Record> {
+    restore_locked(p, name, lease).map(|(r, _lock)| r)
+}
+
+/// Reopen the archived graft `name`. When this call reopened it, the graft's
+/// lock comes back still held, so the caller can go on working in the graft
+/// before any other command. A repeat of a finished restore returns the
+/// graft as it is, without the lock.
+pub(super) fn restore_locked(
+    p: &Project,
+    name: &str,
+    lease: &str,
+) -> Result<(Record, Option<WorkspaceLock>)> {
     validate_name(name)?;
     let registry = scan(p)?;
     registry.damaged_name(name)?;
@@ -2237,7 +2254,7 @@ pub fn restore(p: &Project, name: &str, lease: &str) -> Result<Record> {
     {
         let _lock = workspace_lock(p, name)?;
         verify(p, r)?;
-        return Ok(r.clone());
+        return Ok((r.clone(), None));
     }
     let mut r = known
         .iter()
@@ -2247,7 +2264,7 @@ pub fn restore(p: &Project, name: &str, lease: &str) -> Result<Record> {
     if r.transition.is_none() && !r.initialized {
         return Err(unfinished_creation(&r));
     }
-    let _lock = workspace_lock(p, name)?;
+    let lock = workspace_lock(p, name)?;
     if active.as_ref().is_some_and(|active| active.id != r.id) {
         return Err(fault(
             "already_exists",
@@ -2282,7 +2299,7 @@ pub fn restore(p: &Project, name: &str, lease: &str) -> Result<Record> {
         persist(p, &r)?;
     }
     resume(p, &mut r)?;
-    Ok(r)
+    Ok((r, Some(lock)))
 }
 
 /// Whether any graft may still be live. A damaged record counts as live:
@@ -2485,38 +2502,76 @@ fn open_existing_lock(p: &Project, name: &str) -> Result<WorkspaceLock> {
     try_lock(open_exclusive(&lock, name)?, name)
 }
 
-/// Archive eligible expired workspaces. Archives, foreign paths and refs are
-/// retained. A preview performs the same eligibility checks without writing.
-/// An error on one graft is reported on that graft, and prune goes on.
+/// What prune calls before it archives a graft: runs the project's
+/// `pre-archive` hook for the graft and returns the hook's report, or `None`
+/// when no hook is registered. It may release the project lock while the hook
+/// runs, and holds it again when it returns.
+pub(super) type PreArchive<'a> = &'a mut dyn FnMut(&Record) -> Result<Option<Value>>;
+
+#[cfg(test)]
 pub fn prune(p: &Project, apply: bool) -> Result<Vec<Summary>> {
+    prune_with(p, apply, &mut |_| Ok(None))
+}
+
+/// Archive eligible expired workspaces. Archives, foreign paths and refs are
+/// retained. A preview performs the same eligibility checks without writing,
+/// and never calls `pre_archive`. An error on one graft is reported on that
+/// graft, and prune goes on.
+pub(super) fn prune_with(
+    p: &Project,
+    apply: bool,
+    pre_archive: PreArchive<'_>,
+) -> Result<Vec<Summary>> {
     let mut result = Vec::new();
-    let records = scan(p)?.records;
-    for mut r in records.iter().cloned() {
+    let mut records = scan(p)?.records;
+    let ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
+    for id in ids {
+        let Some(mut r) = records.iter().find(|r| r.id == id).cloned() else {
+            continue;
+        };
         if r.status.retired() || now().saturating_sub(r.heartbeat) < LEASE_SECS {
             continue;
         }
-        let mut entry = match prune_one(p, &mut r, apply) {
+        let mut hooks = Vec::new();
+        let mut entry = match prune_one(p, &mut r, apply, pre_archive, &mut hooks) {
             Ok((reason, available, error)) => Summary {
                 error,
                 ..summary(&r, available, Some(reason))
             },
+            // Without the project lock, prune must not go on to other grafts.
+            Err(error) if error.is::<super::hook::Unlocked>() => return Err(error),
             Err(error) => Summary {
                 error: Some(format!("{error:#}")),
                 ..summary(&r, false, Some("error"))
             },
         };
+        if !hooks.is_empty() {
+            // The project lock may have been released while the hook ran.
+            // Other grafts can have been renewed, archived or changed since,
+            // so judge each of the rest by its record as it is now.
+            records = scan(p)?.records;
+        }
         entry.archived_attempts = attempts_of(&records, &r);
+        entry.hooks = hooks;
         result.push(entry);
     }
     Ok(result)
 }
 
+/// Whether an expired graft may be archived, judged from its files and refs.
+fn eligibility(r: &Record, detached: Option<usize>) -> Option<&'static str> {
+    prune_eligibility(r, detached).unwrap_or(Some("git_state_unverified"))
+}
+
 /// The prune reason for one expired graft, whether it is available, and why
-/// its checkout could not be verified when it is missing or replaced.
+/// its checkout could not be verified when it is missing or replaced. The
+/// report of a `pre-archive` hook run for the graft is added to `hooks`.
 fn prune_one(
     p: &Project,
     r: &mut Record,
     apply: bool,
+    pre_archive: PreArchive<'_>,
+    hooks: &mut Vec<Value>,
 ) -> Result<(&'static str, bool, Option<String>)> {
     if apply && r.retiring_to() == Some(Status::Dropped) {
         let _lock = open_existing_lock(p, &r.name)?;
@@ -2550,15 +2605,34 @@ fn prune_one(
                     "different_filesystem"
                 } else if exists(&archive)? {
                     "archive_occupied"
-                } else if let Some(reason) =
-                    prune_eligibility(r, endpoint?).unwrap_or(Some("git_state_unverified"))
-                {
-                    reason
-                } else if apply {
-                    begin_retirement(p, r, Status::Dropped, None)?;
-                    "archived"
                 } else {
-                    "eligible"
+                    let mut reason = eligibility(r, endpoint?);
+                    // The hook runs for a graft prune would archive, and for
+                    // one kept back only by uncommitted or ignored files,
+                    // which may be the hook's own to remove. A graft kept for
+                    // its commits, refs or stash is left as it is, hook unrun.
+                    if apply
+                        && matches!(reason, None | Some("dirty"))
+                        && let Some(entry) = pre_archive(r)?
+                    {
+                        let failed = entry["status"] == "failed";
+                        hooks.push(entry);
+                        reason = if failed {
+                            Some("hook_failed")
+                        } else {
+                            // The hook had the graft to itself; check again
+                            // that it is still the checkout Graft created.
+                            eligibility(r, verify_endpoint(p, r, &r.path)?)
+                        };
+                    }
+                    match reason {
+                        Some(reason) => reason,
+                        None if apply => {
+                            begin_retirement(p, r, Status::Dropped, None)?;
+                            "archived"
+                        }
+                        None => "eligible",
+                    }
                 }
             }
             Err(error) if crate::api::error_json(&error)["code"] == "workspace_busy" => "busy",
@@ -3342,6 +3416,78 @@ mod tests {
         let rows = serde_json::to_string(&recoverable(p)?)?;
         assert!(!rows.contains(&old_lease) && !rows.contains(&new_lease));
         assert!(!p.common.join("worktrees").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_runs_the_pre_archive_hook_only_where_it_can_matter() -> Result<()> {
+        let f = Fixture::new()?;
+        let p = &f.project;
+        let clean = f.expired_at_base("clean")?;
+        let littered = f.expired_at_base("littered")?;
+        let refused = f.expired_at_base("refused")?;
+        let worked = f.expired_at_base("worked")?;
+        fs::write(littered.path.join("made-by-setup"), "remove me")?;
+        git::bytes(
+            &worked.path,
+            &["commit", "-q", "--allow-empty", "-m", "work"],
+        )?;
+        let entry = |status: &str| json!({"event": "pre-archive", "status": status});
+        let mut called = Vec::new();
+        let mut hook = |r: &Record| -> Result<Option<Value>> {
+            called.push(r.name.clone());
+            if r.name == "refused" {
+                return Ok(Some(entry("failed")));
+            }
+            // The hook removes what the project's setup left in the graft.
+            let _ = fs::remove_file(r.path.join("made-by-setup"));
+            Ok(Some(entry("ok")))
+        };
+        let reasons = |entries: &[Summary]| -> Vec<(String, &'static str, usize)> {
+            let mut reasons: Vec<_> = entries
+                .iter()
+                .map(|e| (e.name.clone(), e.reason.unwrap_or_default(), e.hooks.len()))
+                .collect();
+            reasons.sort();
+            reasons
+        };
+        let own = |name: &str, reason: &'static str, hooks: usize| (name.to_owned(), reason, hooks);
+
+        // A preview checks the grafts as they are and runs no hook.
+        assert_eq!(
+            reasons(&prune_with(p, false, &mut hook)?),
+            [
+                own("clean", "eligible", 0),
+                own("littered", "dirty", 0),
+                own("refused", "eligible", 0),
+                own("worked", "changed", 0),
+            ]
+        );
+        let before = work_in(&refused.path)?;
+        let applied = prune_with(p, true, &mut hook)?;
+        assert_eq!(
+            reasons(&applied),
+            [
+                own("clean", "archived", 1),
+                own("littered", "archived", 1),
+                own("refused", "hook_failed", 1),
+                own("worked", "changed", 0),
+            ]
+        );
+        called.sort();
+        assert_eq!(called, ["clean", "littered", "refused"]);
+        assert_eq!(work_in(&refused.path)?, before);
+        assert_eq!(load(p, "refused")?.status, Status::Active);
+        assert_eq!(load(p, "worked")?.status, Status::Active);
+        assert!(!clean.path.exists() && !littered.path.exists());
+
+        // Prune stops at once when the project lock could not be taken again.
+        let again = f.expired_at_base("again")?;
+        let stopped = prune_with(p, true, &mut |_| {
+            Err(anyhow::anyhow!("lock failed").context(super::super::hook::Unlocked))
+        });
+        assert!(stopped.is_err_and(|error| error.is::<super::super::hook::Unlocked>()));
+        assert_eq!(load(p, &again.name)?.status, Status::Active);
         Ok(())
     }
 

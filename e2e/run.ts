@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { Context, Unavailable, execute, objectResult, type Scenario } from './harness.ts';
 
 const project = fileURLToPath(new URL('../', import.meta.url));
-const groups = ['lifecycle', 'storage', 'mixed-history', 'local-history', 'line-endings', 'dependencies', 'dependency-reuse', 'registered-managers', 'landing', 'checkout-faults', 'recovery', 'undo', 'safety', 'edge-cases', 'process-faults', 'mcp', 'workspace', 'space'];
+const groups = ['lifecycle', 'storage', 'mixed-history', 'local-history', 'line-endings', 'dependencies', 'dependency-reuse', 'registered-managers', 'landing', 'checkout-faults', 'recovery', 'undo', 'safety', 'edge-cases', 'process-faults', 'mcp', 'workspace', 'hooks', 'space'];
 const args = process.argv.slice(2);
 const group = args[0] === '--group' ? args[1] : undefined;
 if (args.length && (args.length !== 2 || !groups.includes(group ?? ''))) {
@@ -103,7 +103,7 @@ const advertisedCli = [...help.stdout.matchAll(/^  ([a-z][a-z-]+)\s{2,}/gm)]
   .map(match => match[1]).filter(name => name !== 'help').sort();
 // Keep the advertised contract even when a regression removes a command from discovery.
 // heartbeat is hidden from help, so it is not part of the advertised surface.
-const publicCli = 'add deps doctor exec list local-files lock mcp merge move prune remove repair restore status unlock'.split(' ');
+const publicCli = 'add deps doctor exec hook list local-files lock mcp merge move prune remove repair restore status unlock'.split(' ');
 const publicTools = 'add add_dependency exec list local_files merge remove renew restore status'
   .split(' ').map(name => 'graft_' + name);
 const coveredCli = new Set<string>();

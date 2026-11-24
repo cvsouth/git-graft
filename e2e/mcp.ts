@@ -157,7 +157,7 @@ class McpClient {
   }
 }
 
-async function withClient(
+export async function withClient(
   ctx: Context,
   allowExec: boolean,
   run: (client: McpClient) => Promise<void>,
@@ -176,7 +176,7 @@ function result(reply: JsonObject): JsonObject {
   return object(reply.result, 'JSON-RPC result');
 }
 
-async function initialize(client: McpClient, version = protocol): Promise<JsonObject> {
+export async function initialize(client: McpClient, version = protocol): Promise<JsonObject> {
   const info = result(await client.request('initialize', {
     protocolVersion: version,
     capabilities: {},
@@ -225,7 +225,7 @@ async function discover(client: McpClient, allowExec: boolean): Promise<Map<stri
   return catalog;
 }
 
-async function call(client: McpClient, name: string, args: JsonObject = {}, isError = false): Promise<JsonObject> {
+export async function call(client: McpClient, name: string, args: JsonObject = {}, isError = false): Promise<JsonObject> {
   const tool = result(await client.request('tools/call', { name, arguments: args }));
   assert.equal(tool.isError, isError, `${name}: ${JSON.stringify(tool)}`);
   const structured = object(tool.structuredContent, `${name} structured content`);

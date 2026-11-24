@@ -105,6 +105,80 @@ A shared install that Graft attached counts as the graft's own, not as local wor
 
 For an exact-source manual snapshot, use `deps share --snapshot --key KEY` (from the primary checkout) or `deps layer save NAME --key KEY` (from a graft), then `deps layer restore NAME --key KEY`. `deps layer remove NAME --key KEY` retires a saved layer: on every platform it moves the layer to `.git/graft/retained-layers/` and reports `retained_path`, so a patched install is never lost. Delete that directory yourself once you no longer need it; Graft never deletes it. Manual transfers require copy-on-write unless `--copy` is explicitly supplied. Review `--help` for leases and options. Treat installed layers as executable content shared within one trust domain.
 
+## Hooks
+
+A hook is a command of yours that Graft runs at a point in a graft's life. Use one for setup and cleanup that belongs to the project and not to Git: creating a database for the graft and dropping it again, writing a settings file that names the graft's port, or deleting a secret before the graft is archived.
+
+```sh
+git graft hook set post-add -- /opt/project/bin/graft-setup
+git graft hook set pre-archive -- /opt/project/bin/graft-teardown
+git graft hook list
+git graft hook remove post-add
+```
+
+Each event has at most one hook, and `hook set` replaces it. `hook remove` succeeds when none was registered and says so in `removed`. Hooks are stored in the project's private Graft state, like package manager registrations: they are not committed, and they apply to this clone only. Hook registration is CLI-only.
+
+| Event | When the hook runs |
+| --- | --- |
+| `post-add` | After `add` has created the graft and recorded it active, before `add` replies. |
+| `pre-archive` | Before `remove`, `merge` or `prune --apply` archives a graft: after the lease is checked and before Graft looks for local changes or unmerged work. `merge --undo` runs no hook. |
+| `post-restore` | After `restore` has reopened an archived graft, before it replies. |
+
+Graft starts the program directly, without a shell, with the graft as its working directory. It waits for the hook to exit and sets no time limit. Register the program by an absolute path outside the grafts. A relative path with a directory in it is looked up inside the graft, so the graft's own files would decide what runs. The hook gets the environment of the `git graft` command, or of the MCP host, without `GIT_GRAFT_LEASE` and without the variables that point Git at another repository, such as `GIT_DIR`. A hook never receives a lease. Graft adds these variables:
+
+| Variable | Value |
+| --- | --- |
+| `GIT_GRAFT_HOOK` | The event: `post-add`, `pre-archive` or `post-restore`. |
+| `GIT_GRAFT_NAME` | The graft's name. |
+| `GIT_GRAFT_PATH` | The graft's path, which is also the working directory. |
+| `GIT_GRAFT_PRIMARY` | The primary checkout's path. |
+| `GIT_GRAFT_BRANCH` | The branch the graft was created on. Empty for a graft created with `--detach`. |
+| `GIT_GRAFT_BASE` | The commit the graft was created from. Empty for a graft created with `--orphan`. |
+| `GIT_GRAFT_PORT` | The graft's port, the one `exec` passes as `PORT`. `restore` can assign a different one. |
+
+For example, a setup script registered for both `post-add` and `post-restore`, and a teardown script registered for `pre-archive`:
+
+```sh
+#!/bin/sh
+# graft-setup: a database and a settings file for this graft.
+set -e
+createdb "app_$GIT_GRAFT_NAME"
+printf 'DATABASE=app_%s\nPORT=%s\n' "$GIT_GRAFT_NAME" "$GIT_GRAFT_PORT" > settings.local
+```
+
+```sh
+#!/bin/sh
+# graft-teardown: safe to run more than once.
+set -e
+dropdb --if-exists "app_$GIT_GRAFT_NAME"
+rm -f settings.local
+```
+
+If the project ignores `settings.local`, a plain `remove` would refuse the graft with `local_changes` because of that file. The teardown script deletes it first, so `remove` proceeds.
+
+A command that triggers a registered hook reports it in a `hooks` array. With no hook registered for the event, the result has no `hooks` field.
+
+```json
+{"event": "post-add", "status": "ok", "exit_code": 0, "stdout": "", "stderr": "", "stdout_truncated": false, "stderr_truncated": false}
+```
+
+`status` is `ok` for exit code 0, `failed` for any other exit, and `skipped` when the hook was not run. `stdout` and `stderr` are captured as for `exec` and cut at 256 KiB each. A `failed` entry whose hook could not be started, and every `skipped` entry, has a `reason`; `exit_code` is then `null`, as it is for a hook ended by a signal. `prune --apply` reports the hook in the `hooks` array of that graft's entry.
+
+What a failure means depends on the event:
+
+- A failing `post-add` or `post-restore` hook does not fail the command. The graft exists, is active and keeps its lease; Graft never deletes it. Read the entry, then repair the setup by hand or archive the graft.
+- A failing `pre-archive` hook refuses `remove` and `merge` with `hook_failed`, and `details.hooks` carries the entry. Graft itself has changed nothing: the graft, its files and the primary are as the hook left them. `prune --apply` keeps that graft with the reason `hook_failed` and goes on with the others.
+
+A `pre-archive` hook must be safe to run more than once for the same graft. It runs before Graft knows whether the command will succeed. If `merge` then stops on a conflict, or `remove` on `unmerged_work`, the graft stays active with the hook's cleanup already done, and the hook runs again on the retry. `prune --apply` runs it for a graft it would archive and for one held back only by uncommitted or ignored files, which the hook may remove; a graft kept for its commits, refs or stash is left alone, hook unrun. A `prune` preview runs no hook, so it can report `dirty` for a graft whose hook would remove the files.
+
+A retried command that only repeats an earlier result runs no hook and has no `hooks` field: an `add` with the same `request_id` that returns the graft already created, a repeated `restore`, or a repeated `remove` or `merge` that returns its receipt. If `add` or `restore` is interrupted while its hook runs, the retry returns the graft without running the hook again, so run the setup by hand.
+
+While a hook runs, Graft holds that graft's lock and no project-wide lock. Other commands on the same graft report `workspace_busy`, and other grafts can be added, merged and removed meanwhile. A process that a hook leaves running is not tracked.
+
+Over MCP, hooks run on `graft_add`, `graft_remove`, `graft_merge` and `graft_restore` only when the host was started with `--allow-exec`. Without it they are not run, the entry has `"status": "skipped"`, and the command goes on, so `graft_remove` and `graft_merge` archive the graft without its `pre-archive` hook. The CLI always runs hooks.
+
+If the hook registry cannot be read, `add`, `remove`, `merge` and `restore` refuse before changing anything, and `prune --apply` keeps each graft it would have archived, with the reason `error`.
+
 ## Merge and recover
 
 `merge` integrates committed work into a local branch by fast-forward, a merge commit or `--squash`, subject to the destination's state. `--commit MESSAGE` stages nonignored changes in the graft first; use it only when all such changes belong in the task. If `--commit` detects a path with both staged and unstaged changes, it returns `partially_staged` without replacing the staged version. Commit the staged version or unstage it explicitly before retrying. This also applies to a staged deletion whose path has been recreated. Conflicts remain available for inspection. `--reconcile` supports a narrow offline npm lockfile conflict case; other conflicts need normal resolution. Ignored files block a normal merge; `--discard-ignored` retains them in the archived graft.
@@ -191,7 +265,8 @@ These codes and fields tell you that Graft kept something instead of deleting or
 | `checkout_recovery_required` | A checkout update of the primary was interrupted. `details.paths` lists files that need attention. | Retry the same merge or undo with the same lease. See [interrupted checkout update](#interrupted-checkout-update). |
 | `checkout_update_set_aside` | An interrupted checkout update can no longer finish because its branch moved or is no longer checked out. The journal stays at `details.recovery_path`. | Check `git status` in the primary, then retry the merge. |
 | `git_busy` | A Git lock or an unreadable index in the graft or primary is held by a command Graft did not start, or cannot prove has exited. | Wait for the Git command to finish. Remove a lock only once no Git command is running. |
-| `workspace_busy` | Another Graft command, or a process started by `exec` (including background jobs), holds the graft. | Wait, or stop the background job, then retry. |
+| `workspace_busy` | Another Graft command, a running hook, or a process started by `exec` (including background jobs), holds the graft. | Wait, or stop the background job, then retry. |
+| `hook_failed` | The project's `pre-archive` hook exited with a non-zero code or could not be started, so `remove` or `merge` did not archive the graft. `details.hooks` carries its exit code and output. Graft changed nothing; the hook may have. As a prune `reason`, the same for one expired graft; prune went on with the others. | Fix what the hook reports, then retry. The hook runs again. See [hooks](#hooks). |
 | `kept` | A `gc --purge-cache` field listing saved layers (`saved_layer`) and the registered shared layer (`registered_shared_layer`) it did not delete. | Retire them with `deps layer remove` when no longer needed. |
 | `retained`, `retained_path` | `deps layer remove` moved the layer to `.git/graft/retained-layers/` instead of deleting it. | Delete `retained_path` yourself once you no longer need the install. |
 | prune `reason` `error`, `archive_occupied`, `busy` | Prune could not check or archive this graft (`error` carries the message), found its archive path occupied, or found it busy. It went on with the others. | Fix the named problem, then rerun `prune`. |

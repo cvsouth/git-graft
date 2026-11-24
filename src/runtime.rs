@@ -105,7 +105,9 @@ impl Runtime {
         Self::capture_command(command, program)
     }
 
-    fn capture_command(mut command: Command, program: &str) -> Result<Value> {
+    /// Start `command` without input, wait for it and return its exit code
+    /// and its output, each stream cut at [`OUTPUT_LIMIT`].
+    pub(crate) fn capture_command(mut command: Command, program: &str) -> Result<Value> {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

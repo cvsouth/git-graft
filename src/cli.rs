@@ -36,6 +36,19 @@ Examples:
     Exec(api::Exec),
     /// Install and reuse dependencies.
     Deps(Deps),
+    /// Run your own command when a graft is added, about to be archived or restored.
+    #[command(after_help = "\
+Examples:
+  git graft hook set post-add -- /usr/local/bin/prepare-graft   Run after every add
+  git graft hook list                                           Show registered hooks
+  git graft hook remove post-add                                Unregister it
+
+A hook is started without a shell, in the graft, and is told about the graft
+through GIT_GRAFT_HOOK, GIT_GRAFT_NAME, GIT_GRAFT_PATH, GIT_GRAFT_PRIMARY,
+GIT_GRAFT_BRANCH, GIT_GRAFT_BASE and GIT_GRAFT_PORT. A pre-archive hook that
+fails stops remove, merge and prune from archiving the graft, and can run more
+than once for the same graft.")]
+    Hook(HookArgs),
     /// Merge a graft's commits into a local branch, then archive the graft.
     #[command(after_help = "\
 Examples:
@@ -155,6 +168,22 @@ enum ManagerCommand {
     Remove(api::ManagerName),
 }
 
+#[derive(Debug, Args)]
+pub struct HookArgs {
+    #[command(subcommand)]
+    command: HookCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    /// Register the command for an event, replacing the one already registered.
+    Set(api::SetHook),
+    /// List registered hooks.
+    List,
+    /// Unregister the hook for an event.
+    Remove(api::HookEvent),
+}
+
 impl From<Cmd> for workspace::Command {
     fn from(cmd: Cmd) -> Self {
         use workspace::Command as Op;
@@ -179,6 +208,11 @@ impl From<Cmd> for workspace::Command {
                     ManagerCommand::List => Op::ListManagers,
                     ManagerCommand::Remove(args) => Op::UnregisterManager(args),
                 },
+            },
+            Cmd::Hook(HookArgs { command }) => match command {
+                HookCommand::Set(args) => Op::SetHook(args),
+                HookCommand::List => Op::ListHooks,
+                HookCommand::Remove(args) => Op::RemoveHook(args.event),
             },
             Cmd::Merge(args) => Op::land(args),
             Cmd::Remove(args) => Op::Drop(args),

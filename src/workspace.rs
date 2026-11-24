@@ -1,4 +1,5 @@
 //! Graft creation, inspection, integration and recoverable retirement.
+pub(crate) mod hook;
 mod land;
 mod objects;
 mod registry;
@@ -33,6 +34,9 @@ pub enum Command {
     RegisterManager(api::RegisterManager),
     ListManagers,
     UnregisterManager(api::ManagerName),
+    SetHook(api::SetHook),
+    ListHooks,
+    RemoveHook(hook::Event),
     AddDep(api::AddDep),
     SeedLayer(api::SeedLayer),
     /// Save, restore or forget; the string is the action.
@@ -122,6 +126,7 @@ fn spawn(
     mut args: Spawn,
     lock: &std::fs::File,
     mut builds: crate::registry::Held,
+    hooks: hook::Policy,
 ) -> Result<Value> {
     if let Some(id) = &mut args.request_id {
         *id = uuid::Uuid::parse_str(id)
@@ -246,6 +251,9 @@ fn spawn(
         })
         .and_then(|oid| objects::CheckoutDiscovery::start(origin, oid, local));
     crate::trace::mark("start discovery");
+    // Read before anything is reserved, so an unreadable hook registry
+    // refuses the add instead of leaving a graft whose hook never ran.
+    let post_add = hook::registered(p, hook::Event::PostAdd)?;
     let (mut r, _graft_lock) = loop {
         match registry::reserve_locked(
             p,
@@ -313,7 +321,15 @@ fn spawn(
             json!({"name":r.name,"lease":r.lease,"path":r.path,"recovery":format!("Retry the same request: Graft archives this attempt whole and builds the graft again. {guard}")}),
         ));
     }
-    with_leftovers(p, &r)
+    let reply = with_leftovers(p, &r)?;
+    let Some(argv) = post_add else {
+        return Ok(reply);
+    };
+    // The graft is recorded and usable whatever its hook does. The hook runs
+    // under the graft lock taken at reservation; the build lock is released.
+    let mut hooks = hook::Runner::new(hooks, lock, None);
+    hooks.after(p, hook::Event::PostAdd, &argv, &r)?;
+    Ok(hooks.report(reply))
 }
 
 /// The reply for a finished graft, with its lease.
@@ -600,7 +616,7 @@ fn destination_contains(p: &Project, plan: &crate::landing::Plan) -> Result<bool
     }
 }
 
-fn land_workspace(p: &Project, opts: &api::Land) -> Result<Value> {
+fn land_workspace(p: &Project, opts: &api::Land, hooks: &mut hook::Runner<'_>) -> Result<Value> {
     let _lock = registry::workspace_lock(p, &opts.name)?;
     if let Ok(r) = registry::load_retired(p, &opts.name, &opts.lease)
         && r.plan.as_ref().is_some_and(|plan| plan.target == opts.into)
@@ -618,6 +634,7 @@ fn land_workspace(p: &Project, opts: &api::Land) -> Result<Value> {
     ensure!(r.status == Status::Active, "graft creation is incomplete");
     // Verify the graft is where its record says before touching its files.
     registry::preflight_retire(p, &r)?;
+    hooks.pre_archive(p, &mut r)?;
     // We hold the workspace lock, which a killed merge --commit has released.
     crate::landing::reclaim_staging_lock(&r.path)?;
     if let Some(plan) = &r.plan {
@@ -688,7 +705,11 @@ fn keep_advanced(p: &Project, mut r: Record) -> Result<Value> {
     with_attempts(p, &r, value)
 }
 
-fn drop_workspace(p: &Project, opts: &api::DropWorkspace) -> Result<Value> {
+fn drop_workspace(
+    p: &Project,
+    opts: &api::DropWorkspace,
+    hooks: &mut hook::Runner<'_>,
+) -> Result<Value> {
     let _lock = registry::workspace_lock(p, &opts.name)?;
     // Replay the receipt of an earlier remove. Anything else archived with
     // this lease gets authenticate's graft_archived error and restore hint.
@@ -706,6 +727,10 @@ fn drop_workspace(p: &Project, opts: &api::DropWorkspace) -> Result<Value> {
             return retire(p, &r.name, &r.lease, Status::Dropped);
         }
         registry::preflight_retire(p, &r)?;
+        // A graft whose creation never finished has no hook to undo.
+        if r.status == Status::Active && !r.placing() {
+            hooks.pre_archive(p, &mut r)?;
+        }
         if let Some(plan) = &r.plan {
             ensure!(
                 opts.discard,
@@ -806,6 +831,12 @@ fn invoking(p: &Project, location: Option<registry::Location>, repo: &Path) -> R
 }
 
 pub fn run(repo: &Path, command: Command) -> Result<Value> {
+    // The command line is the person's own, so it always runs their hooks.
+    run_with(repo, command, hook::Policy::Run)
+}
+
+/// [`run`] for a caller that says whether it may run the project's hooks.
+pub fn run_with(repo: &Path, command: Command, hooks: hook::Policy) -> Result<Value> {
     // Resolving the project is read-only, so it runs beside the version check;
     // a version failure is still reported first.
     let (version, located) = std::thread::scope(|scope| {
@@ -840,6 +871,17 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             None => Ok(json!({"managers": []})),
         };
     }
+    // Listing hooks, or unregistering one, creates no Graft state in a
+    // project that has none: there is no hook to find there.
+    if let Command::ListHooks | Command::RemoveHook(_) = command {
+        let existing = Project::open_existing_at(paths?)?;
+        return match (&command, existing) {
+            (Command::RemoveHook(event), Some((project, _lock))) => hook::remove(&project, *event),
+            (Command::RemoveHook(event), None) => Ok(hook::unregistered(*event, false)),
+            (_, Some((project, _lock))) => hook::list(&project),
+            (_, None) => Ok(json!({"hooks": []})),
+        };
+    }
     let (p, lock) = Project::open_at(paths?, !matches!(&command, Command::Spawn(_)))?;
     let p = &p;
     // Commands that only read, or change one graft's record, run beside
@@ -853,7 +895,9 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
         | Command::Env(_)
         | Command::Heartbeat(_)
         | Command::Lock { .. }
-        | Command::Unlock(_) => None,
+        | Command::Unlock(_)
+        // Registering a hook changes nothing a build reads.
+        | Command::SetHook(_) => None,
         Command::Gc(args) if !args.apply => None,
         Command::Spawn(_) => Some(p.lock_builds(true)?),
         _ => Some(p.lock_builds(false)?),
@@ -889,6 +933,8 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
         }
         Command::ListManagers => return crate::package_manager::list(p),
         Command::UnregisterManager(a) => return crate::package_manager::unregister(p, &a.manager),
+        Command::SetHook(a) => return hook::set(p, a),
+        Command::ListHooks | Command::RemoveHook(_) => unreachable!("handled above"),
         Command::RegisterManager(a) => match (&a.workspace, &a.lease) {
             (Some(name), Some(lease)) => {
                 let source = registry::authenticate(p, name, lease)?;
@@ -911,12 +957,36 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             };
             let origin = invoking(p, location, repo)?;
             let builds = builds.context("adding a graft requires the build lock")?;
-            return spawn(p, &origin, args, &lock, builds);
+            return spawn(p, &origin, args, &lock, builds, hooks);
         }
         Command::SeedLayer(a) => return engine::seed_layer(p, a),
-        Command::Drop(a) => return drop_workspace(p, a),
-        Command::Land(a) => return land_workspace(p, a),
-        Command::Restore(a) => return with_leftovers(p, &registry::restore(p, &a.name, &a.lease)?),
+        Command::Drop(a) => {
+            let mut hooks = hook::Runner::new(hooks, &lock, builds);
+            let dropped = drop_workspace(p, a, &mut hooks)?;
+            return Ok(hooks.report(dropped));
+        }
+        Command::Land(a) => {
+            let mut hooks = hook::Runner::new(hooks, &lock, builds);
+            let landed = land_workspace(p, a, &mut hooks)?;
+            return Ok(hooks.report(landed));
+        }
+        Command::Restore(a) => {
+            // Read first, so an unreadable hook registry refuses the restore
+            // instead of reopening a graft whose hook never ran.
+            let post_restore = hook::registered(p, hook::Event::PostRestore)?;
+            let (r, reopened) = registry::restore_locked(p, &a.name, &a.lease)?;
+            let reply = with_leftovers(p, &r)?;
+            // A repeated restore returns the graft without running the hook
+            // again. One this call reopened keeps the graft's lock for it.
+            let (Some(argv), Some(_graft_lock), Status::Active) =
+                (post_restore, reopened, r.status)
+            else {
+                return Ok(reply);
+            };
+            let mut hooks = hook::Runner::new(hooks, &lock, builds);
+            hooks.after(p, hook::Event::PostRestore, &argv, &r)?;
+            return Ok(hooks.report(reply));
+        }
         Command::UndoLand(a) => {
             let r = registry::load_retired(p, &a.name, &a.lease)?;
             let plan = r.plan.as_ref().context("graft was not archived by merge")?;
@@ -945,7 +1015,8 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             return Ok(summary(&registry::repair(p, &a.name, &a.lease, path)?));
         }
         Command::Gc(a) => {
-            let retained = registry::prune(p, a.apply)?;
+            let mut hooks = hook::Runner::new(hooks, &lock, builds);
+            let retained = registry::prune_with(p, a.apply, &mut |r| hooks.before_prune(p, r))?;
             let cache = if !a.purge_cache {
                 json!({"requested":false,"purged":false})
             } else {

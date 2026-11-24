@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 
 use crate::api::{self, AddDep, DropWorkspace, Exec, Land, Name, Owned};
-use crate::workspace::{self, Command, Spawn};
+use crate::workspace::{self, Command, Spawn, hook};
 
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 
@@ -55,9 +55,9 @@ fn parse<T: DeserializeOwned>(args: Map<String, Value>) -> Result<T, ErrorData> 
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
         let instructions = if self.allow_exec {
-            "Running commands and installing dependencies in grafts is enabled by the host."
+            "Running commands and installing dependencies in grafts is enabled by the host. Hooks the project's owner registered run when a graft is added, merged, removed or restored; the hooks array of a result reports them."
         } else {
-            "Running commands and installing dependencies in grafts is disabled; the host must start with --allow-exec to enable it."
+            "Running commands and installing dependencies in grafts is disabled; the host must start with --allow-exec to enable it. Hooks the project's owner registered are not run either; the hooks array of a result reports them as skipped."
         };
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
@@ -195,7 +195,14 @@ impl ServerHandler for Server {
             }
         };
         let repo = self.repo.clone();
-        let result = tokio::task::spawn_blocking(move || workspace::run(&repo, op))
+        // A hook is a command of the project's owner. Like graft_exec, it
+        // runs for an agent only when the host allows running commands.
+        let hooks = if self.allow_exec {
+            hook::Policy::Run
+        } else {
+            hook::Policy::Skip
+        };
+        let result = tokio::task::spawn_blocking(move || workspace::run_with(&repo, op, hooks))
             .await
             .map_err(|e| {
                 ErrorData::internal_error(format!("Graft operation failed to join: {e}"), None)

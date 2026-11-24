@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A `.worktreeinclude` file at the root of the checkout sets default include patterns for every graft.
 - `git graft local-files` and the MCP tool `graft_local_files` list the checkout's untracked and ignored files, so an agent can choose what to bring.
 - `status`, `merge` and `remove` don't count included copies as changes until the graft edits them.
+- `git graft hook set|list|remove` registers a command of yours to run at `post-add`, `pre-archive` or `post-restore`, for a project's own setup and cleanup such as creating and dropping a per-graft database. A failing `pre-archive` hook stops `remove`, `merge` and `prune --apply` from archiving that graft with `hook_failed`.
+- Results of `add`, `merge`, `remove`, `restore` and `prune --apply` report a registered hook in a `hooks` array. MCP hosts run hooks only with `--allow-exec` and report them as skipped otherwise; only the CLI registers them.
 
 ### Changed
 
