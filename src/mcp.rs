@@ -65,7 +65,7 @@ impl ServerHandler for Server {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(format!(
-                "{instructions} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for the ones to bring, or [\"*\"] for all. Omitting include uses the project's .worktreeinclude file if it has one, and copies nothing otherwise. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
+                "{instructions} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for just the ones to bring. Prefer naming them: [\"*\"] copies all of them, including build output and directories such as target/ and .venv/, which can be large. Omitting include uses the project's .worktreeinclude file if it has one, and copies nothing otherwise. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
             ))
     }
 
@@ -77,7 +77,7 @@ impl ServerHandler for Server {
         let mut tools = vec![
             tool::<Spawn>(
                 "graft_add",
-                "Create a graft: an independent copy of the repository with its own branch. Returns the graft's path and lease; keep the lease, it authorizes every later call. Omit history for normal work (the project setting defaults to local, which reuses the trusted clone's Git objects). Choose isolated to keep unrelated objects such as staged blobs or other branches' commits out. Untracked and ignored files, such as .env, are not copied unless include names them (see graft_local_files) or the project has a .worktreeinclude file; [\"*\"] copies all of them.",
+                "Create a graft: an independent copy of the repository with its own branch. Returns the graft's path and lease; keep the lease, it authorizes every later call. Omit history for normal work (the project setting defaults to local, which reuses the trusted clone's Git objects). Choose isolated to keep unrelated objects such as staged blobs or other branches' commits out. Untracked and ignored files, such as .env, are not copied unless include names them (see graft_local_files) or the project has a .worktreeinclude file. Name what the task needs; [\"*\"] copies all of them, including large build and environment directories.",
                 false,
                 false,
             ),
