@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
-use crate::{api, engine, git, layer, registry::Project, runtime::Runtime, storage};
+use crate::{api, engine, git, include, layer, registry::Project, runtime::Runtime, storage};
 pub(crate) use objects::{
     HISTORY_CACHE_DIR, HISTORY_CACHE_MARKER, history_cache_root, verify_history_cache_generation,
 };
@@ -23,6 +23,8 @@ pub(crate) use api::Spawn;
 pub enum Command {
     Spawn(Spawn),
     List,
+    /// List the invoking checkout's untracked and ignored files.
+    LocalFiles,
     Status(api::Name),
     Doctor,
     Heartbeat(api::Owned),
@@ -127,6 +129,23 @@ fn spawn(
             .to_string();
     }
     crate::registry::validate_name(&args.name)?;
+    let populated = args.orphan.is_none() && !args.no_checkout;
+    if let Some(patterns) = &args.include {
+        include::validate(patterns)?;
+        ensure!(
+            patterns.is_empty() || populated,
+            "include requires a populated checkout"
+        );
+    }
+    let include = if populated {
+        include::select(origin, args.include.as_deref())?
+    } else {
+        None
+    };
+    ensure!(
+        include.is_none() || origin.join(".git").symlink_metadata().is_ok(),
+        "include needs a checkout with working files; this repository is bare"
+    );
     let mut request = serde_json::to_value(&args)?;
     let previous = args
         .request_id
@@ -261,6 +280,7 @@ fn spawn(
         sparse: &args.sparse,
         no_checkout: args.no_checkout,
         no_deps: args.no_deps,
+        include: include.as_ref(),
         locked: args.lock.then(|| args.reason.unwrap_or_default()),
     };
     // The graft lock keeps every other command off this graft and its
@@ -335,6 +355,8 @@ struct Creation<'a> {
     sparse: &'a [String],
     no_checkout: bool,
     no_deps: bool,
+    /// What to copy from the invoking checkout besides the commit's files.
+    include: Option<&'a include::Patterns>,
     /// The lock reason, when the graft is created locked.
     locked: Option<String>,
 }
@@ -386,6 +408,15 @@ fn create(
             checkout["registered_dependencies"] = json!(registered);
         }
     }
+    // Copy chosen untracked and ignored files last, so they never replace
+    // the checkout or an attached install.
+    if c.base.is_some()
+        && !c.no_checkout
+        && let Some(patterns) = c.include
+    {
+        checkout["included"] = include::copy(origin, &r.path, patterns, !c.sparse.is_empty())?;
+        crate::trace::mark("include");
+    }
     r.storage = checkout;
     r.locked.clone_from(&c.locked);
     Ok(())
@@ -421,6 +452,13 @@ fn without_attached_install(
     found
 }
 
+/// Drop from `found` the files Graft itself put in the graft at `add` and
+/// the graft has not changed: the attached install and the included copies.
+fn without_graft_files(path: &Path, storage: &Value, found: Vec<git::Change>) -> Vec<git::Change> {
+    let found = without_attached_install(path, storage, found);
+    include::without_unchanged_copies(path, storage, found)
+}
+
 /// Which command checks that a graft holds no unrecorded work.
 #[derive(Clone, Copy)]
 enum Retiring {
@@ -439,14 +477,15 @@ const LISTED_CHANGES: usize = 200;
 /// rest of the graft, never delete them. `merge` has no such option.
 ///
 /// The `node_modules` that Graft itself attached is not local work; see
-/// `without_attached_install`.
+/// `without_attached_install`. Nor are the untracked and ignored files it
+/// copied in at `add` while unchanged; see `include::without_unchanged_copies`.
 fn clean(path: &Path, allow_ignored: bool, retiring: Retiring, storage: &Value) -> Result<()> {
     git::check_idle(path)?;
     let mut found: Vec<_> = git::changes(path)?
         .into_iter()
         .filter(|change| !(allow_ignored && change.status == "!!"))
         .collect();
-    found = without_attached_install(path, storage, found);
+    found = without_graft_files(path, storage, found);
     if found.is_empty() {
         return Ok(());
     }
@@ -590,7 +629,7 @@ fn land_workspace(p: &Project, opts: &api::Land) -> Result<Value> {
     }
     if !opts.discard_ignored {
         ensure!(
-            !without_attached_install(&r.path, &r.storage, git::changes(&r.path)?)
+            !without_graft_files(&r.path, &r.storage, git::changes(&r.path)?)
                 .iter()
                 .any(|c| c.status == "!!"),
             "graft has ignored files, such as build output; rerun with --discard-ignored to keep them in its archive"
@@ -737,11 +776,31 @@ fn report_status(p: &Project, name: &str) -> Result<Value> {
             git::symbolic_ref(&r.path, "HEAD")?
                 .and_then(|s| s.strip_prefix("refs/heads/").map(str::to_owned))
         );
-        let changes = git::changes(&r.path)?;
+        // Copies made at add are not changes until the graft changes them.
+        let changes =
+            include::without_unchanged_copies(&r.path, &r.storage, git::changes(&r.path)?);
         result["change_count"] = json!(changes.len());
         result["changes"] = json!(changes.iter().take(200).collect::<Vec<_>>());
     }
     with_attempts(p, &r, result)
+}
+
+/// The checkout a command runs from: the primary, or the active graft it
+/// was invoked inside.
+fn invoking(p: &Project, location: Option<registry::Location>, repo: &Path) -> Result<PathBuf> {
+    let Some(location) = location else {
+        return Ok(p.repo.clone());
+    };
+    // A child can start from a commit that only its parent workspace owns.
+    let parent = registry::load(p, &location.name)?;
+    ensure!(
+        parent.id == location.id
+            && parent.status == Status::Active
+            && dunce::canonicalize(repo)?.starts_with(&parent.path),
+        "the invoking graft moved or is no longer active"
+    );
+    registry::verify(p, &parent)?;
+    Ok(parent.path)
 }
 
 pub fn run(repo: &Path, command: Command) -> Result<Value> {
@@ -786,6 +845,7 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
     let builds = match &command {
         Command::Doctor
         | Command::List
+        | Command::LocalFiles
         | Command::ListManagers
         | Command::Status(_)
         | Command::Env(_)
@@ -800,6 +860,7 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
     match &command {
         Command::Doctor
         | Command::List
+        | Command::LocalFiles
         | Command::ListManagers
         | Command::Status(_)
         | Command::Env(_) => {}
@@ -840,24 +901,12 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             _ => anyhow::bail!("--graft and --lease must be given together"),
         },
         Command::Status(a) => return report_status(p, &a.name),
+        Command::LocalFiles => return include::overview(&invoking(p, location, repo)?),
         Command::Spawn(_) => {
             let Command::Spawn(args) = command else {
                 unreachable!()
             };
-            let origin = if let Some(location) = location {
-                // A child can start from a commit that only its parent workspace owns.
-                let parent = registry::load(p, &location.name)?;
-                ensure!(
-                    parent.id == location.id
-                        && parent.status == Status::Active
-                        && dunce::canonicalize(repo)?.starts_with(&parent.path),
-                    "the invoking graft moved or is no longer active"
-                );
-                registry::verify(p, &parent)?;
-                parent.path
-            } else {
-                p.repo.clone()
-            };
+            let origin = invoking(p, location, repo)?;
             let builds = builds.context("adding a graft requires the build lock")?;
             return spawn(p, &origin, args, &lock, builds);
         }

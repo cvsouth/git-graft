@@ -40,6 +40,14 @@ pub struct Spawn {
     #[arg(long)]
     #[serde(default)]
     pub no_deps: bool,
+    /// Copy untracked or ignored files from the checkout, such as `.env`.
+    ///
+    /// Each entry is a .gitignore-style pattern matched against files Git does not track, for example [".env", "config/*.local.json"], or ["*"] for every one of them.
+    /// Omit to use the patterns in the checkout's .worktreeinclude file, if it has one; otherwise nothing is copied. An empty list copies nothing.
+    /// Copies never replace a file of the checkout, and merge and remove ignore them until they change.
+    #[arg(long, value_name = "PATTERN", conflicts_with_all = ["orphan", "no_checkout"])]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
     /// Name of the new private branch at the selected base.
     #[arg(short = 'b', long, conflicts_with_all = ["detach", "orphan"])]
     pub branch: Option<String>,
@@ -96,6 +104,13 @@ impl Spawn {
             "sparse requires a populated checkout"
         );
         anyhow::ensure!(s.reason.is_none() || s.lock, "a lock reason requires lock");
+        anyhow::ensure!(
+            s.include.as_ref().is_none_or(Vec::is_empty) || (s.orphan.is_none() && !s.no_checkout),
+            "include requires a populated checkout"
+        );
+        if let Some(patterns) = &s.include {
+            crate::include::validate(patterns)?;
+        }
         s.no_deps |= no_deps;
         Ok(s)
     }

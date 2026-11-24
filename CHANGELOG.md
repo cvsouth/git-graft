@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `add --include PATTERN` and MCP `include` copy chosen untracked or ignored files, such as `.env`, into a new graft; `'*'` copies all of them. Nothing is copied by default.
+- A `.worktreeinclude` file at the root of the checkout sets default include patterns for every graft.
+- `git graft local-files` and the MCP tool `graft_local_files` list the checkout's untracked and ignored files, so an agent can choose what to bring.
+- `status`, `merge` and `remove` don't count included copies as changes until the graft edits them.
+
 ## [0.2.0] - 2026-11-22
 
 **Upgrade from 0.1.0:** after a restart, 0.1.0 can refuse every command with `graft namespace ownership is unverified`. 0.2.0 fixes this and upgrades existing state automatically. Don't downgrade afterwards.

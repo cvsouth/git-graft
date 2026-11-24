@@ -5,6 +5,7 @@ mod cli;
 mod collision;
 mod engine;
 mod git;
+mod include;
 mod landing;
 mod layer;
 mod mcp;

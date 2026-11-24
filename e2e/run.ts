@@ -103,8 +103,8 @@ const advertisedCli = [...help.stdout.matchAll(/^  ([a-z][a-z-]+)\s{2,}/gm)]
   .map(match => match[1]).filter(name => name !== 'help').sort();
 // Keep the advertised contract even when a regression removes a command from discovery.
 // heartbeat is hidden from help, so it is not part of the advertised surface.
-const publicCli = 'add deps doctor exec list lock mcp merge move prune remove repair restore status unlock'.split(' ');
-const publicTools = 'add add_dependency exec list merge remove renew restore status'
+const publicCli = 'add deps doctor exec list local-files lock mcp merge move prune remove repair restore status unlock'.split(' ');
+const publicTools = 'add add_dependency exec list local_files merge remove renew restore status'
   .split(' ').map(name => 'graft_' + name);
 const coveredCli = new Set<string>();
 const coveredTools = new Set<string>();
