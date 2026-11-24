@@ -853,17 +853,17 @@ export const cases: Scenario[] = [
       ctx.command('git', ['config', '--local', '--unset-all', 'graft.history'], ctx.repo);
       const unrelated = ctx.git(['commit-tree', 'HEAD^{tree}', '-p', 'HEAD', '-m', 'unrelated']);
       ctx.git(['update-ref', 'refs/heads/unrelated', unrelated]);
-      const probe = object(ctx.cli(['doctor']).source_storage, 'source filesystem capability');
+      const shared = object(ctx.cli(['doctor']).history_sharing, 'history sharing capability').shared;
       const defaultArgs = { name: 'mcp-default-history', request_id: randomUUID() };
       const defaultWorkspace = await call(client, 'graft_add', defaultArgs);
       const visibility = (workspace: JsonObject) => ctx.command('git', ['cat-file', '-e', unrelated], workspacePath(workspace)).status;
-      assert.equal(visibility(defaultWorkspace) === 0, probe.native_clone, 'unconfigured local history visibility');
+      assert.equal(visibility(defaultWorkspace) === 0, shared, 'unconfigured local history visibility');
       ctx.git(['config', '--local', 'graft.history', 'isolated']);
       assert.deepEqual(await call(client, 'graft_add', defaultArgs), defaultWorkspace, 'retry must preserve original policy');
       const configured = await call(client, 'graft_add', { name: 'mcp-configured-history' });
       assert.notEqual(visibility(configured), 0, 'configured isolated policy must exclude unrelated objects');
       const override = await call(client, 'graft_add', { name: 'mcp-override-history', history: 'local' });
-      assert.equal(visibility(override) === 0, probe.native_clone, 'explicit local policy must override project setting');
+      assert.equal(visibility(override) === 0, shared, 'explicit local policy must override project setting');
       ctx.git(['config', '--local', 'graft.history', 'local']);
       const isolated = await call(client, 'graft_add', { name: 'mcp-isolated-history', history: 'isolated' });
       assert.notEqual(visibility(isolated), 0, 'explicit isolated policy must exclude unrelated objects');
@@ -873,7 +873,7 @@ export const cases: Scenario[] = [
     name: 'MCP supports the CLI graft creation modes',
     run: async (ctx) => withClient(ctx, true, async (client) => {
       await initialize(client);
-      const probe = object(ctx.cli(['doctor']).source_storage, 'source filesystem capability');
+      const history = object(ctx.cli(['doctor']).history_sharing, 'history sharing capability');
       for (const options of [
         { branch: 'chosen', detach: true },
         { branch: 'chosen', orphan: 'root' },
@@ -895,7 +895,7 @@ export const cases: Scenario[] = [
       };
       ctx.git(['config', '--local', 'graft.history', 'local']);
       const locked = await call(client, 'graft_add', args);
-      if (probe.native_clone) {
+      if (history.shared) {
         assert.equal(object(object(locked.storage, 'workspace storage').objects, 'workspace history').source, 'local-snapshot');
       }
       ctx.git(['config', '--local', '--unset', 'graft.history']);

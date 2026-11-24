@@ -148,7 +148,7 @@ These are medians from the release build on macOS with APFS, comparing `git work
 
 ## Supported platforms
 
-git-graft runs on macOS, Linux and Windows. Disk sharing needs a filesystem that can clone files: APFS on macOS, or Btrfs and XFS on Linux. On ext4 and NTFS grafts still work, with private repositories, merging, archives and the MCP server, but their files are full copies, as with a worktree. Run `git graft doctor` to see what your filesystem supports.
+git-graft runs on macOS, Linux and Windows. Disk sharing needs a filesystem that can clone files: APFS on macOS, or Btrfs and XFS on Linux. On ext4 and NTFS grafts still work, with private repositories, merging, archives and the MCP server, but their working files are full copies, as with a worktree. On Linux a graft still shares the primary's Git history there, through hard links to its object files. Run `git graft doctor` to see what your filesystem supports.
 
 ## How it works
 
