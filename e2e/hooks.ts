@@ -739,7 +739,7 @@ export const cases: Scenario[] = [
       const program = windows ? './tools/hook.cmd' : './tools/hook';
       const wrapper = join(ctx.root, 'tools', windows ? 'hook.cmd' : 'hook');
       const body = windows
-        ? `@"${process.execPath}" "${script}" %*\r\n`
+        ? `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`
         : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`;
       writeFileSync(wrapper, body, { mode: 0o755 });
       writeFileSync(join(ctx.repo, 'secret.env'), 'TOKEN=1\n');
