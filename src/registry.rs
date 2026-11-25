@@ -720,6 +720,24 @@ impl Project {
     /// without creating state, locks or caches. A present but incomplete
     /// state directory is ambiguous and is left alone.
     pub(crate) fn open_existing_at(paths: Paths) -> Result<Option<(Self, File)>> {
+        let Some((project, lock_path)) = Self::existing(paths, true)? else {
+            return Ok(None);
+        };
+        let lock = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+        lock.lock().context("lock graft registry")?;
+        Ok(Some((project, lock)))
+    }
+
+    /// Open an existing owned project for reading only, without taking its
+    /// lock, such as another project whose grafts a turn names. Its records
+    /// are each replaced atomically, so a read sees each one whole.
+    pub(crate) fn read_existing_at(paths: Paths) -> Result<Option<Self>> {
+        Ok(Self::existing(paths, false)?.map(|(project, _)| project))
+    }
+
+    /// The checks [`Self::open_existing_at`] and [`Self::read_existing_at`]
+    /// share, and the path of the project lock.
+    fn existing(paths: Paths, locking: bool) -> Result<Option<(Self, PathBuf)>> {
         let (repo, common, state, root) = paths;
         if !exists(&state)? {
             return Ok(None);
@@ -730,14 +748,14 @@ impl Project {
         #[cfg(not(unix))]
         let _ = metadata;
         let lock_path = state.join("project.lock");
-        let lock_metadata = fs::symlink_metadata(&lock_path)
-            .context("existing project lock is missing or inaccessible")?;
-        ensure!(
-            lock_metadata.is_file() && !is_reparse_point(&lock_metadata),
-            "lock is not a regular file"
-        );
-        let lock = OpenOptions::new().read(true).write(true).open(&lock_path)?;
-        lock.lock().context("lock graft registry")?;
+        if locking {
+            let lock_metadata = fs::symlink_metadata(&lock_path)
+                .context("existing project lock is missing or inaccessible")?;
+            ensure!(
+                lock_metadata.is_file() && !is_reparse_point(&lock_metadata),
+                "lock is not a regular file"
+            );
+        }
         let id = String::from_utf8(regular(&state.join("project-id"))?)?;
         ensure!(
             Uuid::parse_str(&id)?.to_string() == id,
@@ -751,7 +769,7 @@ impl Project {
                 root,
                 id,
             },
-            lock,
+            lock_path,
         )))
     }
 

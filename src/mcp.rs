@@ -32,6 +32,29 @@ struct Server {
     repo: PathBuf,
     allow_exec: bool,
     allow_push: bool,
+    /// The lease of every turn this server's client holds. The server is
+    /// the holder's process, so its turns end when the client disconnects.
+    turn_lease: String,
+}
+
+impl Server {
+    /// A session's `graft_turn_take` as a `turn take` by this server, with
+    /// grafts named relative to the repository.
+    fn turn_take(&self, take: api::SessionTurnTake) -> TurnTake {
+        TurnTake {
+            resource: take.resource,
+            holder: take.holder,
+            lease: self.turn_lease.clone(),
+            pid: Some(std::process::id()),
+            grafts: take
+                .grafts
+                .into_iter()
+                .map(|graft| self.repo.join(graft))
+                .collect(),
+            wait: take.wait,
+            ttl: take.ttl,
+        }
+    }
 }
 
 #[derive(serde::Deserialize, JsonSchema)]
@@ -110,7 +133,7 @@ impl ServerHandler for Server {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(format!(
-                "{instructions} {publishing} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. Before using something every graft shares, such as a development server on a fixed port, call graft_turn_take, and graft_turn_release when done. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for just the ones to bring. Prefer naming them: [\"*\"] copies all of them, including build output and directories such as target/ and .venv/, which can be large. Omitting include uses the include patterns of the project's .graftconfig and .graftconfig.local, and copies nothing if they set none. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
+                "{instructions} {publishing} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. Before using something every graft shares, such as a development server on a fixed port, call graft_turn_take under one holder name for all of your work, and graft_turn_release when done. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for just the ones to bring. Prefer naming them: [\"*\"] copies all of them, including build output and directories such as target/ and .venv/, which can be large. Omitting include uses the include patterns of the project's .graftconfig and .graftconfig.local, and copies nothing if they set none. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
             ))
     }
 
@@ -194,21 +217,21 @@ impl ServerHandler for Server {
                 false,
                 false,
             ),
-            tool::<TurnTake>(
+            tool::<api::SessionTurnTake>(
                 "graft_turn_take",
-                "Take a turn on something the grafts share and cannot each have a copy of, such as a development server on a fixed port or a local database. resource is a name the project chooses. granted true means this graft holds the turn. Otherwise it is queued and position is its place in line, 1 being next: call again within 300 seconds to keep the place, or set wait to keep asking, for less time than your client allows a tool call. Call again while you hold the turn to renew it before expires_at. Graft does nothing to the resource: a turn is a promise between cooperating grafts. Give it up with graft_turn_release as soon as you finish.",
+                "Take a turn on something every graft shares and cannot have a copy of, such as a development server on a fixed port or a local database. resource is a name the project chooses. holder is the name to hold it under, such as your task's: one name for all of this work, even across grafts of several repositories. List those grafts' paths in grafts; once none of them is active the turn is lost. granted true means you hold the turn. Otherwise you are queued and position is your place in line, 1 being next: call again within 300 seconds to keep the place, or set wait to keep asking, for less time than your client allows a tool call. Call again while you hold the turn to renew it before expires_at. The turn also ends when this MCP session does. Graft does nothing to the resource: a turn is a promise between cooperating agents. Give it up with graft_turn_release as soon as you finish.",
                 false,
                 false,
             ),
-            tool::<TurnRelease>(
+            tool::<api::SessionTurnRelease>(
                 "graft_turn_release",
-                "Give up this graft's turn on a shared resource, or leave its queue. next names the graft now first in line; it gets the turn when it next calls graft_turn_take.",
+                "Give up your turn on a shared resource, or leave its queue, under the holder name you took it with. next names the holder now first in line; it gets the turn when it next calls graft_turn_take.",
                 false,
                 false,
             ),
             tool::<Empty>(
                 "graft_turn_list",
-                "List the shared resources that have a holder or a queue: who holds each turn, when it expires and who waits, in order.",
+                "List the shared resources that have a holder or a queue: who holds each turn, the grafts the holder works in, when the turn expires and who waits, in order.",
                 true,
                 false,
             ),
@@ -263,11 +286,18 @@ impl ServerHandler for Server {
             "graft_push" => Command::Push(parse(args)?),
             "graft_remove" => Command::Drop(parse(args)?),
             "graft_turn_take" => {
-                let take: TurnTake = parse(args)?;
+                let take = self.turn_take(parse(args)?);
                 take.check().map_err(invalid)?;
                 Command::TurnTake(take)
             }
-            "graft_turn_release" => Command::TurnRelease(parse(args)?),
+            "graft_turn_release" => {
+                let release: api::SessionTurnRelease = parse(args)?;
+                Command::TurnRelease(TurnRelease {
+                    resource: release.resource,
+                    holder: release.holder,
+                    lease: self.turn_lease.clone(),
+                })
+            }
             "graft_turn_list" => parse::<Empty>(args).map(|_| Command::TurnList)?,
             _ => {
                 return Err(ErrorData::invalid_params(
@@ -361,8 +391,8 @@ where
             {
                 // If the release fails, the turn still runs out after its ttl.
                 let _ = release(TurnRelease {
-                    name: take.name,
                     resource: take.resource,
+                    holder: take.holder,
                     lease: take.lease,
                 })
                 .await;
@@ -427,6 +457,7 @@ pub fn serve(repo: PathBuf, allow_exec: bool, allow_push: bool) -> anyhow::Resul
                 repo,
                 allow_exec,
                 allow_push,
+                turn_lease: uuid::Uuid::new_v4().to_string(),
             }
             .serve((bounded_input(stdin), stdout))
             .await?
@@ -447,9 +478,11 @@ mod tests {
 
     fn take(wait: u64) -> TurnTake {
         TurnTake {
-            name: "task".into(),
             resource: "web".into(),
+            holder: "task".into(),
             lease: "lease".into(),
+            pid: None,
+            grafts: Vec::new(),
             wait,
             ttl: None,
         }
@@ -527,7 +560,7 @@ mod tests {
                 panic!("expected one release, got {}", releases.len());
             };
             assert_eq!(
-                (&*release.name, &*release.resource, &*release.lease),
+                (&*release.holder, &*release.resource, &*release.lease),
                 ("task", "web", "lease")
             );
         }

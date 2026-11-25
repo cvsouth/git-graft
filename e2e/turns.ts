@@ -1,45 +1,60 @@
 /**
- * Turns on a shared resource: grafts take it in the order they asked, a turn
- * runs out or follows its graft into the archive, a waiting take returns when
- * the holder gives the turn up, and MCP serves the same three operations.
+ * Turns on a shared resource: holders take it in the order they asked, a turn
+ * runs out or ends with the holder's process or grafts, one turn serves
+ * grafts of several repositories, a waiting take returns when the holder
+ * gives the turn up, and MCP serves the same three operations with the MCP
+ * session as the holder.
  */
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { execute, objectResult, type Context, type ObjectResult, type Scenario } from './harness.ts';
+import { objectResult, type Context, type ObjectResult, type Scenario } from './harness.ts';
 import { call, discover, initialize, invalidCall, withClient } from './mcp.ts';
-import { Gate, age, background, graft, running, waitFor } from './process-faults.ts';
+import { Gate, background, graft, running, waitFor } from './process-faults.ts';
 
-type Graft = { name: string; lease: string; id: string };
+type Holder = { name: string; lease: string };
 
-function add(ctx: Context, name: string): Graft {
-  const { lease, result } = ctx.spawn(name);
-  assert(typeof result.id === 'string');
-  return { name, lease, id: result.id };
+function holder(name: string): Holder {
+  return { name, lease: randomUUID() };
 }
-function take(ctx: Context, graft: Graft, resource: string, ...options: string[]): ObjectResult {
-  return ctx.cli(['turn', 'take', graft.name, resource, '--lease', graft.lease, ...options]);
+function take(ctx: Context, who: Holder, resource: string, ...options: string[]): ObjectResult {
+  return ctx.cli(['turn', 'take', resource, '--holder', who.name, '--lease', who.lease, ...options]);
 }
-function release(ctx: Context, graft: Graft, resource: string): ObjectResult {
-  return ctx.cli(['turn', 'release', graft.name, resource, '--lease', graft.lease]);
+function takeIn(ctx: Context, repo: string, who: Holder, resource: string, ...options: string[]): ObjectResult {
+  return ctx.cli(['turn', 'take', resource, '--holder', who.name, '--lease', who.lease, ...options], repo);
+}
+function release(ctx: Context, who: Holder, resource: string, repo = ctx.repo): ObjectResult {
+  return ctx.cli(['turn', 'release', resource, '--holder', who.name, '--lease', who.lease], repo);
 }
 /** Each listed resource as [resource, holder, queue]. */
-function turns(ctx: Context): unknown[][] {
-  const listed = ctx.cli(['turn', 'list']).turns;
+function turns(ctx: Context, repo = ctx.repo): unknown[][] {
+  const listed = ctx.cli(['turn', 'list'], repo).turns;
   assert(Array.isArray(listed));
   return listed.map(objectResult).map(turn => [turn.resource, turn.holder, turn.queue]);
 }
-function stateFile(ctx: Context, resource: string): string {
-  return join(ctx.repo, '.git', 'graft', 'turns', `turn-${resource}.json`);
-}
-function heartbeat(ctx: Context, graft: Graft): unknown {
-  return ctx.cli(['status', graft.name]).last_heartbeat;
+function stateFile(repo: string, resource: string): string {
+  return join(repo, '.git', 'graft', 'turns', `turn-${resource}.json`);
 }
 function number(value: unknown): number {
   assert(typeof value === 'number');
   return value;
+}
+/** A child process that runs until killed. */
+function sleeper(): ReturnType<typeof spawn> {
+  return spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+}
+/** A second repository beside the primary, with one commit. */
+function sibling(ctx: Context, name: string): string {
+  const repo = join(ctx.root, name);
+  mkdirSync(repo);
+  ctx.git(['init', '-q', '-b', 'main'], repo);
+  writeFileSync(join(repo, 'README.md'), `${name}\n`);
+  ctx.git(['add', '-A'], repo);
+  ctx.git(['commit', '-qm', name], repo);
+  return repo;
 }
 
 export const cases: Scenario[] = [
@@ -58,18 +73,17 @@ export const cases: Scenario[] = [
     },
   },
   {
-    name: 'grafts take a turn in the order they asked and hand it over on release',
+    name: 'holders take a turn in the order they asked and hand it over on release',
     run(ctx) {
-      const [a, b, c] = ['task-a', 'task-b', 'task-c'].map(name => add(ctx, name));
-      // Nothing is stored until a turn is taken.
-      assert.deepEqual(ctx.cli(['turn', 'list']), { turns: [] });
+      const [a, b, c] = ['task-a', 'task-b', 'task-c'].map(holder);
       assert.deepEqual(release(ctx, a, 'web'), { resource: 'web', released: false, next: null });
       assert(!existsSync(join(ctx.repo, '.git', 'graft', 'turns')));
 
       const first = take(ctx, a, 'web');
       const since = number(first.since);
-      assert.deepEqual(first, { resource: 'web', granted: true, holder: 'task-a', since, expires_at: since + 1800, queue: [] });
-      const held = { resource: 'web', holder: 'task-a', since, expires_at: since + 1800 };
+      assert.deepEqual(first,
+        { resource: 'web', granted: true, holder: 'task-a', since, expires_at: since + 1800, grafts: [], queue: [] });
+      const held = { resource: 'web', holder: 'task-a', since, expires_at: since + 1800, grafts: [] };
       assert.deepEqual(take(ctx, b, 'web'), { ...held, granted: false, position: 1, queue: ['task-b'] });
       assert.deepEqual(take(ctx, c, 'web'), { ...held, granted: false, position: 2, queue: ['task-b', 'task-c'] });
       // Asking again keeps the place, and another resource has its own turn.
@@ -78,28 +92,19 @@ export const cases: Scenario[] = [
       assert.equal(database.granted, true);
       const listing = ctx.cli(['turn', 'list']);
       assert.deepEqual(listing, { turns: [
-        { resource: 'database', holder: 'task-b', since: database.since, expires_at: database.expires_at, queue: [] },
+        { resource: 'database', holder: 'task-b', since: database.since, expires_at: database.expires_at, grafts: [], queue: [] },
         { ...held, queue: ['task-b', 'task-c'] },
       ] });
-      // Names only: no lease anywhere, and no graft ID in what a command prints.
-      for (const { lease, id } of [a, b, c]) {
-        assert(!JSON.stringify(listing).includes(lease) && !JSON.stringify(listing).includes(id));
-        assert(!readFileSync(stateFile(ctx, 'web'), 'utf8').includes(lease));
+      // No lease anywhere: not in what a command prints, nor in the state.
+      for (const { lease } of [a, b, c]) {
+        assert(!JSON.stringify(listing).includes(lease));
+        assert(!readFileSync(stateFile(ctx.repo, 'web'), 'utf8').includes(lease));
       }
-
-      // A take or a release renews the lease heartbeat like other commands.
-      age(ctx);
-      assert.equal(take(ctx, a, 'web').granted, true);
-      assert(number(heartbeat(ctx, a)) > 0);
-      assert.equal(heartbeat(ctx, c), 0);
-      assert.deepEqual(release(ctx, c, 'cache'), { resource: 'cache', released: false, next: null });
-      assert(number(heartbeat(ctx, c)) > 0);
-      assert.equal(heartbeat(ctx, b), 0);
 
       assert.deepEqual(release(ctx, a, 'web'), { resource: 'web', released: true, next: 'task-b' });
       // The turn is free, but task-b asked first and gets it when it next asks.
-      assert.deepEqual(take(ctx, c, 'web'),
-        { resource: 'web', granted: false, holder: null, since: null, expires_at: null, position: 2, queue: ['task-b', 'task-c'] });
+      assert.deepEqual(take(ctx, c, 'web'), { resource: 'web', granted: false, holder: null, since: null,
+        expires_at: null, grafts: [], position: 2, queue: ['task-b', 'task-c'] });
       const handed = take(ctx, b, 'web');
       assert.deepEqual([handed.granted, handed.holder, handed.queue], [true, 'task-b', ['task-c']]);
       assert.deepEqual(release(ctx, a, 'web'), { resource: 'web', released: false, next: 'task-c' });
@@ -113,50 +118,57 @@ export const cases: Scenario[] = [
     },
   },
   {
-    name: 'a wrong lease, an invalid resource or an out-of-range option takes no turn and changes nothing',
+    name: 'a wrong lease, an invalid holder or resource, or an out-of-range option takes no turn and changes nothing',
     run(ctx) {
-      const [a, b] = ['task-a', 'task-b'].map(name => add(ctx, name));
+      const [a, b] = ['task-a', 'task-b'].map(holder);
       assert.equal(take(ctx, a, 'web').granted, true);
       assert.equal(take(ctx, b, 'web').position, 1);
-      const stored = readFileSync(stateFile(ctx, 'web'), 'utf8');
+      const stored = readFileSync(stateFile(ctx.repo, 'web'), 'utf8');
       const listed = ctx.cli(['turn', 'list']);
-      const beats = [heartbeat(ctx, a), heartbeat(ctx, b)];
 
       for (const [action, name, lease] of [
         ['take', 'task-a', randomUUID()], ['take', 'task-a', b.lease],
         ['release', 'task-a', b.lease], ['release', 'task-b', randomUUID()],
       ]) {
-        const error = ctx.fail(['turn', action, name, 'web', '--lease', lease]);
+        const error = ctx.fail(['turn', action, 'web', '--holder', name, '--lease', lease]);
         assert.equal(error.code, 'lease_mismatch', action);
+        assert.deepEqual(error.details, { holder: name });
         assert(!JSON.stringify(error).includes(a.lease) && !JSON.stringify(error).includes(b.lease));
       }
-      assert.equal(ctx.fail(['turn', 'take', 'missing', 'web', '--lease', a.lease]).code, 'not_found');
-      for (const resource of ['Web', 'web_server', 'web/api', 'web server', 'a'.repeat(65)]) {
+      for (const [name, lease] of [['two words', a.lease], ['-dash', a.lease], ['task-a', 'not-a-uuid'],
+        ['task-a', '00000000-0000-0000-0000-000000000000']]) {
         for (const action of ['take', 'release']) {
-          assert.equal(ctx.fail(['turn', action, 'task-a', resource, '--lease', a.lease]).code, 'invalid_resource', resource);
+          assert.equal(ctx.fail(['turn', action, 'web', `--holder=${name}`, `--lease=${lease}`]).code, 'invalid_holder', name);
         }
       }
+      for (const resource of ['Web', 'web_server', 'web/api', 'web server', 'a'.repeat(65)]) {
+        for (const action of ['take', 'release']) {
+          assert.equal(ctx.fail(['turn', action, resource, '--holder', 'task-a', '--lease', a.lease]).code,
+            'invalid_resource', resource);
+        }
+      }
+      // A process that is not running, or a path that is no graft, cannot bound a holder.
+      assert.equal(ctx.fail(['turn', 'take', 'web', '--holder', 'task-c', '--lease', randomUUID(), '--pid', '4294967295']).code,
+        'invalid_holder');
+      assert.equal(ctx.fail(['turn', 'take', 'web', '--holder', 'task-c', '--lease', randomUUID(), '--graft', ctx.repo]).code,
+        'invalid_holder');
       // The command line refuses these before anything runs.
       for (const options of [['--wait', '3601'], ['--ttl', '0'], ['--ttl', '86401'], ['--wait', '-1']]) {
-        const out = ctx.command(ctx.bin, ['--repo', ctx.repo, '--json', 'turn', 'take', 'task-a', 'web', '--lease', a.lease, ...options]);
+        const out = ctx.command(ctx.bin, ['--repo', ctx.repo, '--json', 'turn', 'take', 'web', '--holder', 'task-a',
+          '--lease', a.lease, ...options]);
         assert.equal(out.status, 2, options.join(' '));
       }
-      assert.equal(ctx.command(ctx.bin, ['--repo', ctx.repo, '--json', 'turn', 'take', 'task-a', 'web']).status, 2);
-      assert.equal(readFileSync(stateFile(ctx, 'web'), 'utf8'), stored);
+      for (const missing of [['--holder', 'task-a'], ['--lease', a.lease]]) {
+        assert.equal(ctx.command(ctx.bin, ['--repo', ctx.repo, '--json', 'turn', 'take', 'web', ...missing]).status, 2);
+      }
+      assert.equal(readFileSync(stateFile(ctx.repo, 'web'), 'utf8'), stored);
       assert.deepEqual(ctx.cli(['turn', 'list']), listed);
-      assert.deepEqual([heartbeat(ctx, a), heartbeat(ctx, b)], beats);
-
-      // The lease can come from the environment, as for other commands.
-      const out = execute(ctx.bin, ['--repo', ctx.repo, '--json', 'turn', 'take', 'task-a', 'web'], ctx.repo,
-        { ...ctx.env, GIT_GRAFT_LEASE: a.lease });
-      assert.equal(out.status, 0, out.stderr);
-      assert.equal(objectResult(JSON.parse(out.stdout)).granted, true);
     },
   },
   {
     name: 'a turn runs out after its ttl unless it is taken again',
     async run(ctx) {
-      const [a, b] = ['task-a', 'task-b'].map(name => add(ctx, name));
+      const [a, b] = ['task-a', 'task-b'].map(holder);
       const short = take(ctx, a, 'web', '--ttl', '1');
       assert.equal(short.granted, true);
       assert.equal(short.expires_at, number(short.since) + 1);
@@ -178,44 +190,73 @@ export const cases: Scenario[] = [
     },
   },
   {
-    name: 'an archived holder loses its turn and a restored one keeps a turn nobody took',
+    name: 'a holder loses its turn and its place when the process it named ends',
+    async run(ctx) {
+      const [a, b, c] = ['task-a', 'task-b', 'task-c'].map(holder);
+      const first = sleeper();
+      const second = sleeper();
+      try {
+        assert.equal(take(ctx, a, 'web', '--pid', String(first.pid)).granted, true);
+        assert.equal(take(ctx, b, 'web', '--pid', String(second.pid)).position, 1);
+        assert.equal(take(ctx, c, 'web').position, 2);
+        // A renewal that names no process keeps the one named before.
+        assert.equal(take(ctx, a, 'web').granted, true);
+        first.kill();
+        await waitFor(() => !running(first.pid!), 'the first process to exit');
+        second.kill();
+        await waitFor(() => !running(second.pid!), 'the second process to exit');
+        assert.deepEqual(turns(ctx), [['web', null, ['task-c']]]);
+        assert.equal(take(ctx, c, 'web').granted, true);
+        // Its name is free again, for any lease.
+        assert.equal(take(ctx, holder('task-a'), 'web').position, 1);
+      } finally {
+        first.kill();
+        second.kill();
+      }
+    },
+  },
+  {
+    name: 'one holder holds one turn for grafts of several repositories, until none of them is active',
     run(ctx) {
-      const [a, b, c] = ['task-a', 'task-b', 'task-c'].map(name => add(ctx, name));
-      for (const resource of ['web', 'database']) assert.equal(take(ctx, a, resource).granted, true);
-      assert.equal(take(ctx, b, 'web').position, 1);
-      assert.equal(take(ctx, c, 'cache').granted, true);
-      assert.equal(take(ctx, b, 'cache').position, 1);
+      // The primary and a second repository side by side in one directory,
+      // which is itself a repository and shares the resource stack.
+      const router = sibling(ctx, 'router');
+      ctx.git(['init', '-q', '-b', 'main'], ctx.root);
+      writeFileSync(join(ctx.root, '.graftconfig.local'), JSON.stringify({ turns: ['stack'] }));
+      const app = ctx.spawn('fix-parser');
+      const api = ctx.spawn('fix-parser', [], router);
+      const other = ctx.spawn('other', [], router);
+      const agent = holder('agent-1');
+      const [appPath, apiPath] = [String(app.path), String(api.path)].map(path => realpathSync(path));
 
-      // Remove changes no turn state; the holder is forgotten when next looked at.
-      const stored = readFileSync(stateFile(ctx, 'web'), 'utf8');
-      ctx.cli(['remove', 'task-a', '--lease', a.lease]);
-      assert.equal(readFileSync(stateFile(ctx, 'web'), 'utf8'), stored);
-      assert.deepEqual(turns(ctx), [['cache', 'task-c', ['task-b']], ['web', null, ['task-b']]]);
-      assert.equal(take(ctx, b, 'web').granted, true);
-      assert.equal(ctx.fail(['turn', 'take', 'task-a', 'web', '--lease', a.lease]).code, 'graft_archived');
+      const granted = takeIn(ctx, ctx.repo, agent, 'stack', '--graft', appPath, '--graft', apiPath);
+      assert.deepEqual([granted.granted, granted.holder, granted.grafts], [true, 'agent-1', [appPath, apiPath]]);
+      assert(existsSync(stateFile(ctx.root, 'stack')));
+      assert(!existsSync(stateFile(ctx.repo, 'stack')) && !existsSync(stateFile(router, 'stack')));
+      // The same turn from the other repository: the same holder renews it,
+      // anyone else queues behind it.
+      assert.equal(takeIn(ctx, router, agent, 'stack').granted, true);
+      const second = holder('agent-2');
+      assert.equal(takeIn(ctx, router, second, 'stack', '--graft', String(other.path)).position, 1);
+      assert.deepEqual(turns(ctx, router), [['stack', 'agent-1', ['agent-2']]]);
+      assert.deepEqual(turns(ctx), turns(ctx, router));
+      // A resource the directory does not share stays each repository's own.
+      assert.equal(takeIn(ctx, router, second, 'web').granted, true);
+      assert.deepEqual(turns(ctx), [['stack', 'agent-1', ['agent-2']]]);
 
-      // Restored within its ttl, the graft still holds the turn nobody took.
-      const reopened = ctx.cli(['restore', 'task-a', '--lease', a.lease]);
-      assert(typeof reopened.lease === 'string' && reopened.lease !== a.lease);
-      const restored = { ...a, lease: reopened.lease };
-      assert.deepEqual(turns(ctx), [['cache', 'task-c', ['task-b']], ['database', 'task-a', []], ['web', 'task-b', []]]);
-      assert.equal(take(ctx, b, 'database').position, 1);
-      assert.equal(take(ctx, restored, 'database').granted, true);
-      assert.equal(take(ctx, restored, 'web').position, 1);
-      assert.equal(ctx.fail(['turn', 'take', 'task-a', 'web', '--lease', a.lease]).code, 'lease_mismatch');
-
-      // A new graft that reuses an archived holder's name holds nothing.
-      ctx.cli(['remove', 'task-c', '--lease', c.lease]);
-      const reused = add(ctx, 'task-c');
-      assert.notEqual(reused.id, c.id);
-      const behind = take(ctx, reused, 'cache');
-      assert.deepEqual([behind.granted, behind.holder, behind.queue], [false, null, ['task-b', 'task-c']]);
+      // Archiving one graft leaves the turn; archiving the last frees it.
+      ctx.cli(['remove', 'fix-parser', '--lease', app.lease]);
+      assert.deepEqual(turns(ctx), [['stack', 'agent-1', ['agent-2']]]);
+      ctx.cli(['remove', 'fix-parser', '--lease', api.lease], router);
+      assert.deepEqual(turns(ctx), [['stack', null, ['agent-2']]]);
+      assert.equal(takeIn(ctx, router, second, 'stack').granted, true);
+      assert.deepEqual(release(ctx, second, 'stack'), { resource: 'stack', released: true, next: null });
     },
   },
   {
     name: 'take --wait returns soon after the holder gives up the turn and holds no lock meanwhile',
     async run(ctx) {
-      const [a, b] = ['task-a', 'task-b'].map(name => add(ctx, name));
+      const [a, b] = ['task-a', 'task-b'].map(holder);
       assert.equal(take(ctx, a, 'web').granted, true);
       let started = performance.now();
       const brief = take(ctx, b, 'web', '--wait', '1');
@@ -223,7 +264,7 @@ export const cases: Scenario[] = [
       assert(performance.now() - started >= 900, 'a wait that was not granted returned early');
 
       let settled = false;
-      const waiting = graft(ctx, ['turn', 'take', 'task-b', 'web', '--lease', b.lease, '--wait', '20'])
+      const waiting = graft(ctx, ['turn', 'take', 'web', '--holder', b.name, '--lease', b.lease, '--wait', '20'])
         .finally(() => { settled = true; });
       await delay(1_500);
       assert(!settled, 'the waiting take returned while the turn was held');
@@ -243,21 +284,22 @@ export const cases: Scenario[] = [
     },
   },
   {
-    name: 'a graft takes and gives up turns while a process it started with exec runs',
+    name: 'a holder takes and gives up turns while a process its graft started with exec runs',
     async run(ctx) {
-      const [a, b] = ['agent', 'task-b'].map(name => add(ctx, name));
+      const work = ctx.spawn('agent');
+      const [a, b] = ['agent', 'task-b'].map(holder);
       const started = join(ctx.root, 'background-started');
       const stop = join(ctx.root, 'background-release');
       // The usual order: take the turn, then start the shared thing.
-      assert.equal(take(ctx, a, 'web').granted, true);
-      const exec = ctx.cli(['exec', 'agent', '--lease', a.lease, '--', ...background(ctx, started, stop)]);
+      assert.equal(take(ctx, a, 'web', '--graft', String(work.path)).granted, true);
+      const exec = ctx.cli(['exec', 'agent', '--lease', work.lease, '--', ...background(ctx, started, stop)]);
       assert.equal(exec.success, true, JSON.stringify(exec));
       let pid = 0;
       try {
         await waitFor(() => existsSync(started) && readFileSync(started, 'utf8').length > 0, 'the background process');
         pid = Number(readFileSync(started, 'utf8'));
         assert(running(pid), 'the background process exited early');
-        assert.equal(ctx.fail(['lock', 'agent', '--lease', a.lease]).code, 'workspace_busy');
+        assert.equal(ctx.fail(['lock', 'agent', '--lease', work.lease]).code, 'workspace_busy');
         assert.equal(take(ctx, a, 'web').granted, true);
         assert.equal(take(ctx, b, 'web').position, 1);
         assert.deepEqual(release(ctx, a, 'web'), { resource: 'web', released: true, next: 'task-b' });
@@ -272,7 +314,7 @@ export const cases: Scenario[] = [
     name: 'turn commands do not wait for a graft that is being built',
     async run(ctx) {
       if (process.platform === 'win32') ctx.unavailable('the fault hooks are POSIX shell scripts');
-      const [a, b] = ['task-a', 'task-b'].map(name => add(ctx, name));
+      const [a, b] = ['task-a', 'task-b'].map(holder);
       // A smudge filter holds the next add part way through its checkout.
       const gate = new Gate(ctx, 'build');
       const filter = join(ctx.root, 'hold-filter.sh');
@@ -295,12 +337,12 @@ export const cases: Scenario[] = [
           assert(outcome.ok, JSON.stringify(outcome.json));
           return outcome.json;
         };
-        assert.equal((await turn('take', 'task-a', 'web', '--lease', a.lease)).granted, true);
-        assert.equal((await turn('take', 'task-b', 'web', '--lease', b.lease)).position, 1);
+        assert.equal((await turn('take', 'web', '--holder', a.name, '--lease', a.lease)).granted, true);
+        assert.equal((await turn('take', 'web', '--holder', b.name, '--lease', b.lease)).position, 1);
         const listed = (await turn('list')).turns;
         assert(Array.isArray(listed) && listed.length === 1);
         assert.deepEqual(objectResult(listed[0]).queue, ['task-b']);
-        assert.deepEqual(await turn('release', 'task-a', 'web', '--lease', a.lease),
+        assert.deepEqual(await turn('release', 'web', '--holder', a.name, '--lease', a.lease),
           { resource: 'web', released: true, next: 'task-b' });
       } finally {
         gate.open();
@@ -309,87 +351,104 @@ export const cases: Scenario[] = [
     },
   },
   {
-    name: 'MCP serves the turn tools without --allow-exec',
-    run: async ctx => withClient(ctx, false, async client => {
-      await initialize(client);
-      const catalog = await discover(client, false);
-      ctx.measure('advertised_tools', [...catalog.keys()].sort());
-      const schema = objectResult(catalog.get('graft_turn_take')?.inputSchema);
-      assert(Array.isArray(schema.required));
-      assert.deepEqual([...schema.required].sort(), ['lease', 'name', 'resource']);
-      assert.deepEqual(Object.keys(objectResult(schema.properties)).sort(), ['lease', 'name', 'resource', 'ttl', 'wait']);
-      assert.equal(objectResult(catalog.get('graft_turn_list')?.annotations).readOnlyHint, true);
-      for (const name of ['graft_turn_take', 'graft_turn_release']) {
-        const annotations = objectResult(catalog.get(name)?.annotations);
-        assert.deepEqual([annotations.readOnlyHint, annotations.destructiveHint], [false, false], name);
-      }
+    name: 'MCP serves the turn tools without --allow-exec, with the session as the holder',
+    run: async ctx => {
+      const outsider = holder('outsider');
+      await withClient(ctx, false, async client => {
+        await initialize(client);
+        const catalog = await discover(client, false);
+        ctx.measure('advertised_tools', [...catalog.keys()].sort());
+        const schema = objectResult(catalog.get('graft_turn_take')?.inputSchema);
+        assert(Array.isArray(schema.required));
+        assert.deepEqual([...schema.required].sort(), ['holder', 'resource']);
+        assert.deepEqual(Object.keys(objectResult(schema.properties)).sort(), ['grafts', 'holder', 'resource', 'ttl', 'wait']);
+        const releaseSchema = objectResult(catalog.get('graft_turn_release')?.inputSchema);
+        assert.deepEqual(Object.keys(objectResult(releaseSchema.properties)).sort(), ['holder', 'resource']);
+        assert.equal(objectResult(catalog.get('graft_turn_list')?.annotations).readOnlyHint, true);
+        for (const name of ['graft_turn_take', 'graft_turn_release']) {
+          const annotations = objectResult(catalog.get(name)?.annotations);
+          assert.deepEqual([annotations.readOnlyHint, annotations.destructiveHint], [false, false], name);
+        }
 
-      assert.deepEqual(await call(client, 'graft_turn_list'), { turns: [] });
-      assert(!existsSync(join(ctx.repo, '.git', 'graft')));
-      const [a, b] = ['task-a', 'task-b'].map(name => add(ctx, name));
-      const owned = (graft: Graft) => ({ name: graft.name, lease: graft.lease, resource: 'web' });
-      const first = await call(client, 'graft_turn_take', { ...owned(a), ttl: 600 });
-      const since = number(first.since);
-      assert.deepEqual(first, { resource: 'web', granted: true, holder: 'task-a', since, expires_at: since + 600, queue: [] });
-      const queued = await call(client, 'graft_turn_take', owned(b));
-      assert.deepEqual([queued.granted, queued.position, queued.queue], [false, 1, ['task-b']]);
-      assert.deepEqual(take(ctx, b, 'web'), queued);
-      const listed = await call(client, 'graft_turn_list');
-      assert.deepEqual(listed, ctx.cli(['turn', 'list']));
-      assert.deepEqual(listed, { turns: [{ resource: 'web', holder: 'task-a', since, expires_at: since + 600, queue: ['task-b'] }] });
-      ctx.coverTool('graft_turn_list');
+        assert.deepEqual(await call(client, 'graft_turn_list'), { turns: [] });
+        assert(!existsSync(join(ctx.repo, '.git', 'graft')));
+        const work = ctx.spawn('task-a');
+        const mine = (name: string) => ({ holder: name, resource: 'web' });
+        // A graft named relative to the repository resolves there.
+        const relative = join('..', 'project.graft', 'task-a');
+        const first = await call(client, 'graft_turn_take', { ...mine('task-a'), grafts: [relative], ttl: 600 });
+        const since = number(first.since);
+        assert.deepEqual(first, { resource: 'web', granted: true, holder: 'task-a', since, expires_at: since + 600,
+          grafts: [realpathSync(String(work.path))], queue: [] });
+        const queued = await call(client, 'graft_turn_take', mine('task-b'));
+        assert.deepEqual([queued.granted, queued.position, queued.queue], [false, 1, ['task-b']]);
+        // Outside the session, the names are taken: the session's lease is its own.
+        for (const action of ['take', 'release']) {
+          const refused = ctx.fail(['turn', action, 'web', '--holder', 'task-a', '--lease', randomUUID()]);
+          assert.equal(refused.code, 'lease_mismatch', action);
+        }
+        assert.equal(take(ctx, outsider, 'web').position, 2);
+        const listed = await call(client, 'graft_turn_list');
+        assert.deepEqual(listed, ctx.cli(['turn', 'list']));
+        assert.deepEqual(turns(ctx), [['web', 'task-a', ['task-b', 'outsider']]]);
+        ctx.coverTool('graft_turn_list');
 
-      await invalidCall(client, 'graft_turn_take', { name: 'task-a', resource: 'web' });
-      await invalidCall(client, 'graft_turn_take', { name: 'task-a', lease: a.lease });
-      await invalidCall(client, 'graft_turn_take', { ...owned(a), wait: 3601 });
-      await invalidCall(client, 'graft_turn_take', { ...owned(a), ttl: 0 });
-      await invalidCall(client, 'graft_turn_take', { ...owned(a), ttl: 86401 });
-      await invalidCall(client, 'graft_turn_take', { ...owned(a), force: true });
-      await invalidCall(client, 'graft_turn_release', { name: 'task-a', lease: a.lease });
-      await invalidCall(client, 'graft_turn_list', { resource: 'web' });
-      for (const tool of ['graft_turn_take', 'graft_turn_release']) {
-        const refused = await call(client, tool, { ...owned(a), lease: randomUUID() }, true);
-        assert.equal(refused.code, 'lease_mismatch', tool);
-        assert(!JSON.stringify(refused).includes(a.lease));
-        assert.equal((await call(client, tool, { ...owned(a), resource: 'Web' }, true)).code, 'invalid_resource', tool);
-      }
-      assert.deepEqual(await call(client, 'graft_turn_list'), listed);
+        await invalidCall(client, 'graft_turn_take', { resource: 'web' });
+        await invalidCall(client, 'graft_turn_take', { holder: 'task-a' });
+        await invalidCall(client, 'graft_turn_take', { ...mine('task-a'), lease: randomUUID() });
+        await invalidCall(client, 'graft_turn_take', { ...mine('task-a'), pid: 1 });
+        await invalidCall(client, 'graft_turn_take', { ...mine('task-a'), wait: 3601 });
+        await invalidCall(client, 'graft_turn_take', { ...mine('task-a'), ttl: 0 });
+        await invalidCall(client, 'graft_turn_take', { ...mine('task-a'), ttl: 86401 });
+        await invalidCall(client, 'graft_turn_release', { holder: 'task-a' });
+        await invalidCall(client, 'graft_turn_list', { resource: 'web' });
+        for (const tool of ['graft_turn_take', 'graft_turn_release']) {
+          assert.equal((await call(client, tool, mine('outsider'), true)).code, 'lease_mismatch', tool);
+          assert.equal((await call(client, tool, { ...mine('task-a'), resource: 'Web' }, true)).code, 'invalid_resource', tool);
+          assert.equal((await call(client, tool, mine('two words'), true)).code, 'invalid_holder', tool);
+        }
+        assert.deepEqual(await call(client, 'graft_turn_list'), listed);
+        assert.deepEqual(release(ctx, outsider, 'web'), { resource: 'web', released: true, next: 'task-b' });
 
-      // A wait that is not granted returns when its time is up.
-      let started = performance.now();
-      const waited = await call(client, 'graft_turn_take', { ...owned(b), wait: 2 });
-      assert.deepEqual([waited.granted, waited.position], [false, 1]);
-      assert(performance.now() - started >= 1_900, 'a wait that was not granted returned early');
+        // A wait that is not granted returns when its time is up.
+        let started = performance.now();
+        const waited = await call(client, 'graft_turn_take', { ...mine('task-b'), wait: 2 });
+        assert.deepEqual([waited.granted, waited.position], [false, 1]);
+        assert(performance.now() - started >= 1_900, 'a wait that was not granted returned early');
 
-      // A wait the client cancels stops asking, so it takes no turn that
-      // nobody would use. The server sends no reply to a cancelled request.
-      const id = 7_000;
-      client.send(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call',
-        params: { name: 'graft_turn_take', arguments: { ...owned(b), wait: 20 } } }));
-      await delay(1_500);
-      client.send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id, reason: 'test' } }));
-      await delay(1_200);
-      assert.deepEqual(await call(client, 'graft_turn_release', owned(a)), { resource: 'web', released: true, next: 'task-b' });
-      await delay(2_200);
-      assert.deepEqual(turns(ctx), [['web', null, ['task-b']]], 'a cancelled wait kept asking');
+        // A wait the client cancels stops asking, so it takes no turn that
+        // nobody would use. The server sends no reply to a cancelled request.
+        const id = 7_000;
+        client.send(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call',
+          params: { name: 'graft_turn_take', arguments: { ...mine('task-b'), wait: 20 } } }));
+        await delay(1_500);
+        client.send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id, reason: 'test' } }));
+        await delay(1_200);
+        assert.deepEqual(await call(client, 'graft_turn_release', mine('task-a')), { resource: 'web', released: true, next: 'task-b' });
+        await delay(2_200);
+        assert.deepEqual(turns(ctx), [['web', null, ['task-b']]], 'a cancelled wait kept asking');
 
-      // A wait still in progress is granted soon after the holder releases.
-      assert.equal((await call(client, 'graft_turn_take', owned(a))).position, 2);
-      const handed = await call(client, 'graft_turn_take', owned(b));
-      assert.deepEqual([handed.granted, handed.holder, handed.queue], [true, 'task-b', ['task-a']]);
-      const waiting = call(client, 'graft_turn_take', { ...owned(a), wait: 20 });
-      await delay(300);
-      started = performance.now();
-      assert.deepEqual(await call(client, 'graft_turn_release', owned(b)), { resource: 'web', released: true, next: 'task-a' });
-      const granted = await waiting;
-      assert.deepEqual([granted.granted, granted.holder, granted.queue], [true, 'task-a', []]);
-      assert(performance.now() - started < 10_000, 'the waiting call returned long after the release');
-      ctx.coverTool('graft_turn_take');
+        // A wait still in progress is granted soon after the holder releases.
+        assert.equal((await call(client, 'graft_turn_take', mine('task-a'))).position, 2);
+        const handed = await call(client, 'graft_turn_take', mine('task-b'));
+        assert.deepEqual([handed.granted, handed.holder, handed.queue], [true, 'task-b', ['task-a']]);
+        const waiting = call(client, 'graft_turn_take', { ...mine('task-a'), wait: 20 });
+        await delay(300);
+        started = performance.now();
+        assert.deepEqual(await call(client, 'graft_turn_release', mine('task-b')), { resource: 'web', released: true, next: 'task-a' });
+        const granted = await waiting;
+        assert.deepEqual([granted.granted, granted.holder, granted.queue], [true, 'task-a', []]);
+        assert(performance.now() - started < 10_000, 'the waiting call returned long after the release');
+        ctx.coverTool('graft_turn_take');
 
-      assert.deepEqual(await call(client, 'graft_turn_release', owned(b)), { resource: 'web', released: false, next: null });
-      assert.deepEqual(await call(client, 'graft_turn_release', owned(a)), { resource: 'web', released: true, next: null });
-      assert.deepEqual(await call(client, 'graft_turn_list'), { turns: [] });
-      ctx.coverTool('graft_turn_release');
-    }),
+        assert.deepEqual(await call(client, 'graft_turn_release', mine('task-b')), { resource: 'web', released: false, next: null });
+        assert.equal(take(ctx, outsider, 'web').position, 1);
+        ctx.coverTool('graft_turn_release');
+      });
+      // The session's turns end with it; the outsider's place does not.
+      await waitFor(() => JSON.stringify(turns(ctx)) === JSON.stringify([['web', null, ['outsider']]]),
+        'the closed session to lose its turns');
+      assert.equal(take(ctx, outsider, 'web').granted, true);
+    },
   },
 ];

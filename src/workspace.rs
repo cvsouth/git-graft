@@ -22,6 +22,7 @@ pub(crate) use objects::{
 };
 pub(crate) use registry::has_live;
 use registry::{Record, Status};
+pub(crate) use turns::validate_resource;
 
 pub(crate) use api::Spawn;
 
@@ -989,12 +990,14 @@ pub(crate) fn run_found(
             None => Ok(json!({"managers": []})),
         };
     }
-    // Listing turns likewise creates no state in a project that has none.
-    if matches!(command, Command::TurnList) {
-        return match Project::open_existing_at(paths)? {
-            Some((project, _lock)) => turns::list(&project),
-            None => Ok(json!({"turns": []})),
-        };
+    // Turns belong to holders, not to grafts, and may be kept in another
+    // project, so they authenticate no graft and open their own project.
+    // Listing creates no state in a project that has none.
+    match command {
+        Command::TurnList => return turns::list(&paths.0.clone(), paths),
+        Command::TurnTake(args) => return turns::take(&paths.0.clone(), paths, &args),
+        Command::TurnRelease(args) => return turns::release(&paths.0.clone(), paths, &args),
+        _ => {}
     }
     // Hooks live in the primary checkout's configuration files, so listing
     // them needs no Graft state.
@@ -1017,8 +1020,6 @@ pub(crate) fn run_found(
         | Command::Heartbeat(_)
         | Command::Lock { .. }
         | Command::Unlock(_)
-        | Command::TurnTake(_)
-        | Command::TurnRelease(_)
         | Command::TrustHooks => None,
         Command::Gc(args) if !args.apply => None,
         Command::Spawn(_) => Some(p.lock_builds(true)?),
@@ -1054,7 +1055,9 @@ pub(crate) fn run_found(
             return Ok(listed);
         }
         Command::ListManagers => return crate::package_manager::list(p),
-        Command::TurnList => unreachable!("turn list returns before the project opens"),
+        Command::TurnList | Command::TurnTake(_) | Command::TurnRelease(_) => {
+            unreachable!("turns return before the project opens")
+        }
         Command::UnregisterManager(a) => return crate::package_manager::unregister(p, &a.manager),
         Command::ListHooks => unreachable!("handled above"),
         Command::TrustHooks => return hook::trust::trust(p),
@@ -1201,15 +1204,6 @@ pub(crate) fn run_found(
         Command::AddDep(a) => (&a.name, &a.lease),
         Command::Heartbeat(a) => (&a.name, &a.lease),
         Command::Layer(_, a) => (&a.name, &a.lease),
-        Command::TurnTake(a) => {
-            turns::validate_resource(&a.resource)?;
-            a.check()?;
-            (&a.name, &a.lease)
-        }
-        Command::TurnRelease(a) => {
-            turns::validate_resource(&a.resource)?;
-            (&a.name, &a.lease)
-        }
         Command::Push(a) => (&a.name, &a.lease),
     };
     let mut r = registry::authenticate(p, name, lease)?;
@@ -1219,13 +1213,9 @@ pub(crate) fn run_found(
     );
     // Exec shares the graft lock with the process it starts, so a process
     // left running in the background still blocks merge, remove and prune.
-    // Heartbeats and turns share it too, so an agent can renew its lease and
-    // take or give up a turn meanwhile, such as the turn its server runs under.
+    // Heartbeats share it too, so an agent can renew its lease meanwhile.
     let (_workspace_lock, exec_lock) = match command {
-        Command::Exec(_)
-        | Command::Heartbeat(_)
-        | Command::TurnTake(_)
-        | Command::TurnRelease(_) => (None, Some(registry::exec_lock(p, name)?)),
+        Command::Exec(_) | Command::Heartbeat(_) => (None, Some(registry::exec_lock(p, name)?)),
         _ => (Some(registry::workspace_lock(p, name)?), None),
     };
     registry::verify(p, &r)?;
@@ -1236,8 +1226,6 @@ pub(crate) fn run_found(
     }
     match command {
         Command::Heartbeat(_) => Ok(summary(&r)),
-        Command::TurnTake(a) => turns::take(p, &r, &a),
-        Command::TurnRelease(a) => turns::release(p, &r, &a.resource),
         Command::Layer(action, a) => layer::run(&r.path, &p.state, action, &a.key, a.copy),
         Command::Exec(a) => {
             ensure!(!a.argv.is_empty(), "program and arguments are required");

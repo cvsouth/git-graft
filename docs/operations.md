@@ -14,6 +14,7 @@ Two JSON files at the root of the primary checkout configure Graft for a project
 
 - `include`: the [untracked and ignored files](#copy-untracked-and-ignored-files) a new graft copies when the request names none.
 - `hooks`: the [commands](#hooks) Graft runs when a graft is added, about to be archived or restored, keyed by a name of up to 64 letters, digits, `-`, `_` or `.`.
+- `turns`, at the top level only: the [shared resources](#share-a-resource-between-repositories) whose turns every repository the file configures shares.
 
 ```json
 {
@@ -169,37 +170,61 @@ For an exact-source manual snapshot, use `deps share --snapshot --key KEY` (from
 
 ## Take turns on a shared resource
 
-Grafts separate source files, but a project can have something that exists once and cannot be copied for each graft: a development server on a fixed port, a local database, a simulator or device, a licensed tool. Grafts that need it take turns. A resource is a name the project chooses, such as `web` or `database`: 1 to 64 lowercase letters, numbers or hyphens, starting with a letter or number. Any other name is refused with `invalid_resource`. Graft attaches no meaning to the name and does nothing to the resource itself. It does not start, stop or lock anything. A turn is a promise between cooperating clients, like a lease: it records whose turn it is, and each agent has to ask before it uses the resource.
+Grafts separate source files, but a project can have something that exists once and cannot be copied for each graft: a development server on a fixed port, a local database, a simulator or device, a licensed tool. The work that needs it takes turns. A resource is a name the project chooses, such as `web` or `database`: 1 to 64 lowercase letters, numbers or hyphens, starting with a letter or number. Any other name is refused with `invalid_resource`. Graft attaches no meaning to the name and does nothing to the resource itself. It does not start, stop or lock anything. A turn is a promise between cooperating clients, like a lease: it records whose turn it is, and each agent has to ask before it uses the resource.
+
+A turn is held by a holder: the work that needs the resource, such as an agent or a task, rather than one graft, so work that uses grafts of several repositories together holds one turn. A holder has a name of 1 to 64 letters, digits, `-`, `_` or `.`, not starting with `-`, and a lease: a random UUIDv4 it chooses for its first `take` and gives to every later `take` and `release` under that name. Anything else is refused with `invalid_holder`. While a holder holds or waits for a turn, its name on that resource belongs to its lease: another lease gets `lease_mismatch`, with the name in `details.holder`.
 
 ```sh
-git graft turn take task web --lease "<lease>"
-git graft turn take task web --lease "<lease>" --wait 600
-git graft turn release task web --lease "<lease>"
+lease=$(uuidgen)
+git graft turn take web --holder fix-parser --lease "$lease"
+git graft turn take web --holder fix-parser --lease "$lease" --wait 600
+git graft turn take web --holder fix-parser --lease "$lease" --pid "$PPID" --graft ../app.graft/fix-parser
+git graft turn release web --holder fix-parser --lease "$lease"
 git graft turn list
 ```
 
 `turn take` exits with status 0 whether or not the turn was granted, because waiting in the queue is not a failure. Read `granted` in the reply. The first reply below went to `task-a`, the second to `task-b`:
 
 ```json
-{"expires_at":1795501800,"granted":true,"holder":"task-a","queue":[],"resource":"web","since":1795500000}
-{"expires_at":1795501800,"granted":false,"holder":"task-a","position":1,"queue":["task-b"],"resource":"web","since":1795500000}
+{"expires_at":1795501800,"granted":true,"grafts":["/work/app.graft/fix-parser"],"holder":"task-a","queue":[],"resource":"web","since":1795500000}
+{"expires_at":1795501800,"granted":false,"grafts":["/work/app.graft/fix-parser"],"holder":"task-a","position":1,"queue":["task-b"],"resource":"web","since":1795500000}
 ```
 
-`holder` and `queue` are graft names, `since` and `expires_at` are Unix times in seconds, and `position` is the caller's place in the queue, with 1 next in line. While nobody holds the turn, `holder`, `since` and `expires_at` are `null`. Replies never contain a lease.
+`holder` and `queue` are holder names, `grafts` are the paths of the holder's grafts, `since` and `expires_at` are Unix times in seconds, and `position` is the caller's place in the queue, with 1 next in line. While nobody holds the turn, `holder`, `since` and `expires_at` are `null` and `grafts` is empty. Replies never contain a lease, and the state stores only a SHA-256 digest of each.
 
-Grafts get the turn in the order they first asked. A `take` on a free resource with an empty queue is granted. Any other graft joins the end of the queue and keeps its place each time it asks again. When the holder releases the turn, the first graft in the queue becomes the holder the next time it calls `take`; a graft further back is not granted while one ahead of it is still waiting. A queued graft must ask again within 300 seconds to keep its place. After that it is dropped, and joins the end of the queue when it next asks.
+Holders get the turn in the order they first asked. A `take` on a free resource with an empty queue is granted. Any other holder joins the end of the queue and keeps its place each time it asks again. When the holder releases the turn, the first in the queue becomes the holder the next time it calls `take`; one further back is not granted while one ahead of it is still waiting. A queued holder must ask again within 300 seconds to keep its place. After that it is dropped, and joins the end of the queue when it next asks.
 
-A turn lasts for its ttl, counted from the last time its holder took it: 1800 seconds unless `--ttl` gives another value from 1 to 86400. The holder renews the turn by calling `take` again, which keeps the turn's ttl unless `--ttl` is given again. A turn that is not renewed by `expires_at` is free, and a holder that asks after that queues like any other graft.
+A turn lasts for its ttl, counted from the last time its holder took it: 1800 seconds unless `--ttl` gives another value from 1 to 86400. The holder renews the turn by calling `take` again, which keeps the turn's ttl unless `--ttl` is given again. A turn that is not renewed by `expires_at` is free, and a holder that asks after that queues like any other.
 
-`--wait N`, up to 3600, asks about once a second for up to N seconds and returns as soon as the turn is granted. It holds no lock between asks, so other commands are not kept waiting. If a waiting `take` is interrupted, the graft stays in the queue: run `turn release` when the graft no longer wants the turn, or the grafts behind it wait until its 300 seconds have passed.
+Two options end a holder's turn and its place in the queue sooner, so a holder that stops without releasing does not keep others waiting for its whole ttl:
 
-`turn release` gives up the caller's turn or takes it out of the queue, and replies `{"next":"task-b","released":true,"resource":"web"}`. `next` names the graft now first in line, or is `null`. `released` is `false` when the graft neither held the turn nor waited for it, which is not an error. `turn list` replies with `turns`: for each resource that has a holder or a queue, its `resource`, `holder`, `since`, `expires_at` and `queue`. It needs no lease and creates no Graft state in a project that has none.
+- `--pid PID` names a process whose life bounds the holder, such as the agent's own. Graft records the process's start time with its ID, so a later process that reuses the ID does not count. Once the process ends, the holder is dropped. On Linux, macOS and Windows the start time is checked; on other systems only whether the ID is in use. A process that is not running is refused with `invalid_holder`.
+- `--graft PATH`, repeatable, names a graft the holder works in, in any repository. Once none of the named grafts is active, because each was merged, removed or pruned, the holder is dropped. A path that is not an active graft is refused with `invalid_holder`. Naming a graft needs no lease, since it can only shorten the holder's own turn.
 
-`take` and `release` need the graft's lease and renew it, as other commands that take the lease do. They work while a process started with `exec` is still running in the graft, such as the server the turn is for, and they do not wait for grafts that are being built. `merge`, `remove` and `prune` do not change turn state. A holder or queued graft that has been archived no longer counts: `take`, `release` and `list` leave it out the next time they read that resource. A graft restored before another graft took its turn, and before the turn expired, still holds it.
+A later `take` that gives `--pid` or `--graft` replaces what the holder named before; one that gives neither keeps it. A holder may name at most 64 grafts. The grafts of another repository are read without its lock, as each of their records is replaced whole, and a repository whose grafts cannot be read counts them as active.
 
-The MCP tools `graft_turn_take`, `graft_turn_release` and `graft_turn_list` take the same arguments and give the same replies. They do not need the host's `--allow-exec` option: they run nothing and change only Graft's own state. Give `wait` a value shorter than the client's limit for one tool call. A call the client cancels stops asking, and gives up a turn it was granted after the cancellation unless it only renewed a turn the graft already held.
+`--wait N`, up to 3600, asks about once a second for up to N seconds and returns as soon as the turn is granted. It holds no lock between asks, so other commands are not kept waiting. If a waiting `take` is interrupted, the holder stays in the queue: run `turn release` when it no longer wants the turn, or those behind it wait until its 300 seconds have passed.
 
-Turn state is kept in `.git/graft/turns/`, one file for each resource. If a file there cannot be read, commands for that resource fail, name the file and leave it unchanged; move it aside to start that resource's queue again.
+`turn release` gives up the caller's turn or takes it out of the queue, and replies `{"next":"task-b","released":true,"resource":"web"}`. `next` names the holder now first in line, or is `null`. `released` is `false` when the holder neither held the turn nor waited for it, which is not an error. `turn list` replies with `turns`: for each resource that has a holder or a queue, its `resource`, `holder`, `since`, `expires_at`, `grafts` and `queue`. It needs no lease and creates no Graft state in a project that has none.
+
+Turn commands authenticate no graft and change no graft's record, so they work while a process started with `exec` is still running in a graft, such as the server the turn is for, and they do not wait for grafts that are being built. `merge`, `remove` and `prune` do not change turn state; a holder whose grafts are no longer active is left out the next time its resource is read.
+
+### Share a resource between repositories
+
+Turn state is kept in `.git/graft/turns/` of the primary, one file for each resource, so by default each repository has its own turns. When several repositories under one directory share a resource, such as a development stack that serves all of them, list it under `turns` at the top level of that directory's [configuration](#configure-several-repositories-from-one-directory):
+
+```json
+{
+  "turns": ["stack"],
+  "repositories": {"app": {}, "services/router": {}}
+}
+```
+
+A `turn` command in any repository that directory configures then keeps that resource's turn in the Graft state of the repository at the directory itself, so there is one queue for all of them. The directory must be the root of a Git checkout; otherwise turn commands refuse with `invalid_config`. `turns` lists from `.graftconfig` and `.graftconfig.local` are joined. Resources not listed stay each repository's own, and `turn list` shows both.
+
+The MCP tools `graft_turn_take`, `graft_turn_release` and `graft_turn_list` serve the same turns. They do not need the host's `--allow-exec` option: they run nothing and change only Graft's own state. Over MCP the session is the holder: the server holds every turn its client takes under a lease of its own and with its own process ID, so the agent gives neither, and the turns end when the session ends. `graft_turn_take` takes `resource`, `holder`, optional `grafts` (paths, relative to the repository the server serves) and optional `wait` and `ttl`; `graft_turn_release` takes `resource` and `holder`. Give `wait` a value shorter than the client's limit for one tool call. A call the client cancels stops asking, and gives up a turn it was granted after the cancellation unless it only renewed a turn the holder already held.
+
+If a turn state file cannot be read, commands for that resource fail, name the file and leave it unchanged; move it aside to start that resource's queue again. A state file written before holders replaced grafts as the holders of turns is reported the same way.
 
 ## Hooks
 
@@ -409,8 +434,10 @@ These codes and fields tell you that Graft kept something instead of deleting or
 | `default_branch` | `push` without `--to` would update the remote's default branch, because the graft's branch has its name. `details.remote` and `details.branch` name them. Nothing was pushed. | Push to another branch with `--to`, or name the default branch with `--to` if it is meant to be updated. |
 | `git_busy` | A Git lock or an unreadable index in the graft or primary is held by a command Graft did not start, or cannot prove has exited. | Wait for the Git command to finish. Remove a lock only once no Git command is running. |
 | `workspace_busy` | Another Graft command, a running hook, or a process started by `exec` (including background jobs), holds the graft. | Wait, or stop the background job, then retry. |
-| `"granted": false` (with `position`) | A `turn take` reply, not an error: another graft holds the turn on the resource or is ahead in its queue. | Leave the resource alone. Ask again within 300 seconds, or use `--wait`. See [take turns on a shared resource](#take-turns-on-a-shared-resource). |
+| `"granted": false` (with `position`) | A `turn take` reply, not an error: another holder holds the turn on the resource or is ahead in its queue. | Leave the resource alone. Ask again within 300 seconds, or use `--wait`. See [take turns on a shared resource](#take-turns-on-a-shared-resource). |
 | `invalid_resource` | A `turn` command was given a resource name that is not 1 to 64 lowercase letters, numbers or hyphens starting with a letter or number. Nothing changed. | Use a name of that form. |
+| `invalid_holder` | A `turn` command was given a holder name that is not 1 to 64 letters, digits, `-`, `_` or `.`, a lease that is not a random UUIDv4, a `--pid` that names no running process, or a `--graft` path that is not an active graft. Nothing changed. | Fix the argument. See [take turns on a shared resource](#take-turns-on-a-shared-resource). |
+| `lease_mismatch` (from `turn`) | Another lease holds or waits for the turn under this holder name. `details.holder` names it. Nothing changed. | Use the lease the name was first given, or another name. |
 | `invalid_config` | `.graftconfig` or `.graftconfig.local` is not valid JSON, is not a JSON object, has a key Graft does not know, or defines a hook or pattern Graft refuses. `details.file` names the file, and the message says what is wrong. Nothing was changed. | Fix the file and retry. See [configure a project](#configure-a-project). |
 | `hook_failed` | One of the project's `pre-archive` hooks exited with a non-zero code or could not be started, so `remove` or `merge` did not archive the graft. `details.hooks` carries the exit code and output of each hook, those skipped after it too. Graft changed nothing; the hook may have. As a prune `reason`, the same for one expired graft; prune went on with the others. | Fix what the hook reports, then retry. The hook runs again. See [hooks](#hooks). |
 | `purge_failed` | `prune --apply --purge-archives` could not delete an archive. Unlike the other codes here, the command has changed things: prune archived what `details.retained` reports, and `details.archives.purged` lists the archives deleted before the failure. `message` names the cause. | Fix the named problem, then rerun the command. It finishes a deletion it had begun. |

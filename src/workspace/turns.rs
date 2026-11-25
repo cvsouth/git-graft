@@ -1,19 +1,36 @@
 //! Turns on a named shared resource: something a project has once and cannot
 //! copy per graft, such as a development server on a fixed port. Each
-//! resource has one holder and a first-come queue, kept in the project's
-//! private state. Graft does nothing to the resource itself: like a lease, a
-//! turn is a promise between cooperating clients. Callers hold the project
-//! lock while reading or changing turn state.
-use std::{collections::HashSet, fs, path::PathBuf};
+//! resource has one holder and a first-come queue. A holder is whoever does
+//! the work that needs the resource, such as an agent, under a name it
+//! chooses and a lease that proves the name is its own. One holder can work
+//! in grafts of several repositories and still hold one turn.
+//!
+//! A holder loses its turn and its place when its turn runs out, when the
+//! process it named ends, or when none of the grafts it named is active any
+//! more. Turn state is kept in a project's private state: the primary's, or,
+//! for a resource the configuration lists under `turns`, that of the
+//! repository at the configuration's directory, which every repository it
+//! configures shares. Graft does nothing to the resource itself: like a
+//! lease, a turn is a promise between cooperating clients. Callers hold the
+//! lock of the project that keeps the state while reading or changing it.
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
-use super::registry::{self, Record};
+use super::registry;
 use crate::{
     api, cache,
-    registry::{Project, atomic, dir, exists, now, owned_directory},
+    config::Config,
+    registry::{Paths, Project, atomic, dir, exists, now, owned_directory},
 };
 
 const DIRECTORY: &str = "turns";
@@ -22,10 +39,13 @@ const DIRECTORY: &str = "turns";
 const PREFIX: &str = "turn-";
 const SUFFIX: &str = ".json";
 const MAX_BYTES: usize = 1024 * 1024;
-/// A queued graft keeps its place while it asks again within this long.
+/// A queued holder keeps its place while it asks again within this long.
 const QUEUE_SECS: u64 = 300;
+const MAX_HOLDER_BYTES: usize = 64;
+/// The most grafts one holder may name.
+const MAX_GRAFTS: usize = 64;
 
-pub(super) fn validate_resource(resource: &str) -> Result<()> {
+pub(crate) fn validate_resource(resource: &str) -> Result<()> {
     if resource.is_empty()
         || resource.len() > 64
         || resource.starts_with('-')
@@ -42,11 +62,90 @@ pub(super) fn validate_resource(resource: &str) -> Result<()> {
     Ok(())
 }
 
+fn invalid_holder(message: impl Into<String>) -> anyhow::Error {
+    api::fault("invalid_holder", message.into(), Value::Null)
+}
+
+/// A holder is named by 1 to 64 letters, digits, `-`, `_` or `.`, and proves
+/// the name with a random UUIDv4 of its own choosing.
+fn validate_holder(holder: &str, lease: &str) -> Result<()> {
+    if holder.is_empty()
+        || holder.len() > MAX_HOLDER_BYTES
+        || holder.starts_with('-')
+        || !holder
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        return Err(invalid_holder(format!(
+            "Use a holder name of 1 to {MAX_HOLDER_BYTES} letters, digits, '-', '_' or '.', not starting with '-'"
+        )));
+    }
+    let random = Uuid::parse_str(lease).is_ok_and(|id| {
+        id.get_version() == Some(uuid::Version::Random)
+            && id.get_variant() == uuid::Variant::RFC4122
+    });
+    if !random {
+        return Err(invalid_holder(
+            "Use a randomly generated UUIDv4 as the holder's lease, and keep it for every later take and release",
+        ));
+    }
+    Ok(())
+}
+
+/// What is stored of a lease: its digest, so the state file never holds it.
+fn digest(lease: &str) -> String {
+    Sha256::digest(lease.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A process whose life bounds a holder, by ID and start time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Process {
+    pid: u32,
+    start: String,
+}
+
+/// A graft a holder works in: the primary checkout of its repository, the
+/// graft's ID there, and its name and path as they were when named.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Graft {
+    project: PathBuf,
+    id: String,
+    name: String,
+    path: PathBuf,
+}
+
+/// Who holds or waits for a turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Party {
+    name: String,
+    /// The digest of the holder's lease.
+    lease: String,
+    process: Option<Process>,
+    grafts: Vec<Graft>,
+}
+
+impl Party {
+    /// Take what a later ask says about the holder's process and grafts.
+    fn update(&mut self, asked: &Party) {
+        if asked.process.is_some() {
+            self.process.clone_from(&asked.process);
+        }
+        if !asked.grafts.is_empty() {
+            self.grafts.clone_from(&asked.grafts);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Holder {
-    id: String,
-    name: String,
+    who: Party,
     /// When the turn was granted.
     since: u64,
     /// When the holder last took the turn again.
@@ -63,10 +162,9 @@ impl Holder {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Waiter {
-    id: String,
-    name: String,
+    who: Party,
     joined: u64,
-    /// When the graft last asked for the turn.
+    /// When the holder last asked for the turn.
     asked: u64,
 }
 
@@ -77,94 +175,121 @@ struct Turn {
     queue: Vec<Waiter>,
 }
 
-/// The graft that asks.
-#[derive(Clone, Copy)]
-struct Graft<'a> {
-    id: &'a str,
-    name: &'a str,
+fn lease_mismatch(holder: &str) -> anyhow::Error {
+    api::fault(
+        "lease_mismatch",
+        format!(
+            "Another holder holds or waits for this turn under the name {holder}. Use the lease that name was first given, or another name"
+        ),
+        json!({"holder": holder}),
+    )
 }
 
-// The rules. They read no clock and no file: `now` and the IDs of the grafts
-// that are still active come from the caller.
+// The rules. They read no clock, file or process: `now`, and whether a
+// party has gone, come from the caller.
 impl Turn {
-    /// Forget a holder whose graft is no longer active or whose turn ran out,
-    /// and every queued graft that is no longer active or stopped asking.
-    fn settle(&mut self, now: u64, active: &HashSet<String>) {
+    /// Forget a holder that has gone or whose turn ran out, and every queued
+    /// party that has gone or stopped asking.
+    fn settle(&mut self, now: u64, gone: &dyn Fn(&Party) -> bool) {
         if self
             .holder
             .as_ref()
-            .is_some_and(|holder| !active.contains(&holder.id) || now >= holder.expires_at())
+            .is_some_and(|holder| now >= holder.expires_at() || gone(&holder.who))
         {
             self.holder = None;
         }
-        self.queue.retain(|waiter| {
-            active.contains(&waiter.id) && now <= waiter.asked.saturating_add(QUEUE_SECS)
-        });
+        self.queue
+            .retain(|waiter| now <= waiter.asked.saturating_add(QUEUE_SECS) && !gone(&waiter.who));
     }
 
-    /// Ask for the turn, and report whether `graft` now holds it. A holder
+    /// Ask for the turn, and report whether `who` now holds it. A holder
     /// renews its turn. Anyone else joins the queue, or keeps its place in
-    /// it, and gets the turn once nobody holds it and nobody is ahead.
+    /// it, and gets the turn once nobody holds it and nobody is ahead. A
+    /// name held or queued under another lease is refused.
     fn take(
         &mut self,
         now: u64,
-        graft: Graft<'_>,
+        who: &Party,
         ttl: Option<u64>,
-        active: &HashSet<String>,
-    ) -> bool {
-        self.settle(now, active);
+        gone: &dyn Fn(&Party) -> bool,
+    ) -> Result<bool> {
+        self.settle(now, gone);
         if let Some(holder) = self.holder.as_mut()
-            && holder.id == graft.id
+            && holder.who.name == who.name
         {
+            ensure!(holder.who.lease == who.lease, lease_mismatch(&who.name));
+            holder.who.update(who);
             holder.renewed = now;
             holder.ttl = ttl.unwrap_or(holder.ttl);
-            return true;
+            return Ok(true);
         }
-        match self.queue.iter_mut().find(|waiter| waiter.id == graft.id) {
-            Some(waiter) => waiter.asked = now,
+        match self
+            .queue
+            .iter_mut()
+            .find(|waiter| waiter.who.name == who.name)
+        {
+            Some(waiter) => {
+                ensure!(waiter.who.lease == who.lease, lease_mismatch(&who.name));
+                waiter.who.update(who);
+                waiter.asked = now;
+            }
             None => self.queue.push(Waiter {
-                id: graft.id.into(),
-                name: graft.name.into(),
+                who: who.clone(),
                 joined: now,
                 asked: now,
             }),
         }
-        if self.holder.is_some() || self.queue[0].id != graft.id {
-            return false;
+        if self.holder.is_some() || self.queue[0].who.name != who.name {
+            return Ok(false);
         }
-        self.queue.remove(0);
+        let first = self.queue.remove(0);
         self.holder = Some(Holder {
-            id: graft.id.into(),
-            name: graft.name.into(),
+            who: first.who,
             since: now,
             renewed: now,
             ttl: ttl.unwrap_or(api::TURN_TTL_DEFAULT),
         });
-        true
+        Ok(true)
     }
 
-    /// Give up the turn or leave the queue, and report whether `graft` did
-    /// either. The next graft in line gets the turn when it next asks.
-    fn release(&mut self, now: u64, graft: &str, active: &HashSet<String>) -> bool {
-        let held = self
-            .holder
-            .as_ref()
-            .is_some_and(|holder| holder.id == graft);
+    /// Give up the turn or leave the queue, and report whether the holder
+    /// named `name` did either. The next in line gets the turn when it next
+    /// asks. A name held or queued under another lease is refused.
+    fn release(
+        &mut self,
+        now: u64,
+        name: &str,
+        lease: &str,
+        gone: &dyn Fn(&Party) -> bool,
+    ) -> Result<bool> {
+        let mine = |who: &Party| -> Result<bool> {
+            if who.name != name {
+                return Ok(false);
+            }
+            ensure!(who.lease == lease, lease_mismatch(name));
+            Ok(true)
+        };
+        let held = match &self.holder {
+            Some(holder) => mine(&holder.who)?,
+            None => false,
+        };
+        let mut queued = false;
+        for waiter in &self.queue {
+            queued |= mine(&waiter.who)?;
+        }
         if held {
             self.holder = None;
         }
-        let queued = self.queue.len();
-        self.queue.retain(|waiter| waiter.id != graft);
-        let released = held || self.queue.len() != queued;
+        self.queue.retain(|waiter| waiter.who.name != name);
         // Settled last: a holder whose turn has just run out still gave it up.
-        self.settle(now, active);
-        released
+        self.settle(now, gone);
+        Ok(held || queued)
     }
 
-    fn position(&self, graft: &str) -> Option<usize> {
+    fn position(&self, name: &str) -> Option<usize> {
         self.queue
             .iter()
-            .position(|waiter| waiter.id == graft)
+            .position(|waiter| waiter.who.name == name)
             .map(|index| index + 1)
     }
 
@@ -172,16 +297,77 @@ impl Turn {
         self.holder.is_none() && self.queue.is_empty()
     }
 
-    /// What everyone may see: names and times, never a lease or a graft ID.
+    /// What everyone may see: names, times and the holder's graft paths,
+    /// never a lease or a graft ID.
     fn describe(&self, resource: &str) -> Value {
         let holder = self.holder.as_ref();
         json!({
             "resource": resource,
-            "holder": holder.map(|holder| &holder.name),
+            "holder": holder.map(|holder| &holder.who.name),
             "since": holder.map(|holder| holder.since),
             "expires_at": holder.map(Holder::expires_at),
-            "queue": self.queue.iter().map(|waiter| &waiter.name).collect::<Vec<_>>(),
+            "grafts": holder.map_or_else(Vec::new, |holder| {
+                holder.who.grafts.iter().map(|graft| &graft.path).collect::<Vec<_>>()
+            }),
+            "queue": self.queue.iter().map(|waiter| &waiter.who.name).collect::<Vec<_>>(),
         })
+    }
+}
+
+/// Tells whether a party has gone. Each repository's active grafts are read
+/// once, without its lock, as another repository's lock may be held by a
+/// command that is itself waiting for this one.
+struct Liveness<'a> {
+    here: &'a Project,
+    live: RefCell<HashMap<PathBuf, Option<HashSet<String>>>>,
+}
+
+impl<'a> Liveness<'a> {
+    fn new(here: &'a Project) -> Self {
+        Self {
+            here,
+            live: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The active graft IDs of the repository whose primary is `project`,
+    /// or `None` when they cannot be read.
+    fn live_in(&self, project: &Path) -> Option<HashSet<String>> {
+        if project == self.here.repo {
+            return registry::live_ids(self.here).ok();
+        }
+        let paths = Project::paths(project).ok()?;
+        if paths.0 != project {
+            return None;
+        }
+        match Project::read_existing_at(paths).ok()? {
+            Some(other) => registry::live_ids(&other).ok(),
+            None => Some(HashSet::new()),
+        }
+    }
+
+    /// Whether the graft `id` of the repository at `project` is active. A
+    /// repository whose grafts cannot be read counts its grafts as active:
+    /// they may still be using the resource.
+    fn active(&self, project: &Path, id: &str) -> bool {
+        let mut live = self.live.borrow_mut();
+        let ids = live
+            .entry(project.to_owned())
+            .or_insert_with(|| self.live_in(project));
+        ids.as_ref().is_none_or(|ids| ids.contains(id))
+    }
+
+    fn gone(&self, who: &Party) -> bool {
+        if let Some(process) = &who.process
+            && !crate::process::alive(process.pid, &process.start)
+        {
+            return true;
+        }
+        !who.grafts.is_empty()
+            && !who
+                .grafts
+                .iter()
+                .any(|graft| self.active(&graft.project, &graft.id))
     }
 }
 
@@ -195,6 +381,9 @@ struct Stored {
     holder: Option<Holder>,
     queue: Vec<Waiter>,
 }
+
+/// The version of the stored turn. Version 1 held grafts as holders.
+const VERSION: u8 = 2;
 
 fn file(p: &Project, resource: &str) -> PathBuf {
     p.state
@@ -218,7 +407,7 @@ fn read(p: &Project, resource: &str) -> Result<Turn> {
         let stored: Stored =
             serde_json::from_slice(&cache::read_private_file(&path, MAX_BYTES as u64)?)?;
         ensure!(
-            stored.version == 1 && stored.project == p.id() && stored.resource == resource,
+            stored.version == VERSION && stored.project == p.id() && stored.resource == resource,
             "it belongs to another project, resource or version"
         );
         Ok(Turn {
@@ -243,7 +432,7 @@ fn write(p: &Project, resource: &str, turn: &Turn) -> Result<()> {
         registry::sync_directory(&p.state)?;
     }
     let bytes = serde_json::to_vec(&Stored {
-        version: 1,
+        version: VERSION,
         project: p.id().into(),
         resource: resource.into(),
         holder: turn.holder.clone(),
@@ -251,57 +440,150 @@ fn write(p: &Project, resource: &str, turn: &Turn) -> Result<()> {
     })?;
     ensure!(
         bytes.len() <= MAX_BYTES,
-        "too many grafts wait for resource {resource}"
+        "too many holders wait for resource {resource}"
     );
     atomic(&file(p, resource), &bytes)
 }
 
-/// `turn take`, asked once. The caller authenticated the graft `r`.
-pub(super) fn take(p: &Project, r: &Record, args: &api::TurnTake) -> Result<Value> {
-    let active = registry::live_ids(p)?;
-    let stored = read(p, &args.resource)?;
-    let mut turn = stored.clone();
-    let graft = Graft {
-        id: &r.id,
-        name: &r.name,
+/// Where the turns of the primary at `primary` are kept: the paths of the
+/// primary's own project, and, when the configuration shares resources, the
+/// paths of the project at its directory with the resources it shares.
+/// The project that keeps the turns the configuration shares, and their names.
+type Shared = Option<(Paths, Vec<String>)>;
+
+fn places(primary: &Path, own: Paths) -> Result<(Paths, Shared)> {
+    let config = Config::read(primary)?;
+    let shared = match config.dir {
+        Some(dir) if !config.turns.is_empty() && dir != primary => {
+            let paths = Project::paths(&dir).ok().filter(|paths| paths.0 == dir);
+            let Some(paths) = paths else {
+                return Err(api::fault(
+                    "invalid_config",
+                    format!(
+                        "{} lists turns to share, but the directory is not the root of a Git checkout, which would keep their state",
+                        dir.display()
+                    ),
+                    json!({"file": dir}),
+                ));
+            };
+            Some((paths, config.turns))
+        }
+        _ => None,
     };
-    let granted = turn.take(now(), graft, args.ttl, &active);
+    Ok((own, shared))
+}
+
+/// The paths of the project that keeps the turn on `resource`.
+fn place_of(primary: &Path, own: Paths, resource: &str) -> Result<Paths> {
+    Ok(match places(primary, own)? {
+        (_, Some((paths, shared))) if shared.iter().any(|known| known == resource) => paths,
+        (own, _) => own,
+    })
+}
+
+/// The grafts at `paths`, each of which must be an active graft.
+fn grafts_at(paths: &[PathBuf], liveness: &Liveness<'_>) -> Result<Vec<Graft>> {
+    if paths.len() > MAX_GRAFTS {
+        return Err(invalid_holder(format!(
+            "A holder may name at most {MAX_GRAFTS} grafts"
+        )));
+    }
+    let mut grafts: Vec<Graft> = Vec::new();
+    for path in paths {
+        let found = dunce::canonicalize(path)
+            .ok()
+            .and_then(|canonical| Some((registry::discover(&canonical).ok()??, canonical)));
+        let Some((location, canonical)) = found else {
+            return Err(invalid_holder(format!(
+                "{} is not a graft. Name the directory of an active graft",
+                path.display()
+            )));
+        };
+        if !liveness.active(&location.project, &location.id) {
+            return Err(invalid_holder(format!(
+                "Graft {} at {} is not active",
+                location.name,
+                path.display()
+            )));
+        }
+        if !grafts
+            .iter()
+            .any(|known| known.project == location.project && known.id == location.id)
+        {
+            grafts.push(Graft {
+                project: location.project,
+                id: location.id,
+                name: location.name,
+                path: canonical,
+            });
+        }
+    }
+    Ok(grafts)
+}
+
+/// `turn take`, asked once, for the primary at `primary` whose own project
+/// is at `own`.
+pub(super) fn take(primary: &Path, own: Paths, args: &api::TurnTake) -> Result<Value> {
+    validate_resource(&args.resource)?;
+    args.check()?;
+    validate_holder(&args.holder, &args.lease)?;
+    let process = match args.pid {
+        None => None,
+        Some(pid) => Some(Process {
+            pid,
+            start: crate::process::start_time(pid)
+                .ok_or_else(|| invalid_holder(format!("No running process has the ID {pid}")))?,
+        }),
+    };
+    let (p, _lock) = Project::open_at(place_of(primary, own, &args.resource)?, false)?;
+    let liveness = Liveness::new(&p);
+    let who = Party {
+        name: args.holder.clone(),
+        lease: digest(&args.lease),
+        process,
+        grafts: grafts_at(&args.grafts, &liveness)?,
+    };
+    let stored = read(&p, &args.resource)?;
+    let mut turn = stored.clone();
+    let granted = turn.take(now(), &who, args.ttl, &|party| liveness.gone(party))?;
     if turn != stored {
-        write(p, &args.resource, &turn)?;
+        write(&p, &args.resource, &turn)?;
     }
     let mut reply = turn.describe(&args.resource);
     reply["granted"] = json!(granted);
     if !granted {
-        reply["position"] = json!(turn.position(&r.id));
+        reply["position"] = json!(turn.position(&args.holder));
     }
     Ok(reply)
 }
 
-/// `turn release`. The caller authenticated the graft `r`.
-pub(super) fn release(p: &Project, r: &Record, resource: &str) -> Result<Value> {
-    let active = registry::live_ids(p)?;
-    let stored = read(p, resource)?;
+/// `turn release`, for the primary at `primary` whose own project is at `own`.
+pub(super) fn release(primary: &Path, own: Paths, args: &api::TurnRelease) -> Result<Value> {
+    validate_resource(&args.resource)?;
+    validate_holder(&args.holder, &args.lease)?;
+    let (p, _lock) = Project::open_at(place_of(primary, own, &args.resource)?, false)?;
+    let liveness = Liveness::new(&p);
+    let stored = read(&p, &args.resource)?;
     let mut turn = stored.clone();
-    let released = turn.release(now(), &r.id, &active);
+    let released = turn.release(now(), &args.holder, &digest(&args.lease), &|party| {
+        liveness.gone(party)
+    })?;
     if turn != stored {
-        write(p, resource, &turn)?;
+        write(&p, &args.resource, &turn)?;
     }
     Ok(json!({
-        "resource": resource,
+        "resource": args.resource,
         "released": released,
-        "next": turn.queue.first().map(|waiter| &waiter.name),
+        "next": turn.queue.first().map(|waiter| &waiter.who.name),
     }))
 }
 
-/// `turn list`: every resource someone holds or waits for, as the next
-/// `take` would find it. Reads only; `take` and `release` store what they
-/// forget.
-pub(super) fn list(p: &Project) -> Result<Value> {
+/// The resources with stored turns in project `p`.
+fn resources(p: &Project) -> Result<Vec<String>> {
     let directory = p.state.join(DIRECTORY);
-    let mut turns = Vec::new();
+    let mut resources = Vec::new();
     if exists(&directory)? {
         owned_directory(&directory)?;
-        let mut resources = Vec::new();
         for entry in fs::read_dir(&directory)? {
             // Anything else here, such as a temporary file an interrupted
             // write left behind, is not turn state.
@@ -314,17 +596,51 @@ pub(super) fn list(p: &Project) -> Result<Value> {
                 resources.push(resource.to_owned());
             }
         }
-        resources.sort();
-        let active = registry::live_ids(p)?;
-        let now = now();
-        for resource in resources {
-            let mut turn = read(p, &resource)?;
-            turn.settle(now, &active);
-            if !turn.idle() {
-                turns.push(turn.describe(&resource));
-            }
+    }
+    resources.sort();
+    Ok(resources)
+}
+
+/// The turns of project `p` that someone holds or waits for, as the next
+/// `take` would find them, among the resources `keep` accepts.
+fn listed(p: &Project, keep: &dyn Fn(&str) -> bool) -> Result<Vec<Value>> {
+    let liveness = Liveness::new(p);
+    let now = now();
+    let mut turns = Vec::new();
+    for resource in resources(p)?.into_iter().filter(|r| keep(r)) {
+        let mut turn = read(p, &resource)?;
+        turn.settle(now, &|party| liveness.gone(party));
+        if !turn.idle() {
+            turns.push(turn.describe(&resource));
         }
     }
+    Ok(turns)
+}
+
+/// `turn list`: every resource someone holds or waits for, as the next
+/// `take` would find it, from the primary's own project and from the project
+/// that keeps the resources the configuration shares. Reads only, and
+/// creates no state; `take` and `release` store what they forget.
+pub(super) fn list(primary: &Path, own: Paths) -> Result<Value> {
+    let (own, shared) = places(primary, own)?;
+    let names: Vec<String> = shared
+        .as_ref()
+        .map(|(_, names)| names.clone())
+        .unwrap_or_default();
+    let mut turns = Vec::new();
+    if let Some((p, _lock)) = Project::open_existing_at(own)? {
+        turns.extend(listed(&p, &|resource| {
+            !names.iter().any(|name| name == resource)
+        })?);
+    }
+    if let Some((paths, _)) = shared
+        && let Some((p, _lock)) = Project::open_existing_at(paths)?
+    {
+        turns.extend(listed(&p, &|resource| {
+            names.iter().any(|name| name == resource)
+        })?);
+    }
+    turns.sort_by(|a, b| a["resource"].as_str().cmp(&b["resource"].as_str()));
     Ok(json!({ "turns": turns }))
 }
 
@@ -332,78 +648,88 @@ pub(super) fn list(p: &Project) -> Result<Value> {
 mod tests {
     use super::*;
 
-    const A: Graft<'static> = Graft {
-        id: "id-a",
-        name: "task-a",
-    };
-    const B: Graft<'static> = Graft {
-        id: "id-b",
-        name: "task-b",
-    };
-    const C: Graft<'static> = Graft {
-        id: "id-c",
-        name: "task-c",
-    };
-
-    fn active(grafts: &[Graft<'_>]) -> HashSet<String> {
-        grafts.iter().map(|graft| graft.id.to_owned()).collect()
+    fn party(name: &str) -> Party {
+        Party {
+            name: name.into(),
+            lease: digest(&format!("lease of {name}")),
+            process: None,
+            grafts: Vec::new(),
+        }
     }
 
-    fn all() -> HashSet<String> {
-        active(&[A, B, C])
+    fn a() -> Party {
+        party("task-a")
+    }
+    fn b() -> Party {
+        party("task-b")
+    }
+    fn c() -> Party {
+        party("task-c")
+    }
+
+    fn stay(_: &Party) -> bool {
+        false
     }
 
     fn queue(turn: &Turn) -> Vec<&str> {
         turn.queue
             .iter()
-            .map(|waiter| waiter.name.as_str())
+            .map(|waiter| waiter.who.name.as_str())
             .collect()
     }
 
     fn holder(turn: &Turn) -> Option<&str> {
-        turn.holder.as_ref().map(|holder| holder.name.as_str())
+        turn.holder.as_ref().map(|holder| holder.who.name.as_str())
+    }
+
+    fn take(turn: &mut Turn, now: u64, who: &Party, ttl: Option<u64>) -> bool {
+        turn.take(now, who, ttl, &stay).unwrap()
+    }
+
+    fn release(turn: &mut Turn, now: u64, who: &Party) -> bool {
+        turn.release(now, &who.name, &who.lease, &stay).unwrap()
     }
 
     #[test]
-    fn the_turn_passes_in_the_order_grafts_first_asked() {
+    fn the_turn_passes_in_the_order_holders_first_asked() {
         let mut turn = Turn::default();
-        assert!(turn.take(100, A, None, &all()));
-        assert!(!turn.take(101, B, None, &all()));
-        assert!(!turn.take(102, C, None, &all()));
+        assert!(take(&mut turn, 100, &a(), None));
+        assert!(!take(&mut turn, 101, &b(), None));
+        assert!(!take(&mut turn, 102, &c(), None));
         assert_eq!(
             (holder(&turn), queue(&turn)),
             (Some("task-a"), vec!["task-b", "task-c"])
         );
         assert_eq!(
-            (turn.position(B.id), turn.position(C.id)),
+            (turn.position("task-b"), turn.position("task-c")),
             (Some(1), Some(2))
         );
-        assert_eq!(turn.position(A.id), None);
+        assert_eq!(turn.position("task-a"), None);
 
-        assert!(turn.release(103, A.id, &all()));
+        assert!(release(&mut turn, 103, &a()));
         // The turn is free, but task-b asked first.
-        assert!(!turn.take(104, C, None, &all()));
-        assert_eq!((holder(&turn), turn.position(C.id)), (None, Some(2)));
-        assert!(turn.take(105, B, None, &all()));
+        assert!(!take(&mut turn, 104, &c(), None));
+        assert_eq!((holder(&turn), turn.position("task-c")), (None, Some(2)));
+        assert!(take(&mut turn, 105, &b(), None));
         assert_eq!(
             (holder(&turn), queue(&turn)),
             (Some("task-b"), vec!["task-c"])
         );
-        assert!(turn.release(106, B.id, &all()));
-        assert!(turn.take(107, C, None, &all()));
-        assert!(turn.release(108, C.id, &all()));
+        assert!(release(&mut turn, 106, &b()));
+        assert!(take(&mut turn, 107, &c(), None));
+        assert!(release(&mut turn, 108, &c()));
         assert!(turn.idle());
     }
 
     #[test]
     fn asking_again_keeps_a_place_in_the_queue() {
         let mut turn = Turn::default();
-        assert!(turn.take(100, A, None, &all()));
-        assert!(!turn.take(101, B, None, &all()));
-        assert!(!turn.take(102, C, None, &all()));
-        assert!(!turn.take(350, C, None, &all()));
-        assert!(!turn.take(400, B, None, &all()));
-        assert!(!turn.take(600, C, None, &all()));
+        assert!(take(&mut turn, 100, &a(), None));
+        assert!(!take(&mut turn, 101, &b(), None));
+        assert!(!take(&mut turn, 102, &c(), None));
+        assert!(!take(&mut turn, 350, &c(), None));
+        assert!(!take(&mut turn, 400, &b(), None));
+        assert!(!take(&mut turn, 600, &c(), None));
         assert_eq!(queue(&turn), ["task-b", "task-c"]);
         let first = &turn.queue[0];
         assert_eq!((first.joined, first.asked), (101, 400));
@@ -412,292 +738,185 @@ mod tests {
     #[test]
     fn a_turn_that_is_not_renewed_runs_out_after_its_ttl() {
         let mut turn = Turn::default();
-        assert!(turn.take(100, A, Some(10), &all()));
-        assert!(!turn.take(109, B, None, &all()));
+        assert!(take(&mut turn, 100, &a(), Some(10)));
+        assert!(!take(&mut turn, 109, &b(), None));
         assert_eq!(holder(&turn), Some("task-a"));
-        assert!(turn.take(110, B, None, &all()));
+        assert!(take(&mut turn, 110, &b(), None));
         let held = turn.holder.clone().unwrap();
         assert_eq!((held.since, held.ttl), (110, api::TURN_TTL_DEFAULT));
-        // The earlier holder lost the turn and queues like anyone else.
-        assert!(!turn.take(111, A, None, &all()));
-        assert_eq!(turn.position(A.id), Some(1));
-    }
-
-    #[test]
-    fn a_holder_whose_turn_ran_out_goes_behind_those_already_waiting() {
-        let mut turn = Turn::default();
-        assert!(turn.take(100, A, Some(10), &all()));
-        assert!(!turn.take(105, B, None, &all()));
-        assert!(!turn.take(120, A, None, &all()));
-        assert_eq!(
-            (holder(&turn), queue(&turn)),
-            (None, vec!["task-b", "task-a"])
-        );
-        // Alone, it simply takes a new turn.
+        // The earlier holder lost the turn and queues like anyone else, and
+        // behind those already waiting.
+        assert!(!take(&mut turn, 111, &a(), None));
+        assert_eq!(turn.position("task-a"), Some(1));
         let mut alone = Turn::default();
-        assert!(alone.take(100, A, Some(10), &all()));
-        assert!(alone.take(120, A, None, &all()));
+        assert!(take(&mut alone, 100, &a(), Some(10)));
+        assert!(take(&mut alone, 120, &a(), None));
         assert_eq!(alone.holder.unwrap().since, 120);
     }
 
     #[test]
     fn a_waiter_that_stopped_asking_loses_its_place() {
         let mut turn = Turn::default();
-        assert!(turn.take(100, A, None, &all()));
-        assert!(!turn.take(101, B, None, &all()));
-        assert!(!turn.take(200, C, None, &all()));
-        assert!(turn.release(300, A.id, &all()));
+        assert!(take(&mut turn, 100, &a(), None));
+        assert!(!take(&mut turn, 101, &b(), None));
+        assert!(!take(&mut turn, 200, &c(), None));
+        assert!(release(&mut turn, 300, &a()));
         // task-b is first and last asked at 101, so it has until 401.
-        assert!(!turn.take(401, C, None, &all()));
+        assert!(!take(&mut turn, 401, &c(), None));
         assert_eq!(queue(&turn), ["task-b", "task-c"]);
-        assert!(turn.take(402, C, None, &all()));
+        assert!(take(&mut turn, 402, &c(), None));
         assert!(turn.queue.is_empty());
-        // Asking again later joins at the end with a new time.
-        assert!(!turn.take(403, B, None, &all()));
+        assert!(!take(&mut turn, 403, &b(), None));
         assert_eq!(turn.queue[0].joined, 403);
     }
 
     #[test]
-    fn grafts_that_are_no_longer_active_are_forgotten() {
+    fn holders_that_have_gone_are_forgotten() {
         let mut turn = Turn::default();
-        assert!(turn.take(100, A, None, &all()));
-        assert!(!turn.take(101, B, None, &all()));
-        assert!(!turn.take(102, C, None, &all()));
-        // task-a and task-b were archived; task-c is next at once.
-        assert!(turn.take(103, C, None, &active(&[C])));
+        assert!(take(&mut turn, 100, &a(), None));
+        assert!(!take(&mut turn, 101, &b(), None));
+        assert!(!take(&mut turn, 102, &c(), None));
+        // task-a's process ended and task-b's grafts were archived.
+        let gone = |who: &Party| who.name != "task-c";
+        assert!(turn.take(103, &c(), None, &gone).unwrap());
         assert_eq!((holder(&turn), queue(&turn)), (Some("task-c"), vec![]));
-
-        // A new graft that reuses an archived holder's name has another ID.
-        let renamed = Graft {
-            id: "id-d",
-            name: C.name,
-        };
-        assert!(turn.take(104, renamed, None, &active(&[renamed])));
-        assert_eq!(turn.holder.unwrap().id, "id-d");
+        // Once forgotten, its name is free for another lease.
+        let mut again = a();
+        again.lease = digest("another lease");
+        assert!(!turn.take(104, &again, None, &stay).unwrap());
+        assert_eq!(turn.queue[0].who.lease, again.lease);
     }
 
     #[test]
-    fn taking_again_renews_the_turn_and_can_change_its_ttl() {
+    fn a_name_held_or_queued_under_another_lease_is_refused() {
         let mut turn = Turn::default();
-        assert!(turn.take(100, A, None, &all()));
+        assert!(take(&mut turn, 100, &a(), None));
+        assert!(!take(&mut turn, 101, &b(), None));
+        let before = turn.clone();
+        for name in ["task-a", "task-b"] {
+            let mut impostor = party(name);
+            impostor.lease = digest("someone else's lease");
+            let error = turn.take(102, &impostor, None, &stay).unwrap_err();
+            assert_eq!(api::error_json(&error)["code"], "lease_mismatch");
+            assert_eq!(api::error_json(&error)["details"], json!({"holder": name}));
+            let error = turn.release(102, name, &impostor.lease, &stay).unwrap_err();
+            assert_eq!(api::error_json(&error)["code"], "lease_mismatch");
+        }
+        assert_eq!(turn, before);
+    }
+
+    #[test]
+    fn taking_again_renews_the_turn_and_updates_what_bounds_the_holder() {
+        let mut turn = Turn::default();
+        assert!(take(&mut turn, 100, &a(), None));
         let expires = |turn: &Turn| turn.holder.as_ref().unwrap().expires_at();
         assert_eq!(expires(&turn), 100 + api::TURN_TTL_DEFAULT);
-        assert!(turn.take(500, A, None, &all()));
-        assert_eq!(expires(&turn), 500 + api::TURN_TTL_DEFAULT);
-        assert!(turn.take(600, A, Some(60), &all()));
+        assert!(take(&mut turn, 600, &a(), Some(60)));
         assert_eq!(expires(&turn), 660);
         // A renewal without a ttl keeps the one the turn has.
-        assert!(turn.take(650, A, None, &all()));
+        assert!(take(&mut turn, 650, &a(), None));
         assert_eq!(expires(&turn), 710);
-        assert_eq!(turn.holder.unwrap().since, 100);
+        assert_eq!(turn.holder.as_ref().unwrap().since, 100);
+
+        let mut bounded = a();
+        bounded.process = Some(Process {
+            pid: 7,
+            start: "1".into(),
+        });
+        bounded.grafts = vec![Graft {
+            project: "/app".into(),
+            id: "id".into(),
+            name: "fix".into(),
+            path: "/app.graft/fix".into(),
+        }];
+        assert!(take(&mut turn, 700, &bounded, None));
+        // An ask that names neither keeps what the holder named before.
+        assert!(take(&mut turn, 710, &a(), None));
+        let who = &turn.holder.as_ref().unwrap().who;
+        assert_eq!(
+            (&who.process, &who.grafts),
+            (&bounded.process, &bounded.grafts)
+        );
     }
 
     #[test]
     fn release_clears_a_holder_or_a_waiter_and_nothing_else() {
         let mut turn = Turn::default();
-        assert!(!turn.release(99, A.id, &all()));
-        assert!(turn.take(100, A, None, &all()));
-        assert!(!turn.take(101, B, None, &all()));
-        assert!(!turn.take(102, C, None, &all()));
-        // A waiter leaves the queue and the holder keeps the turn.
-        assert!(turn.release(103, B.id, &all()));
+        assert!(!release(&mut turn, 99, &a()));
+        assert!(take(&mut turn, 100, &a(), None));
+        assert!(!take(&mut turn, 101, &b(), None));
+        assert!(!take(&mut turn, 102, &c(), None));
+        assert!(release(&mut turn, 103, &b()));
         assert_eq!(
             (holder(&turn), queue(&turn)),
             (Some("task-a"), vec!["task-c"])
         );
-        assert!(!turn.release(104, B.id, &all()));
-        assert!(turn.release(105, A.id, &all()));
+        assert!(!release(&mut turn, 104, &b()));
+        assert!(release(&mut turn, 105, &a()));
         assert_eq!((holder(&turn), queue(&turn)), (None, vec!["task-c"]));
-        assert!(!turn.release(106, A.id, &all()));
 
         // A turn that has already run out still counts as given up.
         let mut late = Turn::default();
-        assert!(late.take(100, A, Some(1), &all()));
-        assert!(late.release(200, A.id, &all()));
+        assert!(take(&mut late, 100, &a(), Some(1)));
+        assert!(release(&mut late, 200, &a()));
         assert!(late.idle());
     }
 
     #[test]
-    fn describes_names_and_times_only() {
+    fn describes_names_times_and_graft_paths_only() {
         let mut turn = Turn::default();
         assert_eq!(
             turn.describe("web"),
-            json!({"resource":"web","holder":null,"since":null,"expires_at":null,"queue":[]})
+            json!({"resource":"web","holder":null,"since":null,"expires_at":null,"grafts":[],"queue":[]})
         );
-        assert!(turn.take(100, A, Some(30), &all()));
-        assert!(!turn.take(101, B, None, &all()));
+        let mut holder = a();
+        holder.grafts = vec![Graft {
+            project: "/repo".into(),
+            id: "secret-id".into(),
+            name: "fix".into(),
+            path: "/repo.graft/fix".into(),
+        }];
+        assert!(take(&mut turn, 100, &holder, Some(30)));
+        assert!(!take(&mut turn, 101, &b(), None));
+        let described = turn.describe("web");
         assert_eq!(
-            turn.describe("web"),
-            json!({"resource":"web","holder":"task-a","since":100,"expires_at":130,"queue":["task-b"]})
+            described,
+            json!({"resource":"web","holder":"task-a","since":100,"expires_at":130,
+                   "grafts":["/repo.graft/fix"],"queue":["task-b"]})
         );
-    }
-
-    /// A project with real grafts, for the rules as stored.
-    struct Fixture {
-        _temp: tempfile::TempDir,
-        project: Project,
-        _lock: fs::File,
-    }
-
-    impl Fixture {
-        fn new() -> Result<Self> {
-            let temp = tempfile::tempdir()?;
-            let primary = temp.path().join("primary");
-            fs::create_dir(&primary)?;
-            crate::git::bytes(&primary, &["init", "-q", "--template=", "-b", "main"])?;
-            let (project, _lock) = Project::open(&primary)?;
-            Ok(Self {
-                _temp: temp,
-                project,
-                _lock,
-            })
-        }
-
-        fn graft(&self, name: &str) -> Result<Record> {
-            let p = &self.project;
-            let mut record = registry::reserve(p, name, None, None, Some("agent"), Value::Null)?;
-            // Like `add`, release the reservation's index lock once built.
-            crate::storage::release_index(&record.path.join(".git"))?;
-            crate::git::bytes(&record.path, &["init", "-q", "--template=", "-b", "agent"])?;
-            registry::finish(p, &mut record)?;
-            Ok(record)
-        }
-    }
-
-    fn ask(p: &Project, r: &Record, resource: &str) -> Result<Value> {
-        let args = api::TurnTake {
-            name: r.name.clone(),
-            resource: resource.into(),
-            lease: r.lease.clone(),
-            wait: 0,
-            ttl: None,
-        };
-        take(p, r, &args)
-    }
-
-    fn listed(p: &Project) -> Result<Vec<(String, Value, Value)>> {
-        let turns = list(p)?["turns"].take();
-        Ok(turns
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|turn| {
-                let resource = turn["resource"].as_str().unwrap().to_owned();
-                (resource, turn["holder"].clone(), turn["queue"].clone())
-            })
-            .collect())
+        assert!(!described.to_string().contains(&holder.lease));
     }
 
     #[test]
-    fn an_archived_holder_is_forgotten_and_a_restored_one_is_not() -> Result<()> {
-        let f = Fixture::new()?;
-        let p = &f.project;
-        assert_eq!(list(p)?, json!({"turns": []}));
-        assert!(!p.state.join(DIRECTORY).exists());
-        let (a, b) = (f.graft("task-a")?, f.graft("task-b")?);
-        assert_eq!(ask(p, &a, "web")?["granted"], true);
-        assert_eq!(ask(p, &a, "database")?["granted"], true);
-        assert_eq!(ask(p, &b, "web")?["position"], 1);
-
-        // Archiving changes no turn state, yet nobody sees the holder again.
-        let web = fs::read(file(p, "web"))?;
-        registry::retire(p, &a.name, &a.lease, registry::Status::Dropped, None)?;
-        assert_eq!(fs::read(file(p, "web"))?, web);
-        assert_eq!(listed(p)?, [("web".into(), Value::Null, json!(["task-b"]))]);
-        assert_eq!(ask(p, &b, "web")?["granted"], true);
-
-        // Restored before anyone else took it and within its ttl, the graft
-        // still holds the other turn, under the same graft ID.
-        let restored = registry::restore(p, &a.name, &a.lease)?;
-        assert_eq!(restored.id, a.id);
-        assert_eq!(
-            listed(p)?,
-            [
-                ("database".into(), json!("task-a"), json!([])),
-                ("web".into(), json!("task-b"), json!([])),
-            ]
-        );
-        assert_eq!(ask(p, &b, "database")?["position"], 1);
-        assert_eq!(ask(p, &restored, "database")?["granted"], true);
-        // The turn it lost while archived is the other graft's.
-        assert_eq!(ask(p, &restored, "web")?["position"], 1);
-        assert_eq!(
-            release(p, &b, "web")?,
-            json!({"resource":"web","released":true,"next":"task-a"})
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn a_graft_with_a_damaged_record_keeps_its_turn_until_it_runs_out() -> Result<()> {
-        let f = Fixture::new()?;
-        let p = &f.project;
-        let (a, b) = (f.graft("task-a")?, f.graft("task-b")?);
-        assert_eq!(ask(p, &a, "web")?["granted"], true);
-        let record = p
-            .state
-            .join("workspaces")
-            .join("records")
-            .join(format!("{}.json", a.id));
-        fs::write(&record, &fs::read(&record)?[..40])?;
-        assert_eq!(registry::damaged(p)?.len(), 1);
-        // Its graft may still be using the resource.
-        let reply = ask(p, &b, "web")?;
-        assert_eq!(
-            (&reply["granted"], &reply["holder"]),
-            (&json!(false), &json!("task-a"))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn turn_state_that_cannot_be_used_is_reported_and_left_unchanged() -> Result<()> {
-        let f = Fixture::new()?;
-        let p = &f.project;
-        let a = f.graft("task-a")?;
-        assert_eq!(ask(p, &a, "web")?["granted"], true);
-        let good = fs::read(file(p, "web"))?;
-
-        let foreign =
-            String::from_utf8(good.clone())?.replace(p.id(), &uuid::Uuid::new_v4().to_string());
-        for unusable in [b"{\"version\":1".to_vec(), foreign.into_bytes()] {
-            atomic(&file(p, "web"), &unusable)?;
-            for error in [
-                ask(p, &a, "web").unwrap_err(),
-                release(p, &a, "web").unwrap_err(),
-                list(p).unwrap_err(),
-            ] {
-                let message = format!("{error:#}");
-                assert!(
-                    message.contains("turn-web.json") && message.contains("left it unchanged"),
-                    "{message}"
-                );
-            }
-            assert_eq!(fs::read(file(p, "web"))?, unusable);
-            // Other resources are unaffected.
-            assert_eq!(ask(p, &a, "database")?["granted"], true);
+    fn holder_names_and_leases_are_checked() {
+        let lease = Uuid::new_v4().to_string();
+        for valid in ["agent", "869abc-fix", "session.2", "a_b", &"a".repeat(64)] {
+            validate_holder(valid, &lease).unwrap();
         }
-
-        // A stray file in the directory is not turn state.
-        atomic(&file(p, "web"), &good)?;
-        fs::write(p.state.join(DIRECTORY).join(".tmp-interrupted"), "partial")?;
-        fs::write(
-            p.state.join(DIRECTORY).join("turn-Not A Resource.json"),
-            "{}",
-        )?;
-        assert_eq!(listed(p)?.len(), 2);
-        Ok(())
+        for invalid in ["", "-agent", "two words", "a/b", "wé", &"a".repeat(65)] {
+            let error = validate_holder(invalid, &lease).unwrap_err();
+            assert_eq!(
+                api::error_json(&error)["code"],
+                "invalid_holder",
+                "{invalid}"
+            );
+        }
+        for lease in ["", "lease", "00000000-0000-0000-0000-000000000000"] {
+            let error = validate_holder("agent", lease).unwrap_err();
+            assert_eq!(api::error_json(&error)["code"], "invalid_holder", "{lease}");
+        }
+        // The stored digest never equals the lease and is stable.
+        assert_eq!(digest(&lease), digest(&lease));
+        assert_ne!(digest(&lease), lease);
     }
 
     #[test]
     fn resource_names_are_portable() {
         for valid in [
             "web",
-            "database",
             "ios-simulator-2",
             "3d-printer",
             "com3",
-            "a",
             &"a".repeat(64),
         ] {
             validate_resource(valid).unwrap();
@@ -709,7 +928,6 @@ mod tests {
             "web_server",
             "-web",
             "web/api",
-            "../web",
             "wéb",
             &"a".repeat(65),
         ] {
@@ -722,12 +940,233 @@ mod tests {
         }
     }
 
+    /// A directory that is a repository and holds two more, `app` and
+    /// `api`, as several repositories used together are kept.
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        app: PathBuf,
+        api: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Result<Self> {
+            let temp = tempfile::tempdir()?;
+            let root = dunce::canonicalize(temp.path())?.join("root");
+            let (app, api) = (root.join("app"), root.join("api"));
+            for repo in [&root, &app, &api] {
+                fs::create_dir_all(repo)?;
+                crate::git::bytes(repo, &["init", "-q", "--template=", "-b", "main"])?;
+            }
+            Ok(Self {
+                _temp: temp,
+                root,
+                app,
+                api,
+            })
+        }
+
+        fn ask(&self, repo: &Path, resource: &str, who: &str, pid: Option<u32>) -> Result<Value> {
+            super::take(
+                repo,
+                Project::paths(repo)?,
+                &api::TurnTake {
+                    resource: resource.into(),
+                    holder: who.into(),
+                    lease: lease(who),
+                    pid,
+                    grafts: Vec::new(),
+                    wait: 0,
+                    ttl: None,
+                },
+            )
+        }
+
+        fn give_up(&self, repo: &Path, resource: &str, who: &str) -> Result<Value> {
+            super::release(
+                repo,
+                Project::paths(repo)?,
+                &api::TurnRelease {
+                    resource: resource.into(),
+                    holder: who.into(),
+                    lease: lease(who),
+                },
+            )
+        }
+
+        fn list(&self, repo: &Path) -> Result<Vec<(String, Value, Value)>> {
+            let turns = list(repo, Project::paths(repo)?)?["turns"].take();
+            Ok(turns
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|turn| {
+                    let resource = turn["resource"].as_str().unwrap().to_owned();
+                    (resource, turn["holder"].clone(), turn["queue"].clone())
+                })
+                .collect())
+        }
+    }
+
+    /// One fixed lease per holder name, for the tests.
+    fn lease(who: &str) -> String {
+        thread_local! {
+            static LEASES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+        }
+        LEASES.with(|leases| {
+            leases
+                .borrow_mut()
+                .entry(who.to_owned())
+                .or_insert_with(|| Uuid::new_v4().to_string())
+                .clone()
+        })
+    }
+
+    #[test]
+    fn a_shared_resource_is_one_queue_for_every_repository_the_directory_configures() -> Result<()>
+    {
+        let f = Fixture::new()?;
+        fs::write(f.root.join(crate::config::LOCAL), r#"{"turns": ["stack"]}"#)?;
+        assert_eq!(f.list(&f.app)?, []);
+        assert_eq!(f.ask(&f.app, "stack", "agent-1", None)?["granted"], true);
+        let queued = f.ask(&f.api, "stack", "agent-2", None)?;
+        assert_eq!(
+            (&queued["granted"], &queued["holder"], &queued["position"]),
+            (&json!(false), &json!("agent-1"), &json!(1))
+        );
+        // The same holder asking from another repository holds the same turn.
+        assert_eq!(f.ask(&f.api, "stack", "agent-1", None)?["granted"], true);
+        // The state is the root's; a resource it does not share is each repository's own.
+        assert!(f.root.join(".git/graft/turns/turn-stack.json").is_file());
+        assert!(!f.app.join(".git/graft/turns").exists());
+        assert_eq!(f.ask(&f.app, "web", "agent-2", None)?["granted"], true);
+        assert_eq!(f.ask(&f.api, "web", "agent-1", None)?["granted"], true);
+        assert_eq!(
+            f.list(&f.app)?,
+            [
+                ("stack".into(), json!("agent-1"), json!(["agent-2"])),
+                ("web".into(), json!("agent-2"), json!([])),
+            ]
+        );
+        assert_eq!(
+            f.give_up(&f.app, "stack", "agent-1")?,
+            json!({"resource": "stack", "released": true, "next": "agent-2"})
+        );
+        assert_eq!(f.ask(&f.api, "stack", "agent-2", None)?["granted"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn turns_shared_from_a_directory_that_is_not_a_checkout_are_refused() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = dunce::canonicalize(temp.path())?;
+        let app = root.join("app");
+        fs::create_dir(&app)?;
+        crate::git::bytes(&app, &["init", "-q", "--template=", "-b", "main"])?;
+        fs::write(root.join(crate::config::SHARED), r#"{"turns": ["stack"]}"#)?;
+        let error = super::take(
+            &app,
+            Project::paths(&app)?,
+            &api::TurnTake {
+                resource: "stack".into(),
+                holder: "agent".into(),
+                lease: Uuid::new_v4().to_string(),
+                pid: None,
+                grafts: Vec::new(),
+                wait: 0,
+                ttl: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(api::error_json(&error)["code"], "invalid_config");
+        fs::write(root.join(crate::config::SHARED), r#"{"turns": ["Stack"]}"#)?;
+        let error = list(&app, Project::paths(&app)?).unwrap_err();
+        assert_eq!(api::error_json(&error)["code"], "invalid_config");
+        Ok(())
+    }
+
+    #[test]
+    fn a_holder_whose_process_ended_loses_the_turn() -> Result<()> {
+        let f = Fixture::new()?;
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
+            .args(if cfg!(windows) {
+                &["/C", "timeout", "30"][..]
+            } else {
+                &["30"][..]
+            })
+            .spawn()?;
+        let reply = f.ask(&f.app, "web", "short-lived", Some(child.id()))?;
+        assert_eq!(reply["granted"], true);
+        assert_eq!(f.ask(&f.app, "web", "patient", None)?["position"], 1);
+        child.kill()?;
+        child.wait()?;
+        assert_eq!(
+            f.list(&f.app)?,
+            [("web".into(), Value::Null, json!(["patient"]))]
+        );
+        assert_eq!(f.ask(&f.app, "web", "patient", None)?["granted"], true);
+        // A process that is not running cannot bound a holder.
+        let error = f.ask(&f.app, "web", "nobody", Some(u32::MAX)).unwrap_err();
+        assert_eq!(api::error_json(&error)["code"], "invalid_holder");
+        Ok(())
+    }
+
+    #[test]
+    fn only_an_active_graft_can_bound_a_holder() -> Result<()> {
+        let f = Fixture::new()?;
+        let error = super::take(
+            &f.app,
+            Project::paths(&f.app)?,
+            &api::TurnTake {
+                resource: "web".into(),
+                holder: "agent".into(),
+                lease: lease("agent"),
+                pid: None,
+                grafts: vec![f.api.clone()],
+                wait: 0,
+                ttl: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(api::error_json(&error)["code"], "invalid_holder");
+        assert!(format!("{error:#}").contains("is not a graft"));
+        Ok(())
+    }
+
+    #[test]
+    fn turn_state_that_cannot_be_used_is_reported_and_left_unchanged() -> Result<()> {
+        let f = Fixture::new()?;
+        assert_eq!(f.ask(&f.app, "web", "agent", None)?["granted"], true);
+        let path = f.app.join(".git/graft/turns/turn-web.json");
+        let good = fs::read(&path)?;
+        let older = String::from_utf8(good.clone())?.replace("\"version\":2", "\"version\":1");
+        for unusable in [b"{\"version\":2".to_vec(), older.into_bytes()] {
+            atomic(&path, &unusable)?;
+            for error in [
+                f.ask(&f.app, "web", "agent", None).unwrap_err(),
+                f.give_up(&f.app, "web", "agent").unwrap_err(),
+                list(&f.app, Project::paths(&f.app)?).unwrap_err(),
+            ] {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("turn-web.json") && message.contains("left it unchanged"),
+                    "{message}"
+                );
+            }
+            assert_eq!(fs::read(&path)?, unusable);
+            assert_eq!(f.ask(&f.app, "database", "agent", None)?["granted"], true);
+        }
+        Ok(())
+    }
+
     #[test]
     fn wait_and_ttl_have_limits() {
         let take = |wait, ttl| api::TurnTake {
-            name: "task-a".into(),
             resource: "web".into(),
+            holder: "agent".into(),
             lease: String::new(),
+            pid: None,
+            grafts: Vec::new(),
             wait,
             ttl,
         };

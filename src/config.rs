@@ -101,6 +101,9 @@ pub(crate) struct Config {
     /// below the directory, with the file that has it, so that a mistyped
     /// path can be reported rather than configure nothing unnoticed.
     pub missing_repositories: Vec<Value>,
+    /// The shared resources whose turns are kept in the Graft state of the
+    /// repository at [`Self::dir`], for every repository it configures.
+    pub turns: Vec<String>,
 }
 
 impl Config {
@@ -133,12 +136,14 @@ impl Config {
                 dir: None,
             };
             let missing = missing(primary, &shared, &local, &names);
+            let turns = turns(&shared, &local);
             let mut config = merge(
                 shared.map(|file| file.own),
                 local.map(|file| file.own),
                 &names,
             )?;
             config.missing_repositories = missing;
+            config.turns = turns;
             return Ok(config.placed(primary, false));
         }
         let ceiling = home
@@ -164,12 +169,14 @@ impl Config {
                 dir: Some(dir),
             };
             let missing = missing(dir, &shared, &local, &names);
+            let turns = turns(&shared, &local);
             let mut config = merge(
                 shared.and_then(|file| file.section(&key)),
                 local.and_then(|file| file.section(&key)),
                 &names,
             )?;
             config.missing_repositories = missing;
+            config.turns = turns;
             return Ok(config.placed(dir, true));
         }
         Ok(Self::default())
@@ -208,6 +215,21 @@ fn home() -> Option<PathBuf> {
     std::env::var_os(name)
         .map(PathBuf::from)
         .filter(|home| home.is_absolute())
+}
+
+/// The `turns` both files list, the shared file's first, each once.
+fn turns(shared: &Option<File>, local: &Option<File>) -> Vec<String> {
+    let mut turns: Vec<String> = Vec::new();
+    for resource in [shared, local]
+        .into_iter()
+        .flatten()
+        .flat_map(|file| &file.turns)
+    {
+        if !turns.contains(resource) {
+            turns.push(resource.clone());
+        }
+    }
+    turns
 }
 
 /// Whether `dir` has an entry called `name`, of any type, so that a file
@@ -305,6 +327,7 @@ impl<'de> Deserialize<'de> for Part {
 struct File {
     own: Part,
     repositories: Vec<(String, Part)>,
+    turns: Vec<String>,
 }
 
 impl File {
@@ -328,6 +351,8 @@ impl<'de> Deserialize<'de> for File {
             hooks: Option<Named>,
             #[serde(default)]
             repositories: Option<Repositories>,
+            #[serde(default)]
+            turns: Option<Vec<String>>,
         }
         let written = Written::deserialize(deserializer)?;
         Ok(File {
@@ -336,6 +361,7 @@ impl<'de> Deserialize<'de> for File {
                 hooks: written.hooks,
             },
             repositories: written.repositories.map(|r| r.0).unwrap_or_default(),
+            turns: written.turns.unwrap_or_default(),
         })
     }
 }
@@ -507,6 +533,10 @@ fn load(dir: &Path, name: &'static str, above: bool) -> Result<Option<File>> {
 /// `dir`.
 fn check(file: &File, name: &'static str, dir: &Path) -> Result<()> {
     check_part(&file.own, name, None)?;
+    for resource in &file.turns {
+        crate::workspace::validate_resource(resource)
+            .map_err(|_| anyhow::anyhow!("turns: {resource:?} is not a resource name: use 1 to 64 lowercase letters, numbers or hyphens, starting with a letter or number"))?;
+    }
     for (key, part) in &file.repositories {
         check_key(key)?;
         check_part(part, name, Some((key, dir)))
@@ -1417,5 +1447,36 @@ mod tests {
         );
         std::os::unix::fs::symlink(&kept, root.join(LOCAL)).unwrap();
         assert_eq!(Config::read(&app).unwrap().include, [".env"]);
+    }
+
+    #[test]
+    fn turns_are_listed_at_the_top_of_either_file_and_checked() {
+        let (_tmp, root, app, _api) = enclosing();
+        write(&root, SHARED, r#"{"turns": ["stack", "database"]}"#);
+        write(&root, LOCAL, r#"{"turns": ["database", "simulator"]}"#);
+        let config = Config::read(&app).unwrap();
+        assert_eq!(config.turns, ["stack", "database", "simulator"]);
+        assert_eq!(config.dir.as_deref(), Some(root.as_path()));
+        // Only the top level lists them, not a repository's settings.
+        write(
+            &root,
+            LOCAL,
+            r#"{"repositories": {"app": {"turns": ["web"]}}}"#,
+        );
+        let error = Config::read(&app).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field"), "{error:#}");
+        for bad in [
+            r#"{"turns": ["Stack"]}"#,
+            r#"{"turns": "stack"}"#,
+            r#"{"turns": [""]}"#,
+        ] {
+            write(&root, LOCAL, bad);
+            let error = Config::read(&app).unwrap_err();
+            assert_eq!(
+                crate::api::error_json(&error)["code"],
+                "invalid_config",
+                "{bad}"
+            );
+        }
     }
 }
