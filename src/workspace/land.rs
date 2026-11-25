@@ -25,7 +25,7 @@ const STORE_OWNER: &str = "graft-object-store";
 /// The first 128 bits of a BLAKE3 hash in hex. Ref and file names built from
 /// these stay well inside Windows' 260-character path limit, which Git for
 /// Windows enforces for loose refs.
-fn short_key(hash: blake3::Hash) -> String {
+pub(super) fn short_key(hash: blake3::Hash) -> String {
     hash.to_hex()[..32].to_owned()
 }
 

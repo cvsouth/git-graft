@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 
-use crate::api::{self, AddDep, DropWorkspace, Exec, Land, Name, Owned};
+use crate::api::{self, AddDep, DropWorkspace, Exec, Land, Name, Owned, Push};
 use crate::workspace::{self, Command, Spawn};
 
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -23,6 +23,7 @@ const MAX_REQUEST_BYTES: usize = 256 * 1024;
 struct Server {
     repo: PathBuf,
     allow_exec: bool,
+    allow_push: bool,
 }
 
 #[derive(serde::Deserialize, JsonSchema)]
@@ -59,13 +60,18 @@ impl ServerHandler for Server {
         } else {
             "Running commands and installing dependencies in grafts is disabled; the host must start with --allow-exec to enable it."
         };
+        let publishing = if self.allow_push {
+            "Pushing a graft's commits to a remote with graft_push is enabled by the host; use it only when the task asks for the work to be published."
+        } else {
+            "Pushing a graft's commits to a remote is disabled; the host must start with --allow-push to enable it."
+        };
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(format!(
-                "{instructions} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for just the ones to bring. Prefer naming them: [\"*\"] copies all of them, including build output and directories such as target/ and .venv/, which can be large. Omitting include uses the project's .worktreeinclude file if it has one, and copies nothing otherwise. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
+                "{instructions} {publishing} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for just the ones to bring. Prefer naming them: [\"*\"] copies all of them, including build output and directories such as target/ and .venv/, which can be large. Omitting include uses the project's .worktreeinclude file if it has one, and copies nothing otherwise. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
             ))
     }
 
@@ -114,13 +120,23 @@ impl ServerHandler for Server {
                 true,
             ));
         }
-        tools.extend([
-            tool::<Land>(
-                "graft_merge",
-                "Merge a graft's commits into a local branch, then archive the graft. Set undo to reverse an earlier merge instead: it appends a commit only if the branch is still at the merged commit. Lockfile reconciliation needs host --allow-exec.",
+        tools.push(tool::<Land>(
+            "graft_merge",
+            "Merge a graft's commits into a local branch, then archive the graft. Set undo to reverse an earlier merge instead: it appends a commit only if the branch is still at the merged commit. Lockfile reconciliation needs host --allow-exec.",
+            false,
+            true,
+        ));
+        if self.allow_push {
+            // Marked destructive: a push changes a remote that others share,
+            // and nothing here can take it back.
+            tools.push(tool::<Push>(
+                "graft_push",
+                "Push a graft's commits to a branch on a remote of the primary repository, for example to open a pull request. Uses the primary's remote configuration and credentials, never forces, updates the remote's default branch only when to names it, and leaves the graft active; uncommitted work is not pushed. Use it only when the task asks for the work to be published. Needs host --allow-push.",
                 false,
                 true,
-            ),
+            ));
+        }
+        tools.extend([
             tool::<DropWorkspace>(
                 "graft_remove",
                 "Archive a graft and its files. Unless discard is set, refuses and names what it found when the graft has uncommitted, untracked or ignored files, unmerged commits, a stash, or extra branches or tags; keep the recovery lease to reopen it.",
@@ -158,6 +174,11 @@ impl ServerHandler for Server {
                 "Tool {name} requires the host to start with --allow-exec"
             ));
         }
+        if !self.allow_push && name == "graft_push" {
+            return refuse(format!(
+                "Tool {name} requires the host to start with --allow-push"
+            ));
+        }
         let args = request.arguments.unwrap_or_default();
         let op = match name {
             "graft_list" => parse::<Empty>(args).map(|_| Command::List)?,
@@ -186,6 +207,7 @@ impl ServerHandler for Server {
                 }
                 Command::land(land)
             }
+            "graft_push" => Command::Push(parse(args)?),
             "graft_remove" => Command::Drop(parse(args)?),
             _ => {
                 return Err(ErrorData::invalid_params(
@@ -243,17 +265,21 @@ fn bounded_input(input: impl AsyncRead + Send + Unpin + 'static) -> impl AsyncRe
 }
 
 /// Serve MCP over stdin/stdout until the client closes the connection.
-pub fn serve(repo: PathBuf, allow_exec: bool) -> anyhow::Result<()> {
+pub fn serve(repo: PathBuf, allow_exec: bool, allow_push: bool) -> anyhow::Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async move {
             let (stdin, stdout) = rmcp::transport::stdio();
-            Server { repo, allow_exec }
-                .serve((bounded_input(stdin), stdout))
-                .await?
-                .waiting()
-                .await?;
+            Server {
+                repo,
+                allow_exec,
+                allow_push,
+            }
+            .serve((bounded_input(stdin), stdout))
+            .await?
+            .waiting()
+            .await?;
             Ok(())
         })
 }

@@ -30,6 +30,7 @@ Workflow:
   git graft add fix-parser                               Create a graft; prints its path and lease
   cd ../<repo>.graft/fix-parser                          Edit, test and commit with ordinary Git
   git graft merge fix-parser --lease <lease>             Merge into main and archive the graft
+  git graft push fix-parser --lease <lease>              Or push its commits to origin for a pull request
   git graft restore fix-parser --lease <recovery_lease>  Reopen an archived graft
 
 Leases:
@@ -68,6 +69,9 @@ enum Entry {
         /// Let agents run programs and install dependencies in grafts.
         #[arg(long)]
         allow_exec: bool,
+        /// Let agents push a graft's commits to the primary repository's remotes.
+        #[arg(long)]
+        allow_push: bool,
     },
     #[command(flatten)]
     Workspace(cli::Cmd),
@@ -90,7 +94,10 @@ fn run(repo: PathBuf, mut command: Entry) -> anyhow::Result<Option<serde_json::V
         path
     };
     match command {
-        Entry::Mcp { allow_exec } => mcp::serve(repo, allow_exec).map(|_| None),
+        Entry::Mcp {
+            allow_exec,
+            allow_push,
+        } => mcp::serve(repo, allow_exec, allow_push).map(|_| None),
         Entry::Workspace(command) => workspace::run(&repo, command.into()).map(Some),
     }
 }

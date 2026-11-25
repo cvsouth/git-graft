@@ -19,12 +19,13 @@ const protocol = '2025-06-18';
 const requestTimeoutMs = 30_000;
 const maxRequestBytes = 256 * 1024;
 const executionTools = ['graft_exec', 'graft_add_dependency'];
+const publishingTools = ['graft_push'];
 const defaultTools = ['graft_list', 'graft_local_files', 'graft_add', 'graft_status', 'graft_renew', 'graft_merge', 'graft_remove',
   'graft_restore'];
 const spawnOptions = ['base', 'branch', 'detach', 'history', 'include', 'lock', 'name', 'no_checkout', 'no_deps', 'orphan',
   'reason', 'request_id', 'sparse'];
 const leaseTools = new Set(['graft_add_dependency', 'graft_remove', 'graft_exec', 'graft_renew', 'graft_merge',
-  'graft_restore']);
+  'graft_push', 'graft_restore']);
 
 function isObject(value: unknown): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -55,8 +56,9 @@ class McpClient {
   closing = false;
   failure?: Error;
 
-  constructor(ctx: Context, allowExec: boolean) {
-    const args = ['--repo', ctx.repo, 'mcp', ...(allowExec ? ['--allow-exec'] : [])];
+  constructor(ctx: Context, allowExec: boolean, allowPush: boolean) {
+    const args = ['--repo', ctx.repo, 'mcp', ...(allowExec ? ['--allow-exec'] : []),
+      ...(allowPush ? ['--allow-push'] : [])];
     this.child = spawn(ctx.bin, args, { cwd: ctx.repo, env: ctx.env, stdio: 'pipe', windowsHide: true });
     this.exited = new Promise((resolve) => {
       this.child.once('close', (code, signal) => {
@@ -157,12 +159,13 @@ class McpClient {
   }
 }
 
-async function withClient(
+export async function withClient(
   ctx: Context,
   allowExec: boolean,
   run: (client: McpClient) => Promise<void>,
+  allowPush = false,
 ): Promise<void> {
-  const client = new McpClient(ctx, allowExec);
+  const client = new McpClient(ctx, allowExec, allowPush);
   try {
     await run(client);
     if (client.failure) throw client.failure;
@@ -176,7 +179,7 @@ function result(reply: JsonObject): JsonObject {
   return object(reply.result, 'JSON-RPC result');
 }
 
-async function initialize(client: McpClient, version = protocol): Promise<JsonObject> {
+export async function initialize(client: McpClient, version = protocol): Promise<JsonObject> {
   const info = result(await client.request('initialize', {
     protocolVersion: version,
     capabilities: {},
@@ -188,11 +191,16 @@ async function initialize(client: McpClient, version = protocol): Promise<JsonOb
   return info;
 }
 
-async function discover(client: McpClient, allowExec: boolean): Promise<Map<string, JsonObject>> {
+export async function discover(
+  client: McpClient,
+  allowExec: boolean,
+  allowPush = false,
+): Promise<Map<string, JsonObject>> {
   const { tools } = result(await client.request('tools/list', {}));
   assert(Array.isArray(tools));
   const expected = [...defaultTools];
   if (allowExec) expected.push(...executionTools);
+  if (allowPush) expected.push(...publishingTools);
   const catalog = new Map<string, JsonObject>();
   for (const entry of tools) {
     const tool = object(entry, 'tool descriptor');
@@ -206,6 +214,7 @@ async function discover(client: McpClient, allowExec: boolean): Promise<Map<stri
     assert.equal(required.includes('lease'), leaseTools.has(name), name + ' lease requirement');
     const description = string(tool.description, `${name} description`);
     if (executionTools.includes(name)) assert.match(description, /--allow-exec/);
+    if (publishingTools.includes(name)) assert.match(description, /--allow-push/);
   }
   assert.deepEqual([...catalog.keys()].sort(), expected.sort());
   const spawnDescription = string(catalog.get('graft_add')?.description, 'spawn description');
@@ -225,7 +234,7 @@ async function discover(client: McpClient, allowExec: boolean): Promise<Map<stri
   return catalog;
 }
 
-async function call(client: McpClient, name: string, args: JsonObject = {}, isError = false): Promise<JsonObject> {
+export async function call(client: McpClient, name: string, args: JsonObject = {}, isError = false): Promise<JsonObject> {
   const tool = result(await client.request('tools/call', { name, arguments: args }));
   assert.equal(tool.isError, isError, `${name}: ${JSON.stringify(tool)}`);
   const structured = object(tool.structuredContent, `${name} structured content`);
