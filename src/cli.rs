@@ -18,7 +18,8 @@ Examples:
   git graft add api --include '*'              Copy every untracked and ignored file
 
 Untracked and ignored files stay behind unless --include names them, or the
-checkout has a .worktreeinclude file listing .gitignore-style patterns.")]
+project's .graftconfig or .graftconfig.local lists .gitignore-style patterns
+under \"include\".")]
     Add(api::Spawn),
     /// List active and recoverable grafts.
     List,
@@ -36,6 +37,34 @@ Examples:
     Exec(api::Exec),
     /// Install and reuse dependencies.
     Deps(Deps),
+    /// Show the hooks .graftconfig and .graftconfig.local define, and trust them.
+    #[command(after_help = "\
+Examples:
+  git graft hook list    Show every hook, in the order it runs, its file, and
+                         whether it is trusted
+  git graft hook trust   Let the hooks the repository carries run, as defined now
+
+Hooks are defined by name in .graftconfig, which a project commits, and
+.graftconfig.local, the person's own, at the root of the primary checkout:
+
+  {\"hooks\": {\"database\": {\"event\": \"post-add\", \"argv\": [\"/usr/local/bin/create-db\"]}}}
+
+The event is post-add, pre-archive or post-restore. A local hook replaces the
+shared hook of the same name, null turns it off, and a new name adds one.
+A hook is started without a shell, in the graft, and is told about the graft
+through GIT_GRAFT_HOOK, GIT_GRAFT_HOOK_NAME, GIT_GRAFT_NAME, GIT_GRAFT_PATH,
+GIT_GRAFT_PRIMARY, GIT_GRAFT_BRANCH, GIT_GRAFT_BASE and GIT_GRAFT_PORT. Its
+program is an absolute path or a bare name looked up in PATH. Graft waits until
+the hook's output closes, so a job it starts in the background must redirect
+stdout and stderr. A pre-archive hook that fails stops remove, merge and prune
+from archiving the graft, and can run more than once for the same graft.
+
+A hook in .graftconfig, or in .graftconfig.local once Git tracks that file,
+comes with the repository, so it runs only after git graft hook trust. Until
+then, and again after any change to those hooks, add, remove, merge, prune
+--apply and restore refuse with hooks_untrusted before changing anything.
+There is no MCP tool that trusts hooks.")]
+    Hook(HookArgs),
     /// Merge a graft's commits into a local branch, then archive the graft.
     #[command(after_help = "\
 Examples:
@@ -195,6 +224,20 @@ enum ManagerCommand {
     Remove(api::ManagerName),
 }
 
+#[derive(Debug, Args)]
+pub struct HookArgs {
+    #[command(subcommand)]
+    command: HookCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    /// List the configured hooks, in the order they run.
+    List,
+    /// Let the hooks the repository carries run, as they are defined now.
+    Trust,
+}
+
 impl From<Cmd> for workspace::Command {
     fn from(cmd: Cmd) -> Self {
         use workspace::Command as Op;
@@ -219,6 +262,10 @@ impl From<Cmd> for workspace::Command {
                     ManagerCommand::List => Op::ListManagers,
                     ManagerCommand::Remove(args) => Op::UnregisterManager(args),
                 },
+            },
+            Cmd::Hook(HookArgs { command }) => match command {
+                HookCommand::List => Op::ListHooks,
+                HookCommand::Trust => Op::TrustHooks,
             },
             Cmd::Merge(args) => Op::land(args),
             Cmd::Push(args) => Op::Push(args),

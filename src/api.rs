@@ -46,7 +46,7 @@ pub struct Spawn {
     /// Copy untracked or ignored files from the checkout, such as `.env`.
     ///
     /// Each entry is a .gitignore-style pattern matched against files Git does not track, for example [".env", "config/*.local.json"], or ["*"] for every one of them, including large build and environment directories.
-    /// Omit to use the patterns in the checkout's .worktreeinclude file, if it has one; otherwise nothing is copied. An empty list copies nothing.
+    /// Omit to use the include patterns of the project's .graftconfig and .graftconfig.local, if they set any; otherwise nothing is copied. An empty list copies nothing.
     /// Copies never replace a file of the checkout, and merge and remove ignore them until they change.
     #[arg(long, value_name = "PATTERN", conflicts_with_all = ["orphan", "no_checkout"])]
     #[serde(default, skip_serializing_if = "Option::is_none")]

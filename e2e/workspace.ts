@@ -388,7 +388,7 @@ export const cases: Scenario[] = [
     },
   },
   {
-    name: 'include copies chosen untracked and ignored files, by request or .worktreeinclude',
+    name: 'include copies chosen untracked and ignored files, by request or from .graftconfig and .graftconfig.local',
     run(ctx) {
       write(ctx.repo, '.env', 'SECRET=1\n');
       write(ctx.repo, 'ignored/local.json', '{}\n');
@@ -405,20 +405,40 @@ export const cases: Scenario[] = [
       const none = spawn(ctx, 'none');
       for (const name of ['.env', 'ignored', 'notes.txt']) assert(!existsSync(join(none.path, name)));
 
-      // A setup file is the default; the copies do not show as changes.
-      write(ctx.repo, '.worktreeinclude', '# local configuration\n.env\nignored/*.json\n');
+      // The configured patterns are the default: the local file's are added
+      // to the shared file's, and a local !pattern removes a shared one.
+      // The copies do not show as changes.
+      write(ctx.repo, '.graftconfig', JSON.stringify({ include: ['.env', 'ignored/*.json', 'ignored/deep/'] }));
+      write(ctx.repo, '.graftconfig.local', JSON.stringify({ include: ['!ignored/deep/', 'notes.txt'] }));
+      assert.deepEqual(ctx.cli(['local-files']).defaults, {
+        patterns: ['.env', 'ignored/*.json', 'notes.txt'], files: ['.graftconfig', '.graftconfig.local'] });
       const setup = spawn(ctx, 'setup');
       const receipt = objectResult(objectResult(setup.result.storage).included);
-      assert.equal(receipt.source, '.worktreeinclude');
-      assert.equal(receipt.files, 2);
+      assert.equal(receipt.source, 'config');
+      assert.deepEqual(receipt.config_files, ['.graftconfig', '.graftconfig.local']);
+      assert.deepEqual(receipt.patterns, ['.env', 'ignored/*.json', 'notes.txt']);
+      assert.equal(receipt.files, 3);
       assert.equal(read(setup.path, '.env'), 'SECRET=1\n');
       assert.equal(read(setup.path, 'ignored/local.json'), '{}\n');
+      assert.equal(read(setup.path, 'notes.txt'), 'scratch\n');
       assert(!existsSync(join(setup.path, 'ignored', 'deep')));
-      assert(!existsSync(join(setup.path, 'notes.txt')));
+      assert(!existsSync(join(setup.path, '.graftconfig.local')));
       assert.deepEqual(ctx.cli(['status', setup.name]).changes, []);
       ctx.cli(owned('remove', setup));
 
-      // A request replaces the setup file.
+      // The configuration is the primary's: a graft added from inside
+      // another graft uses it too, and copies from the graft it was added in.
+      const parent = spawn(ctx, 'parent', ['--include', '.env']);
+      write(parent.path, 'notes.txt', 'parent notes\n');
+      write(parent.path, '.graftconfig', JSON.stringify({ include: ['*'] }));
+      const nested = spawn(ctx, 'nested', [], parent.path);
+      assert.equal(read(nested.path, '.env'), 'SECRET=1\n');
+      assert.equal(read(nested.path, 'notes.txt'), 'parent notes\n');
+      assert(!existsSync(join(nested.path, '.graftconfig')));
+      ctx.cli(owned('remove', nested));
+      ctx.cli(owned('remove', parent, '--discard'));
+
+      // A request replaces the configured patterns.
       const picked = spawn(ctx, 'picked', ['--include', 'notes.txt']);
       assert.equal(read(picked.path, 'notes.txt'), 'scratch\n');
       assert(!existsSync(join(picked.path, '.env')));

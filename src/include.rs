@@ -3,8 +3,9 @@
 //!
 //! Nothing is copied by default. The caller names `.gitignore`-style
 //! patterns when it adds a graft, such as `.env` or `*` for every file Git
-//! does not track. When it names none, a `.worktreeinclude` file at the root
-//! of the checkout supplies them; without one, nothing is copied.
+//! does not track. When it names none, the `include` lists of the project's
+//! `.graftconfig` and `.graftconfig.local` supply them (see
+//! [`crate::config`]); without either, nothing is copied.
 //!
 //! Copies are clones where the filesystem supports them. A copy never
 //! replaces a file of the checkout, never writes through a symlink, and is
@@ -22,10 +23,9 @@ use std::process::Stdio;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
+use crate::config::Config;
 use crate::git;
 
-/// The optional project file listing what every graft copies by default.
-pub(crate) const SETUP_FILE: &str = ".worktreeinclude";
 /// Where a graft records the copies it was created with, inside its `.git`.
 const MANIFEST: &str = "graft-included";
 /// Most skipped paths a receipt names.
@@ -38,8 +38,19 @@ const LISTED_ENTRIES: usize = 500;
 pub(crate) enum Patterns {
     /// Named by the request.
     Requested(Vec<String>),
-    /// Read from the checkout's `.worktreeinclude`.
-    Setup(PathBuf),
+    /// Read from the project's configuration files, which are named.
+    Config {
+        patterns: Vec<String>,
+        files: Vec<&'static str>,
+    },
+}
+
+impl Patterns {
+    fn list(&self) -> &[String] {
+        match self {
+            Self::Requested(list) | Self::Config { patterns: list, .. } => list,
+        }
+    }
 }
 
 /// Reject patterns Git cannot take as one exclude line.
@@ -53,10 +64,10 @@ pub(crate) fn validate(requested: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The patterns a new graft of `origin` copies with: the request's when it
-/// names any, otherwise the checkout's `.worktreeinclude`, otherwise none.
-/// An explicitly empty request copies nothing.
-pub(crate) fn select(origin: &Path, requested: Option<&[String]>) -> Result<Option<Patterns>> {
+/// The patterns a new graft copies with: the request's when it names any,
+/// otherwise the project configuration's, otherwise none. An explicitly
+/// empty request copies nothing.
+pub(crate) fn select(requested: Option<&[String]>, config: &Config) -> Result<Option<Patterns>> {
     if let Some(list) = requested {
         validate(list)?;
         let list: Vec<String> = list
@@ -66,14 +77,10 @@ pub(crate) fn select(origin: &Path, requested: Option<&[String]>) -> Result<Opti
             .collect();
         return Ok((!list.is_empty()).then_some(Patterns::Requested(list)));
     }
-    let setup = origin.join(SETUP_FILE);
-    match fs::metadata(&setup) {
-        Ok(meta) if meta.is_file() => Ok(Some(Patterns::Setup(setup))),
-        // Only a file sets the default; anything else by that name does not.
-        Ok(_) => Ok(None),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("read {SETUP_FILE}")),
-    }
+    Ok((!config.include.is_empty()).then(|| Patterns::Config {
+        patterns: config.include.clone(),
+        files: config.include_files.clone(),
+    }))
 }
 
 fn git_output(dir: &Path, args: &[OsString]) -> Result<Vec<u8>> {
@@ -101,19 +108,14 @@ fn candidates(origin: &Path, patterns: &Patterns) -> Result<Vec<Vec<u8>>> {
     let mut args: Vec<OsString> = ["ls-files", "-z", "--others", "--ignored"]
         .map(OsString::from)
         .into();
-    match patterns {
-        Patterns::Requested(list) => {
-            args.extend(
-                list.iter()
-                    .map(|pattern| format!("--exclude={pattern}").into()),
-            );
-        }
-        Patterns::Setup(file) => {
-            let mut arg = OsString::from("--exclude-from=");
-            arg.push(file);
-            args.push(arg);
-        }
-    }
+    // Git takes the patterns in order and the last that matches decides,
+    // so a `!pattern` re-includes what an earlier pattern matched.
+    args.extend(
+        patterns
+            .list()
+            .iter()
+            .map(|pattern| format!("--exclude={pattern}").into()),
+    );
     args.push("--".into());
     let raw = git_output(origin, &args)?;
     Ok(records(&raw).map(<[u8]>::to_vec).collect())
@@ -451,7 +453,9 @@ pub(crate) fn copy(
     }
     let mut receipt = match patterns {
         Patterns::Requested(list) => json!({"source": "request", "patterns": list}),
-        Patterns::Setup(_) => json!({"source": SETUP_FILE}),
+        Patterns::Config { patterns, files } => {
+            json!({"source": "config", "config_files": files, "patterns": patterns})
+        }
     };
     receipt["files"] = json!(copied.len());
     receipt["bytes"] = json!(bytes);
@@ -535,8 +539,8 @@ pub(crate) fn without_unchanged_copies(
 }
 
 /// The untracked and ignored files and directories in `origin` that `add
-/// --include` can copy, with whether a `.worktreeinclude` sets a default.
-pub(crate) fn overview(origin: &Path) -> Result<Value> {
+/// --include` can copy, with the default patterns `config` sets.
+pub(crate) fn overview(origin: &Path, config: &Config) -> Result<Value> {
     ensure!(
         origin.join(".git").symlink_metadata().is_ok(),
         "this repository is bare, so it has no untracked or ignored files"
@@ -574,14 +578,12 @@ pub(crate) fn overview(origin: &Path) -> Result<Value> {
             json!({"path": String::from_utf8_lossy(name), "status": status, "kind": kind})
         })
         .collect();
-    let setup = fs::metadata(origin.join(SETUP_FILE)).is_ok_and(|m| m.is_file());
     Ok(json!({
         "checkout": origin,
         "entries": listed,
         "count": entries.len(),
         "truncated": entries.len() > LISTED_ENTRIES,
-        "setup_file": SETUP_FILE,
-        "setup_file_present": setup,
+        "defaults": config.include_defaults(),
     }))
 }
 
@@ -639,19 +641,25 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_selected_without_a_request_or_setup_file() {
+    fn nothing_is_selected_without_a_request_or_configured_patterns() {
         let (_root, primary, _) = fixture();
-        assert!(select(&primary, None).unwrap().is_none());
-        assert!(select(&primary, Some(&[])).unwrap().is_none());
-        assert!(select(&primary, Some(&[" ".into()])).unwrap().is_none());
-        assert!(select(&primary, Some(&["a\nb".into()])).is_err());
-        write(&primary, SETUP_FILE, ".env\n");
+        let none = Config::read(&primary).unwrap();
+        assert!(select(None, &none).unwrap().is_none());
+        assert!(select(Some(&[]), &none).unwrap().is_none());
+        assert!(select(Some(&[" ".into()]), &none).unwrap().is_none());
+        assert!(select(Some(&["a\nb".into()]), &none).is_err());
+        write(&primary, crate::config::SHARED, r#"{"include": [".env"]}"#);
+        let config = Config::read(&primary).unwrap();
         assert!(matches!(
-            select(&primary, None).unwrap(),
-            Some(Patterns::Setup(_))
+            select(None, &config).unwrap(),
+            Some(Patterns::Config { patterns, files }) if patterns == [".env"] && files == [".graftconfig"]
         ));
-        // A request replaces the setup file, and an empty one copies nothing.
-        assert!(select(&primary, Some(&[])).unwrap().is_none());
+        // A request replaces the configured patterns, and an empty one copies nothing.
+        assert!(select(Some(&[]), &config).unwrap().is_none());
+        assert!(matches!(
+            select(Some(&["*.log".into()]), &config).unwrap(),
+            Some(Patterns::Requested(list)) if list == ["*.log"]
+        ));
     }
 
     #[test]
@@ -743,14 +751,35 @@ mod tests {
     }
 
     #[test]
-    fn setup_file_supplies_the_default() {
+    fn configured_patterns_supply_the_default_and_a_local_bang_reincludes() {
         let (_root, primary, graft) = fixture();
-        write(&primary, SETUP_FILE, "# local secrets\n*.log\n");
-        let patterns = select(&primary, None).unwrap().unwrap();
+        write(&primary, "keep.env", "KEEP=1\n");
+        write(
+            &primary,
+            crate::config::SHARED,
+            r#"{"include": ["*.log", "*.env", ".env"]}"#,
+        );
+        write(
+            &primary,
+            crate::config::LOCAL,
+            r#"{"include": ["!*.log", "notes.txt", "!keep.env"]}"#,
+        );
+        let config = Config::read(&primary).unwrap();
+        let patterns = select(None, &config).unwrap().unwrap();
         let receipt = copy(&primary, &graft, &patterns, false, &[]).unwrap();
-        assert_eq!(receipt["source"], SETUP_FILE);
-        assert_eq!(receipt["files"], 1, "{receipt}");
-        assert!(graft.join("debug.log").is_file());
+        assert_eq!(receipt["source"], "config");
+        assert_eq!(
+            receipt["config_files"],
+            json!([".graftconfig", ".graftconfig.local"])
+        );
+        assert_eq!(
+            receipt["patterns"],
+            json!(["*.env", ".env", "notes.txt", "!keep.env"])
+        );
+        // .env and notes.txt; *.log was removed and keep.env re-excluded.
+        assert_eq!(receipt["files"], 2, "{receipt}");
+        assert!(graft.join(".env").is_file() && graft.join("notes.txt").is_file());
+        assert!(!graft.join("debug.log").exists() && !graft.join("keep.env").exists());
     }
 
     #[cfg(unix)]
@@ -769,7 +798,7 @@ mod tests {
     #[test]
     fn overview_lists_untracked_and_ignored_entries() {
         let (_root, primary, _) = fixture();
-        let listed = overview(&primary).unwrap();
+        let listed = overview(&primary, &Config::read(&primary).unwrap()).unwrap();
         let entries: Vec<_> = listed["entries"]
             .as_array()
             .unwrap()
@@ -790,7 +819,7 @@ mod tests {
                 ("notes.txt", "untracked"),
             ]
         );
-        assert_eq!(listed["setup_file_present"], false);
+        assert_eq!(listed["defaults"], json!({"patterns": [], "files": []}));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use crate::api::{
     self, AddDep, DropWorkspace, Exec, Land, Name, Owned, Push, TurnRelease, TurnTake,
 };
 use crate::registry;
-use crate::workspace::{self, Command, Spawn};
+use crate::workspace::{self, Command, Spawn, hook};
 
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 
@@ -68,7 +68,18 @@ impl Server {
     /// Run one operation off the async thread.
     async fn run(&self, op: Command) -> Result<anyhow::Result<Value>, ErrorData> {
         let repo = self.repo.clone();
-        blocking(move || workspace::run(&repo, op)).await
+        let hooks = self.hooks();
+        blocking(move || workspace::run_with(&repo, op, hooks)).await
+    }
+
+    /// A hook is a command the project's configuration runs. Like graft_exec,
+    /// it runs for an agent only when the host allows running commands.
+    fn hooks(&self) -> hook::Policy {
+        if self.allow_exec {
+            hook::Policy::Run
+        } else {
+            hook::Policy::Skip
+        }
     }
 }
 
@@ -84,9 +95,9 @@ async fn blocking<T: Send + 'static>(
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
         let instructions = if self.allow_exec {
-            "Running commands and installing dependencies in grafts is enabled by the host."
+            "Running commands and installing dependencies in grafts is enabled by the host. Hooks the project's .graftconfig and .graftconfig.local define run when a graft is added, merged, removed, pruned or restored; the hooks array of a result reports them. Hooks that come with the repository run only once the user has trusted them in a terminal; until then those calls fail with hooks_untrusted, which you report to the user and must not try to get past."
         } else {
-            "Running commands and installing dependencies in grafts is disabled; the host must start with --allow-exec to enable it."
+            "Running commands and installing dependencies in grafts is disabled; the host must start with --allow-exec to enable it. Hooks the project's .graftconfig and .graftconfig.local define are not run either; the hooks array of a result reports them as skipped."
         };
         let publishing = if self.allow_push {
             "Pushing a graft's commits to a remote with graft_push is enabled by the host; use it only when the task asks for the work to be published."
@@ -99,7 +110,7 @@ impl ServerHandler for Server {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(format!(
-                "{instructions} {publishing} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. Before using something every graft shares, such as a development server on a fixed port, call graft_turn_take, and graft_turn_release when done. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for just the ones to bring. Prefer naming them: [\"*\"] copies all of them, including build output and directories such as target/ and .venv/, which can be large. Omitting include uses the project's .worktreeinclude file if it has one, and copies nothing otherwise. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
+                "{instructions} {publishing} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. Before using something every graft shares, such as a development server on a fixed port, call graft_turn_take, and graft_turn_release when done. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for just the ones to bring. Prefer naming them: [\"*\"] copies all of them, including build output and directories such as target/ and .venv/, which can be large. Omitting include uses the include patterns of the project's .graftconfig and .graftconfig.local, and copies nothing if they set none. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
             ))
     }
 
@@ -111,7 +122,7 @@ impl ServerHandler for Server {
         let mut tools = vec![
             tool::<Spawn>(
                 "graft_add",
-                "Create a graft: an independent copy of the repository with its own branch. Returns the graft's path and lease; keep the lease, it authorizes every later call. Omit history for normal work (the project setting defaults to local, which reuses the trusted clone's Git objects). Choose isolated to keep unrelated objects such as staged blobs or other branches' commits out. Untracked and ignored files, such as .env, are not copied unless include names them (see graft_local_files) or the project has a .worktreeinclude file. Name what the task needs; [\"*\"] copies all of them, including large build and environment directories.",
+                "Create a graft: an independent copy of the repository with its own branch. Returns the graft's path and lease; keep the lease, it authorizes every later call. Omit history for normal work (the project setting defaults to local, which reuses the trusted clone's Git objects). Choose isolated to keep unrelated objects such as staged blobs or other branches' commits out. Untracked and ignored files, such as .env, are not copied unless include names them (see graft_local_files) or the include list of the project's .graftconfig or .graftconfig.local does. Name what the task needs; [\"*\"] copies all of them, including large build and environment directories.",
                 false,
                 false,
             ),
@@ -123,7 +134,7 @@ impl ServerHandler for Server {
             ),
             tool::<Empty>(
                 "graft_local_files",
-                "List the checkout's untracked and ignored files and directories, such as .env, local config and build output. A new graft holds none of them; pass the ones its task needs to graft_add as include patterns. Also says whether the project's .worktreeinclude file sets a default.",
+                "List the checkout's untracked and ignored files and directories, such as .env, local config and build output. A new graft holds none of them; pass the ones its task needs to graft_add as include patterns. Also reports, as defaults, the include patterns the project's .graftconfig and .graftconfig.local set, which graft_add uses when include is omitted.",
                 true,
                 false,
             ),
@@ -277,7 +288,12 @@ impl ServerHandler for Server {
                         let ask = |take| {
                             let (repo, found) = (self.repo.clone(), found.clone());
                             blocking(move || {
-                                workspace::run_found(&repo, found, Command::TurnTake(take))
+                                workspace::run_found(
+                                    &repo,
+                                    found,
+                                    Command::TurnTake(take),
+                                    hook::Policy::Skip,
+                                )
                             })
                         };
                         take_turn(

@@ -3,6 +3,7 @@ mod api;
 mod cache;
 mod cli;
 mod collision;
+mod config;
 mod engine;
 mod git;
 mod include;
