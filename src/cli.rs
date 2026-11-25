@@ -19,7 +19,9 @@ Examples:
 
 Untracked and ignored files stay behind unless --include names them, or the
 project's .graftconfig or .graftconfig.local lists .gitignore-style patterns
-under \"include\".")]
+under \"include\". Those files are read from the root of the primary checkout,
+or else from the nearest directory above it that holds either, under
+\"repositories\" and the checkout's path relative to that directory.")]
     Add(api::Spawn),
     /// List active and recoverable grafts.
     List,
@@ -49,18 +51,27 @@ Hooks are defined by name in .graftconfig, which a project commits, and
 
   {\"hooks\": {\"database\": {\"event\": \"post-add\", \"argv\": [\"/usr/local/bin/create-db\"]}}}
 
+Where the checkout has neither file, the nearest directory above it that holds
+either configures it under \"repositories\", by its path relative to that
+directory. A hook there may name its program relative to that directory:
+
+  {\"repositories\": {\"app\": {\"hooks\": {\"setup\": {\"event\": \"post-add\", \"argv\": [\"./scripts/setup\"]}}}}}
+
 The event is post-add, pre-archive or post-restore. A local hook replaces the
 shared hook of the same name, null turns it off, and a new name adds one.
 A hook is started without a shell, in the graft, and is told about the graft
 through GIT_GRAFT_HOOK, GIT_GRAFT_HOOK_NAME, GIT_GRAFT_NAME, GIT_GRAFT_PATH,
-GIT_GRAFT_PRIMARY, GIT_GRAFT_BRANCH, GIT_GRAFT_BASE and GIT_GRAFT_PORT. Its
-program is an absolute path or a bare name looked up in PATH. Graft waits until
+GIT_GRAFT_PRIMARY, GIT_GRAFT_CONFIG_DIR, GIT_GRAFT_BRANCH, GIT_GRAFT_BASE and
+GIT_GRAFT_PORT. Its program is an absolute path, a bare name looked up in PATH,
+or, in a directory above the checkout, a path inside that directory. Graft waits until
 the hook's output closes, so a job it starts in the background must redirect
 stdout and stderr. A pre-archive hook that fails stops remove, merge and prune
 from archiving the graft, and can run more than once for the same graft.
 
 A hook in .graftconfig, or in .graftconfig.local once Git tracks that file,
-comes with the repository, so it runs only after git graft hook trust. Until
+comes with the repository, so it runs only after git graft hook trust. Trust
+covers a program named relative to a directory above the checkout by its
+contents too. Until
 then, and again after any change to those hooks, add, remove, merge, prune
 --apply and restore refuse with hooks_untrusted before changing anything.
 There is no MCP tool that trusts hooks.")]

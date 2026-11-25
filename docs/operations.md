@@ -42,7 +42,32 @@ Two JSON files at the root of the primary checkout configure Graft for a project
 - `include` lists are joined, the shared patterns first. A local `!pattern` removes the same pattern from the shared list. A `!pattern` that matches no shared pattern stays in the list as a `.gitignore` negation, which leaves out files that the patterns before it match. With the two files above, a graft copies `.env` and `fixtures/large/`.
 - A local hook with the name of a shared hook replaces it whole, program, arguments and event together, and keeps its place in the order. A local `null` turns the shared hook off. A new name adds a hook, which runs after the shared ones. With the two files above, `post-add` runs `graft-setup --small` and then `notify-send`, `post-restore` runs nothing, and `pre-archive` runs `graft-teardown`.
 
-Hooks for the same event run in the order they are written. `null` is only meaningful in `.graftconfig.local`; `.graftconfig` refuses it. Graft reads both files from the primary checkout's working tree every time it needs them, never from a graft: a graft's own copy of `.graftconfig`, edited or committed, changes nothing until it is merged into the primary. `git graft hook list` shows the hooks in effect, in the order they run, each with the file that defined it and whether it is [trusted](#hooks). A file that is not valid JSON, holds anything but a JSON object, has a key Graft does not know or a hook it would refuse, stops every command that reads it with `invalid_config`, naming the file.
+Hooks for the same event run in the order they are written. `null` is only meaningful in `.graftconfig.local`; `.graftconfig` refuses it. Graft reads both files from the primary checkout's working tree, or from a [directory above it](#configure-several-repositories-from-one-directory), every time it needs them, never from a graft: a graft's own copy of `.graftconfig`, edited or committed, changes nothing until it is merged into the primary. `git graft hook list` shows the hooks in effect, in the order they run, each with the file that defined it and whether it is [trusted](#hooks). A file that is not valid JSON, holds anything but a JSON object, has a key Graft does not know or a hook it would refuse, stops every command that reads it with `invalid_config`, naming the file.
+
+### Configure several repositories from one directory
+
+Some projects keep several repositories side by side in one directory, which may itself be a repository, and use them together. When the primary checkout's root holds neither `.graftconfig` nor `.graftconfig.local`, Graft reads them from the nearest directory above it that holds either. There, a `repositories` object holds the same settings for each repository below, keyed by its path relative to that directory, with `/` between parts:
+
+```json
+{
+  "repositories": {
+    "app": {
+      "include": [".env", "storage/*.key"],
+      "hooks": {
+        "prepare": {"event": "post-add", "argv": ["./scripts/graft-hook.sh"]},
+        "cleanup": {"event": "pre-archive", "argv": ["./scripts/graft-hook.sh"]}
+      }
+    },
+    "services/router": {"include": ["config.local.json"]}
+  }
+}
+```
+
+- A checkout's own files always come first: once its root holds either file, the directory above is not read. Of the directories above, only the nearest that holds either file is read, and a repository it does not name under `repositories` gets nothing from it. The directory's own top-level `include` and `hooks` are for the repository whose root it is, if any, and are not passed down.
+- `.graftconfig.local` in that directory overrides `.graftconfig` for each repository as described above. Reports name the files by their path from the primary checkout, such as `../.graftconfig`.
+- A hook there may name its program by a path relative to that directory, such as `./scripts/graft-hook.sh`, which keeps a committed file free of absolute paths. No graft of the repository holds that file, so the graft's work cannot change it. The path must stay inside the directory, without `..`, and outside the repository and its grafts: for `app`, a program under `app/` or `app.graft/` is refused. `git graft hook list` shows such a hook's resolved `program`.
+- Both files there must belong to you or to the superuser, as must the directory and any link to them; otherwise every command that reads them refuses with `invalid_config`. A file in a shared directory such as `/tmp` could otherwise run another user's commands as you. Windows is not checked.
+- Hooks from that directory's `.graftconfig`, and from its `.graftconfig.local` while the directory's own repository tracks that file, need [trust](#hooks) as the primary's own do. The trust is recorded for each repository in its own Graft state, so run `git graft hook trust` in each.
 
 ## Copy untracked and ignored files
 
@@ -185,7 +210,7 @@ A hook is a command that Graft runs at a point in a graft's life, defined in the
 
 `argv` is the program and its arguments. An event can have any number of hooks, which run in the order the configuration gives; once one fails, the rest for that command are skipped. `git graft hook list` shows them. There is no command or MCP tool that defines a hook: edit the files.
 
-A hook that comes with the repository runs only once you have trusted it: every hook in `.graftconfig`, and every hook in `.graftconfig.local` once Git tracks that file. `git graft hook list` shows such a hook with `"trusted": false` until then. Read the hooks, then run `git graft hook trust`. It records a SHA-256 digest of those hooks, each by event, name and `argv`, in `.git/graft/trusted-hooks.json`, and replies with the hooks it trusted and the digest. Until you trust them, and again after any change to a hook in those files, such as one merged from a graft or pulled from a remote, `add`, `remove`, `merge`, `restore` and `prune --apply` refuse with `hooks_untrusted` before they run or change anything, when they would run a hook for their event. A `prune` preview runs no hook, so it needs no trust. What an untracked `.graftconfig.local` adds, replaces or turns off is your own and needs no trust; `include` patterns run nothing and need none either. There is no MCP tool that trusts hooks. See [safety](safety.md).
+A hook that comes with the repository runs only once you have trusted it: every hook in `.graftconfig`, and every hook in `.graftconfig.local` once Git tracks that file. `git graft hook list` shows such a hook with `"trusted": false` until then. Read the hooks, then run `git graft hook trust`. It records a SHA-256 digest of those hooks, each by event, name and `argv`, in `.git/graft/trusted-hooks.json`, and replies with the hooks it trusted and the digest. For a hook whose program is a path relative to a [directory above the checkout](#configure-several-repositories-from-one-directory), the digest also covers the resolved path and the program's contents, so an edit to the program needs trust again. Until you trust them, and again after any change to a hook in those files, such as one merged from a graft or pulled from a remote, `add`, `remove`, `merge`, `restore` and `prune --apply` refuse with `hooks_untrusted` before they run or change anything, when they would run a hook for their event. A `prune` preview runs no hook, so it needs no trust. What an untracked `.graftconfig.local` adds, replaces or turns off is your own and needs no trust; `include` patterns run nothing and need none either. There is no MCP tool that trusts hooks. See [safety](safety.md).
 
 | Event | When the hook runs |
 | --- | --- |
@@ -193,7 +218,7 @@ A hook that comes with the repository runs only once you have trusted it: every 
 | `pre-archive` | Before `remove`, `merge` or `prune --apply` archives a graft: after the lease is checked and before Graft looks for untracked or ignored files, which the hook may remove. A plain `remove` refuses a pending merge, a Git operation in progress, a change to a tracked file and unmerged work before the hook runs. `merge --undo` runs no hook. |
 | `post-restore` | After `restore` has reopened an archived graft, before it replies. |
 
-Graft starts the program directly, without a shell, with the graft as its working directory. It waits for the hook to exit, and for its standard output and standard error to close, and sets no time limit. A job the hook starts in the background must redirect both streams, for example `nohup server >server.log 2>&1 &`, or the command does not return until that job exits. Name the program by an absolute path outside the grafts, or by a bare name that is looked up in `PATH`. The configuration refuses a relative path with a directory in it, such as `./scripts/setup`: on Unix it would name the graft's own copy, so the graft's files would decide what runs, and on Windows it would name a program in the caller's directory instead. The hook gets the environment of the `git graft` command, or of the MCP host, without `GIT_GRAFT_LEASE` and without the variables that point Git at another repository, such as `GIT_DIR`. A hook never receives a lease. Graft adds these variables:
+Graft starts the program directly, without a shell, with the graft as its working directory, or the resolved `program` for a hook from a directory above the checkout. It waits for the hook to exit, and for its standard output and standard error to close, and sets no time limit. A job the hook starts in the background must redirect both streams, for example `nohup server >server.log 2>&1 &`, or the command does not return until that job exits. Name the program by an absolute path outside the grafts, or by a bare name that is looked up in `PATH`; in a directory above the checkout, a path relative to that directory also works. The configuration refuses a relative path with a directory in it, such as `./scripts/setup`, everywhere else: on Unix it would name the graft's own copy, so the graft's files would decide what runs, and on Windows it would name a program in the caller's directory instead. The hook gets the environment of the `git graft` command, or of the MCP host, without `GIT_GRAFT_LEASE` and without the variables that point Git at another repository, such as `GIT_DIR`. A hook never receives a lease. Graft adds these variables:
 
 | Variable | Value |
 | --- | --- |
@@ -202,6 +227,7 @@ Graft starts the program directly, without a shell, with the graft as its workin
 | `GIT_GRAFT_NAME` | The graft's name. |
 | `GIT_GRAFT_PATH` | The graft's path, which is also the working directory. |
 | `GIT_GRAFT_PRIMARY` | The primary checkout's path. |
+| `GIT_GRAFT_CONFIG_DIR` | The directory that holds the file defining the hook: the primary checkout, or the directory above it. |
 | `GIT_GRAFT_BRANCH` | The branch the graft was created on. Empty for a graft created with `--detach`. |
 | `GIT_GRAFT_BASE` | The commit the graft was created from. Empty for a graft created with `--orphan`. |
 | `GIT_GRAFT_PORT` | The graft's port, the one `exec` passes as `PORT`. `restore` can assign a different one. |

@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Hooks that come with the repository, those in `.graftconfig` and in a `.graftconfig.local` that Git tracks, run only after `git graft hook trust`, which records a SHA-256 digest of their events, names and arguments in `.git/graft/trusted-hooks.json`. Until then, and again after any change to them, `add`, `remove`, `merge`, `restore` and `prune --apply` refuse with `hooks_untrusted` before running or changing anything. `git graft hook list` reports whether each hook is trusted. No MCP tool trusts hooks.
 - `prune --purge-archives DAYS` previews, and with `--apply` deletes, the archives of grafts archived at least DAYS days ago, with their records. Records now note when a graft was archived (`archived`). If a deletion fails, the command fails with `purge_failed`, and `details` holds the prune reply.
 
+- Where the primary checkout's root holds neither `.graftconfig` nor `.graftconfig.local`, Graft reads them from the nearest directory above it that holds either, under `repositories` and the checkout's path relative to that directory. One directory that holds several repositories can then configure them all. A hook there may name its program by a path relative to that directory, which trust covers by contents. Such files must belong to the user or the superuser. Hooks receive `GIT_GRAFT_CONFIG_DIR`, and `hook list` shows a resolved `program`.
+
 ### Changed
 
 - A graft name may start with a number as well as a letter, so a name can begin with a ticket ID such as `4c2a9-fix-login`. The other rules are unchanged: 1 to 48 lowercase letters, numbers or hyphens, not a reserved Windows device name.

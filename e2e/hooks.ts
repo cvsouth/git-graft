@@ -265,11 +265,13 @@ export const cases: Scenario[] = [
         GIT_GRAFT_NAME: 'prepared',
         GIT_GRAFT_PATH: path,
         GIT_GRAFT_PRIMARY: run.env.GIT_GRAFT_PRIMARY,
+        GIT_GRAFT_CONFIG_DIR: run.env.GIT_GRAFT_CONFIG_DIR,
         GIT_GRAFT_BRANCH: 'graft/prepared',
         GIT_GRAFT_BASE: ctx.git(['rev-parse', 'HEAD']),
         GIT_GRAFT_PORT: String(added.port),
       });
       assert.equal(realpathSync(run.env.GIT_GRAFT_PRIMARY), realpathSync(ctx.repo));
+      assert.equal(realpathSync(run.env.GIT_GRAFT_CONFIG_DIR), realpathSync(ctx.repo));
       assert(!JSON.stringify(run.env).includes(lease), 'the hook saw the lease');
       assert(!JSON.stringify(run.env).includes('lease-of-the-caller'), 'the hook saw the caller lease variable');
 
@@ -722,6 +724,84 @@ export const cases: Scenario[] = [
       assert.equal(entries(ctx.spawn('tracked').result).length, 2);
       ctx.git(['rm', '-q', '--cached', '--', LOCAL]);
       rmSync(join(ctx.repo, LOCAL));
+    },
+  },
+  {
+    name: 'a directory above the primary configures it by path, with a program relative to that directory',
+    run(ctx) {
+      // ctx.root holds the primary at ctx.root/project, as a directory of
+      // several repositories would. The primary has no configuration of its own.
+      const log = join(ctx.root, 'above.log');
+      const script = join(ctx.root, 'hook fixture.cjs');
+      writeFileSync(script, fixture);
+      mkdirSync(join(ctx.root, 'tools'));
+      const windows = process.platform === 'win32';
+      const program = windows ? './tools/hook.cmd' : './tools/hook';
+      const wrapper = join(ctx.root, 'tools', windows ? 'hook.cmd' : 'hook');
+      const body = windows
+        ? `@"${process.execPath}" "${script}" %*\r\n`
+        : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`;
+      writeFileSync(wrapper, body, { mode: 0o755 });
+      writeFileSync(join(ctx.repo, 'secret.env'), 'TOKEN=1\n');
+      writeFileSync(join(ctx.repo, '.gitignore'), 'ignored/\nsecret.env\n');
+      commit(ctx, ctx.repo, 'ignore secret.env');
+      const hooks = {
+        prepare: { event: 'post-add', argv: [program, 'prepare', log] },
+        clean: { event: 'pre-archive', argv: [program, 'clean', log] },
+      };
+      writeFileSync(join(ctx.root, SHARED), JSON.stringify({
+        repositories: { project: { include: ['secret.env'], hooks }, elsewhere: { include: ['*'] } },
+      }));
+      const file = `../${SHARED}`;
+      const resolved = realpathSync(ctx.root);
+      const listed = (trusted: boolean) => Object.entries(hooks).map(([name, hook]) => (
+        { name, ...hook, file, program: join(resolved, 'tools', windows ? 'hook.cmd' : 'hook'), trusted }));
+      assert.deepEqual(ctx.cli(['hook', 'list']).hooks, listed(false));
+      assert.deepEqual(objectResult(ctx.cli(['local-files']).defaults), { patterns: ['secret.env'], files: [file] });
+
+      // A file above is shared like the primary's own: its hooks need trust.
+      const refused = ctx.fail(['add', 'early']);
+      assert.equal(refused.code, 'hooks_untrusted');
+      assert.match(String(refused.message), /\.\.\/\.graftconfig have not been trusted/);
+      ctx.cli(['hook', 'trust']);
+      assert.deepEqual(ctx.cli(['hook', 'list']).hooks, listed(true));
+
+      const added = ctx.spawn('above');
+      assert.deepEqual(entries(added.result), [ran('post-add', 'prepare above', 'prepare', file)]);
+      const path = String(added.result.path);
+      assert.equal(readFileSync(join(path, 'secret.env'), 'utf8'), 'TOKEN=1\n');
+      const included = objectResult(objectResult(added.result.storage).included);
+      assert.deepEqual([included.source, included.config_files], ['config', [file]]);
+      const [run] = runs(log);
+      assert.equal(realpathSync(run.cwd), realpathSync(path));
+      assert.equal(realpathSync(run.env.GIT_GRAFT_CONFIG_DIR), resolved);
+      assert.equal(realpathSync(run.env.GIT_GRAFT_PRIMARY), realpathSync(ctx.repo));
+
+      // The program is part of what was trusted: a change to it refuses
+      // every command that would run a hook, until it is trusted again.
+      writeFileSync(wrapper, body + (windows ? 'rem changed\r\n' : '# changed\n'), { mode: 0o755 });
+      const changed = ctx.fail(['remove', 'above', '--lease', added.lease]);
+      assert.equal(changed.code, 'hooks_untrusted');
+      assert.match(String(changed.message), /changed since they were last trusted/);
+      assert.equal(ctx.cli(['status', 'above']).phase, 'ready');
+      ctx.cli(['hook', 'trust']);
+      const removed = ctx.cli(['remove', 'above', '--lease', added.lease]);
+      assert.deepEqual(entries(removed), [ran('pre-archive', 'clean above', 'clean', file)]);
+
+      // A program that leaves the directory or names the primary's own files is refused.
+      for (const argv of [['../outside'], ['./project/hook'], ['project.graft/above/hook']]) {
+        writeFileSync(join(ctx.root, SHARED), JSON.stringify({ repositories: { project: { hooks: { bad: { event: 'post-add', argv } } } } }));
+        const error = ctx.fail(['hook', 'list']);
+        assert.equal(error.code, 'invalid_config', argv[0]);
+        assert.equal(realpathSync(String(objectResult(error.details).file)), join(resolved, SHARED));
+      }
+
+      // The primary's own files, once there, replace the directory's.
+      writeFileSync(join(ctx.root, SHARED), JSON.stringify({ repositories: { project: { hooks } } }));
+      writeFileSync(join(ctx.repo, LOCAL), '{}');
+      assert.deepEqual(ctx.cli(['hook', 'list']), { hooks: [] });
+      rmSync(join(ctx.repo, LOCAL));
+      rmSync(join(ctx.root, SHARED));
     },
   },
   {
