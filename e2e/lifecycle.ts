@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn as spawnProcess } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -451,6 +451,45 @@ export const cases: Scenario[] = [
       assert.equal(readFileSync(join(restored, 'tracked.txt'), 'utf8'), 'uncommitted edit\n');
       assert.equal(readFileSync(join(restored, 'notes.txt'), 'utf8'), 'untracked notes\n');
       assert.equal(readFileSync(join(restored, 'build', 'out.txt'), 'utf8'), 'ignored output\n');
+    },
+  },
+  {
+    name: 'prune --purge-archives deletes archives of the age given, with their recovery records',
+    run(ctx) {
+      const kept = ctx.spawn('kept');
+      const gone = ctx.spawn('gone');
+      const archived = ctx.cli(['remove', 'gone', '--lease', gone.lease]);
+      const recovery = String(archived.recovery_lease);
+      const archives = join(ctx.root, 'project.graft', '.retired');
+      const ids = () => (existsSync(archives) ? readdirSync(archives) : []).filter(name => /^[0-9a-f-]{36}$/.test(name));
+      const before = ids();
+      assert.equal(before.length, 1);
+
+      // Without the option nothing is said about archives; a larger age finds none.
+      const plain = ctx.cli(['prune']);
+      assert.deepEqual(plain.archives, { requested: false, purged: [] });
+      assert.deepEqual(objectResult(ctx.cli(['prune', '--purge-archives', '1']).archives).purged, []);
+      const preview = objectResult(ctx.cli(['prune', '--purge-archives', '0']).archives);
+      assert.equal(preview.requested, true);
+      assert.equal(preview.older_than_days, 0);
+      assert(Array.isArray(preview.purged) && preview.purged.length === 1);
+      const entry = objectResult(preview.purged[0]);
+      assert.equal(entry.name, 'gone');
+      assert.equal(typeof entry.archived_at, 'number');
+      assert.deepEqual(ids(), before);
+      assert(!JSON.stringify(preview).includes(recovery));
+
+      const applied = ctx.cli(['prune', '--apply', '--purge-archives', '0']);
+      const purged = objectResult(applied.archives).purged;
+      assert(Array.isArray(purged) && purged.length === 1);
+      assert.deepEqual(ids(), []);
+      const listed = ctx.cli(['list']);
+      assert(Array.isArray(listed.recoverable));
+      assert(listed.recoverable.map(objectResult).every(item => item.name !== 'gone'));
+      assert.notEqual(ctx.fail(['restore', 'gone', '--lease', recovery]).code, undefined);
+      // An active graft is never touched.
+      assert.equal(ctx.cli(['status', 'kept']).phase, 'ready');
+      ctx.cli(['remove', 'kept', '--lease', kept.lease]);
     },
   },
   {

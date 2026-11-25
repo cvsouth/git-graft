@@ -1153,7 +1153,16 @@ pub(crate) fn run_found(
             } else {
                 engine::gc::purge_caches(p, a.apply)?
             };
-            let mut pruned = json!({"applied":a.apply,"retained":retained,"cache":cache});
+            let archives = match a.purge_archives {
+                None => json!({"requested": false, "purged": []}),
+                Some(days) => json!({
+                    "requested": true,
+                    "older_than_days": days,
+                    "purged": registry::purge_archives(p, days, a.apply)?,
+                }),
+            };
+            let mut pruned =
+                json!({"applied":a.apply,"retained":retained,"cache":cache,"archives":archives});
             with_damaged(p, &mut pruned)?;
             return Ok(pruned);
         }
