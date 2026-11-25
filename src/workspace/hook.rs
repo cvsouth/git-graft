@@ -35,6 +35,9 @@ pub enum Event {
     PreArchive,
     /// After `restore` has reopened an archived graft.
     PostRestore,
+    /// After `turn take` has granted a holder a turn it did not hold, or
+    /// one whose grafts it changed.
+    PostTake,
 }
 
 impl Event {
@@ -43,6 +46,7 @@ impl Event {
             Self::PostAdd => "post-add",
             Self::PreArchive => "pre-archive",
             Self::PostRestore => "post-restore",
+            Self::PostTake => "post-take",
         }
     }
 }
@@ -123,26 +127,34 @@ struct Graft<'a> {
     port: u16,
 }
 
-/// The process for a hook: the program started directly in the graft, with
-/// the caller's environment and the graft's description. Like `exec`, it
-/// drops the lease and the variables that point Git at another repository.
-fn command(hook: &Hook, graft: &Graft<'_>) -> Result<Command> {
+/// The process for a hook: the program started directly in `dir`, with the
+/// caller's environment. Like `exec`, it drops the lease and the variables
+/// that point Git at another repository.
+fn base_command(hook: &Hook, dir: &Path) -> Result<Command> {
     let (program, args) = hook.argv.split_first().context("the hook has no program")?;
     let mut command = Command::new(hook.program.as_deref().unwrap_or(Path::new(program)));
     crate::git::clear_location(&mut command);
     command
         .args(args)
-        .current_dir(graft.path)
+        .current_dir(dir)
         .env_remove("GIT_GRAFT_LEASE")
         .env("GIT_GRAFT_HOOK", hook.event.name())
         .env("GIT_GRAFT_HOOK_NAME", &hook.name)
-        .env("GIT_GRAFT_NAME", graft.name)
-        .env("GIT_GRAFT_PATH", graft.path)
-        .env("GIT_GRAFT_PRIMARY", graft.primary)
         .env(
             "GIT_GRAFT_CONFIG_DIR",
             hook.dir.as_deref().unwrap_or(Path::new("")),
-        )
+        );
+    Ok(command)
+}
+
+/// The process for a hook of a graft's life: started in the graft, with the
+/// graft's description.
+fn command(hook: &Hook, graft: &Graft<'_>) -> Result<Command> {
+    let mut command = base_command(hook, graft.path)?;
+    command
+        .env("GIT_GRAFT_NAME", graft.name)
+        .env("GIT_GRAFT_PATH", graft.path)
+        .env("GIT_GRAFT_PRIMARY", graft.primary)
         .env("GIT_GRAFT_BRANCH", graft.branch.unwrap_or_default())
         .env("GIT_GRAFT_BASE", graft.base.unwrap_or_default())
         .env("GIT_GRAFT_PORT", graft.port.to_string());
@@ -168,8 +180,12 @@ fn entry(hook: &Hook, status: &str, output: &Value) -> Value {
 /// cannot be started is a failed hook, with the cause as its `reason`, so
 /// the caller decides what a failure means.
 fn run(hook: &Hook, graft: &Graft<'_>) -> Value {
-    let started =
-        command(hook, graft).and_then(|command| Runtime::capture_command(command, &hook.argv[0]));
+    finish(hook, command(hook, graft))
+}
+
+/// Start the prepared `command` for `hook`, wait for it and report it.
+fn finish(hook: &Hook, command: Result<Command>) -> Value {
+    let started = command.and_then(|command| Runtime::capture_command(command, &hook.argv[0]));
     match started {
         Ok(output) => {
             let status = if output["success"] == true {
@@ -195,6 +211,73 @@ fn skipped(hook: &Hook, reason: &str) -> Value {
 }
 
 const NOT_ALLOWED: &str = "The MCP host was not started with --allow-exec, so the hook was not run";
+
+/// A turn a `post-take` hook is told about.
+pub(crate) struct Taken<'a> {
+    /// The checkout of the project that keeps the turn, where the hook runs.
+    pub primary: &'a Path,
+    pub resource: &'a str,
+    pub holder: &'a str,
+    /// The paths of the grafts the holder named.
+    pub grafts: &'a [std::path::PathBuf],
+}
+
+/// Run the `post-take` `hooks` for the turn `taken`, in order, and report
+/// them: all skipped when the caller may not run hooks, and once one fails,
+/// the rest skipped. The caller holds no project lock.
+pub(crate) fn after_take(policy: Policy, hooks: &[Hook], taken: &Taken<'_>) -> Vec<Value> {
+    let mut entries: Vec<Value> = Vec::with_capacity(hooks.len());
+    for hook in hooks {
+        if policy == Policy::Skip {
+            entries.push(skipped(hook, NOT_ALLOWED));
+        } else if let Some(failed) = entries.iter().find(|entry| entry["status"] == "failed") {
+            let reason = format!(
+                "The post-take hook {} failed first, so this one was not run",
+                failed["name"]
+            );
+            entries.push(skipped(hook, &reason));
+        } else {
+            let command = base_command(hook, taken.primary).map(|mut command| {
+                let grafts: Vec<String> = taken
+                    .grafts
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect();
+                command
+                    .env("GIT_GRAFT_PRIMARY", taken.primary)
+                    .env("GIT_GRAFT_TURN_RESOURCE", taken.resource)
+                    .env("GIT_GRAFT_TURN_HOLDER", taken.holder)
+                    .env("GIT_GRAFT_TURN_GRAFTS", grafts.join("\n"));
+                command
+            });
+            entries.push(finish(hook, command));
+        }
+    }
+    entries
+}
+
+/// The refusal of a `turn take` whose `post-take` hook failed: the turn was
+/// given up again. `entries` are the reports of the hooks it ran.
+pub(crate) fn take_failed(resource: &str, holder: &str, entries: Vec<Value>) -> anyhow::Error {
+    let failed = entries
+        .iter()
+        .find(|entry| entry["status"] == "failed")
+        .cloned()
+        .unwrap_or_default();
+    let name = &failed["name"];
+    let cause = match (failed["reason"].as_str(), failed["exit_code"].as_i64()) {
+        (Some(reason), _) => format!("The post-take hook {name} failed: {reason}"),
+        (None, Some(code)) => format!("The post-take hook {name} exited with code {code}"),
+        (None, None) => format!("The post-take hook {name} was ended by a signal"),
+    };
+    api::fault(
+        "hook_failed",
+        format!(
+            "{cause}, so {holder} did not keep the turn on {resource}; it was given up. Fix what the hook reports and take the turn again"
+        ),
+        json!({"resource": resource, "holder": holder, "hooks": entries}),
+    )
+}
 
 /// The project locks could not be taken again after a hook ran. The command
 /// no longer holds what protects the project's records, so it must stop.

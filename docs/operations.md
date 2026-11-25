@@ -245,6 +245,7 @@ A hook that comes with the repository runs only once you have trusted it: every 
 | `post-add` | After `add` has created the graft and recorded it active, before `add` replies. |
 | `pre-archive` | Before `remove`, `merge` or `prune --apply` archives a graft: after the lease is checked and before Graft looks for untracked or ignored files, which the hook may remove. A plain `remove` refuses a pending merge, a Git operation in progress, a change to a tracked file and unmerged work before the hook runs. `merge --undo` runs no hook. |
 | `post-restore` | After `restore` has reopened an archived graft, before it replies. |
+| `post-take` | After `turn take` has granted a turn the holder did not hold, or changed the grafts of one it holds, before it replies. See [hooks for turns](#hooks-for-turns). |
 
 Graft starts the program directly, without a shell, with the graft as its working directory, or the resolved `program` for a hook from a directory above the checkout. It waits for the hook to exit, and for its standard output and standard error to close, and sets no time limit. A job the hook starts in the background must redirect both streams, for example `nohup server >server.log 2>&1 &`, or the command does not return until that job exits. Name the program by an absolute path outside the grafts, or by a bare name that is looked up in `PATH`; in a directory above the checkout, a path relative to that directory also works. The configuration refuses a relative path with a directory in it, such as `./scripts/setup`, everywhere else: on Unix it would name the graft's own copy, so the graft's files would decide what runs, and on Windows it would name a program in the caller's directory instead. The hook gets the environment of the `git graft` command, or of the MCP host, without `GIT_GRAFT_LEASE` and without the variables that point Git at another repository, such as `GIT_DIR`. A hook never receives a lease. Graft adds these variables:
 
@@ -302,6 +303,18 @@ While a hook runs, Graft holds that graft's lock and no project-wide lock. Other
 Over MCP, hooks run on `graft_add`, `graft_remove`, `graft_merge` and `graft_restore` only when the host was started with `--allow-exec`. Without it they are not run, the entry has `"status": "skipped"`, and the command goes on, so `graft_remove` and `graft_merge` archive the graft without its `pre-archive` hook. With it, hooks that need trust and lack it refuse the call with `hooks_untrusted`, as on the CLI. The CLI always runs hooks once they are trusted.
 
 If the configuration cannot be read, `add`, `remove`, `merge` and `restore` refuse with `invalid_config` before changing anything, and `prune --apply` keeps each graft it would have archived, with the reason `error`.
+
+### Hooks for turns
+
+A `post-take` hook acts on the resource for the holder that has just been granted it: it can point a development server at the holder's grafts, for example. It runs when `turn take` grants a turn the holder did not hold, and when a holder that already holds it names a different set of grafts; a renewal, a queued ask and a release run nothing. The hooks come from the configuration of the project that keeps the turn: the primary's own, or, for a [shared resource](#share-a-resource-between-repositories), the top-level `hooks` of the directory's configuration. They run in that project's checkout with no Graft lock held, after the turn is recorded. Since they never run in a graft, a `post-take` hook may name its program by a path relative to the configuration's directory, such as `./scripts/stack`, without `..`, wherever it is defined; trust covers that program's contents, as for hooks [in a directory above the checkout](#configure-several-repositories-from-one-directory). Besides `GIT_GRAFT_HOOK`, `GIT_GRAFT_HOOK_NAME`, `GIT_GRAFT_CONFIG_DIR` and `GIT_GRAFT_PRIMARY`, which names the checkout of the project that keeps the turn, a `post-take` hook receives:
+
+| Variable | Value |
+| --- | --- |
+| `GIT_GRAFT_TURN_RESOURCE` | The resource. |
+| `GIT_GRAFT_TURN_HOLDER` | The holder's name. |
+| `GIT_GRAFT_TURN_GRAFTS` | The paths of the holder's grafts, one per line, or empty. |
+
+The reply carries the `hooks` array. If a `post-take` hook fails, the turn is given up again, the rest are skipped, and `turn take` refuses with `hook_failed`, with `details.resource`, `details.holder` and `details.hooks`. Trust applies as for other hooks, and an MCP host runs them only with `--allow-exec`, reporting them as skipped otherwise while the turn is still taken. A waiting `take` runs them once, when it is granted.
 
 ## Merge and recover
 

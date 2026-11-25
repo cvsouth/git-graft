@@ -311,6 +311,7 @@ impl ServerHandler for Server {
                 // The Git version and the project are found once, not on
                 // every ask.
                 let repo = self.repo.clone();
+                let policy = self.hooks();
                 let command = Command::TurnTake(take.clone());
                 match blocking(move || workspace::find(&repo, &command)).await? {
                     Err(error) => Err(error),
@@ -318,12 +319,7 @@ impl ServerHandler for Server {
                         let ask = |take| {
                             let (repo, found) = (self.repo.clone(), found.clone());
                             blocking(move || {
-                                workspace::run_found(
-                                    &repo,
-                                    found,
-                                    Command::TurnTake(take),
-                                    hook::Policy::Skip,
-                                )
+                                workspace::run_found(&repo, found, Command::TurnTake(take), policy)
                             })
                         };
                         take_turn(

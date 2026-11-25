@@ -130,7 +130,8 @@ impl Config {
             let names = Names {
                 shared: SHARED.to_owned(),
                 local: LOCAL.to_owned(),
-                dir: None,
+                dir: primary,
+                below: false,
             };
             let missing = missing(primary, &shared, &local, &names);
             let mut config = merge(
@@ -152,7 +153,8 @@ impl Config {
             let names = Names {
                 shared: format!("{up}{SHARED}"),
                 local: format!("{up}{LOCAL}"),
-                dir: Some(dir),
+                dir,
+                below: true,
             };
             let missing = missing(dir, &shared, &local, &names);
             let mut config = merge(
@@ -671,6 +673,8 @@ fn check_part(part: &Part, name: &'static str, below: Option<(&str, &Path)>) -> 
         match spec {
             Some(spec) => match below {
                 Some((key, dir)) => validate_below(&spec.argv, key, dir),
+                // A post-take hook runs in the checkout, never in a graft.
+                None if spec.event == Event::PostTake => validate_inside(&spec.argv).map(|_| ()),
                 None => hook::validate(&spec.argv),
             }
             .map_err(|error| anyhow::anyhow!("hook {hook:?}: {error:#}"))?,
@@ -690,29 +694,10 @@ fn check_part(part: &Part, name: &'static str, below: Option<(&str, &Path)>) -> 
 /// resolved first, and where the filesystem ignores case, so is the
 /// comparison.
 fn validate_below(argv: &[String], key: &str, dir: &Path) -> Result<()> {
-    let Some(program) = argv.first().filter(|program| relative_program(program)) else {
-        return hook::validate(argv);
+    let Some(normal) = validate_inside(argv)? else {
+        return Ok(());
     };
-    let mut rest = argv.to_vec();
-    // Check everything else as for any hook, with a bare name in its place.
-    rest[0] = "program".to_owned();
-    hook::validate(&rest)?;
-    anyhow::ensure!(
-        program.len() <= 4096 && !program.contains('\0'),
-        "the hook program must be at most 4096 bytes and contain no NUL character"
-    );
-    let path = Path::new(program);
-    anyhow::ensure!(
-        path.components()
-            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
-            && path.components().any(|c| matches!(c, Component::Normal(_))),
-        "the hook program {program:?} must be a path inside the configuration's directory, \
-         without '..', or an absolute path, or a bare name to look up in PATH"
-    );
-    let normal: PathBuf = path
-        .components()
-        .filter(|component| matches!(component, Component::Normal(_)))
-        .collect();
+    let program = &argv[0];
     let inside_repository = || {
         anyhow::anyhow!(
             "the hook program {program:?} is inside the repository {key:?}, \
@@ -753,6 +738,37 @@ fn validate_below(argv: &[String], key: &str, dir: &Path) -> Result<()> {
         return Err(in_grafts(part));
     }
     Ok(())
+}
+
+/// Check a hook whose program may be a path relative to the configuration's
+/// directory, inside it. Returns that path without `.` parts, or `None` when
+/// the program is an absolute path or a bare name.
+fn validate_inside(argv: &[String]) -> Result<Option<PathBuf>> {
+    let Some(program) = argv.first().filter(|program| relative_program(program)) else {
+        hook::validate(argv)?;
+        return Ok(None);
+    };
+    let mut rest = argv.to_vec();
+    // Check everything else as for any hook, with a bare name in its place.
+    rest[0] = "program".to_owned();
+    hook::validate(&rest)?;
+    anyhow::ensure!(
+        program.len() <= 4096 && !program.contains('\0'),
+        "the hook program must be at most 4096 bytes and contain no NUL character"
+    );
+    let path = Path::new(program);
+    anyhow::ensure!(
+        path.components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+            && path.components().any(|c| matches!(c, Component::Normal(_))),
+        "the hook program {program:?} must be a path inside the configuration's directory, \
+         without '..', or an absolute path, or a bare name to look up in PATH"
+    );
+    Ok(Some(
+        path.components()
+            .filter(|component| matches!(component, Component::Normal(_)))
+            .collect(),
+    ))
 }
 
 /// Whether `path` is `base` or inside it, comparing component by component,
@@ -821,18 +837,21 @@ fn relative_program(program: &str) -> bool {
 struct Names<'a> {
     shared: String,
     local: String,
-    dir: Option<&'a Path>,
+    /// The directory that holds the files.
+    dir: &'a Path,
+    /// Whether these are a repository's settings in a directory above it.
+    below: bool,
 }
 
 impl Names<'_> {
     fn hook(&self, name: String, spec: Spec, local: bool) -> Hook {
-        let program = self.dir.and_then(|dir| {
-            relative_program(&spec.argv[0]).then(|| {
-                Path::new(&spec.argv[0])
-                    .components()
-                    .filter(|component| matches!(component, Component::Normal(_)))
-                    .fold(dir.to_owned(), |path, part| path.join(part))
-            })
+        // Checked already: only these may name a relative program.
+        let resolves = self.below || spec.event == Event::PostTake;
+        let program = (resolves && relative_program(&spec.argv[0])).then(|| {
+            Path::new(&spec.argv[0])
+                .components()
+                .filter(|component| matches!(component, Component::Normal(_)))
+                .fold(self.dir.to_owned(), |path, part| path.join(part))
         });
         Hook {
             name,
@@ -1678,5 +1697,33 @@ mod tests {
             Some((app.clone(), vec!["stack".to_owned()]))
         );
         assert_eq!(shared_turns(&app).unwrap(), None);
+    }
+
+    #[test]
+    fn a_post_take_hook_may_name_a_program_inside_its_own_checkout() {
+        let tmp = primary();
+        write(
+            tmp.path(),
+            SHARED,
+            r#"{"hooks": {"stack": {"event": "post-take", "argv": ["./scripts/stack", "up"]}}}"#,
+        );
+        let config = Config::read(tmp.path()).unwrap();
+        assert_eq!(
+            config.hooks[0].program.as_deref(),
+            Some(tmp.path().join("scripts").join("stack").as_path())
+        );
+        // Other events still refuse it, and no post-take hook may leave the checkout.
+        for body in [
+            r#"{"hooks": {"stack": {"event": "post-add", "argv": ["./scripts/stack"]}}}"#,
+            r#"{"hooks": {"stack": {"event": "post-take", "argv": ["../stack"]}}}"#,
+        ] {
+            write(tmp.path(), SHARED, body);
+            let error = Config::read(tmp.path()).unwrap_err();
+            assert_eq!(
+                crate::api::error_json(&error)["code"],
+                "invalid_config",
+                "{body}"
+            );
+        }
     }
 }

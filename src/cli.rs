@@ -185,8 +185,10 @@ Prints \"granted\": true when the holder holds the turn. Otherwise it is queued
 and \"position\" is its place in line; ask again within 300 seconds to keep it.
 Being queued is not a failure: the exit status is 0 either way. A resource the
 configuration lists under \"turns\" in a directory above the primary is shared
-by every repository that directory configures. Graft does nothing to the
-resource itself.")]
+by every repository that directory configures. A post-take hook in the
+configuration runs when a turn is newly granted or its grafts change; if it
+fails, the turn is given up and the take refused. Graft does nothing else to
+the resource.")]
     Take(api::TurnTake),
     /// Give up the turn on a shared resource, or leave its queue.
     Release(api::TurnRelease),

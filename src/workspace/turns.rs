@@ -27,9 +27,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::registry;
+use super::{
+    hook::{self, Event, Policy},
+    registry,
+};
 use crate::{
-    api, cache, config,
+    api, cache,
+    config::{self, Config},
     registry::{Paths, Project, atomic, dir, exists, now, owned_directory},
 };
 
@@ -521,8 +525,16 @@ fn grafts_at(paths: &[PathBuf], liveness: &Liveness<'_>) -> Result<Vec<Graft>> {
 }
 
 /// `turn take`, asked once, for the primary at `primary` whose own project
-/// is at `own`.
-pub(super) fn take(primary: &Path, own: Paths, args: &api::TurnTake) -> Result<Value> {
+/// is at `own`. When it grants a turn the holder did not hold, or changes
+/// the grafts of one it holds, the `post-take` hooks of the project that
+/// keeps the turn run, with no lock held; if one fails, the turn is given up
+/// again and the take refused. `hooks` says whether the caller may run them.
+pub(super) fn take(
+    primary: &Path,
+    own: Paths,
+    args: &api::TurnTake,
+    hooks: Policy,
+) -> Result<Value> {
     validate_resource(&args.resource)?;
     args.check()?;
     validate_holder(&args.holder, &args.lease)?;
@@ -534,7 +546,12 @@ pub(super) fn take(primary: &Path, own: Paths, args: &api::TurnTake) -> Result<V
                 .ok_or_else(|| invalid_holder(format!("No running process has the ID {pid}")))?,
         }),
     };
-    let (p, _lock) = Project::open_at(place_of(primary, own, &args.resource)?, false)?;
+    let place = place_of(primary, own, &args.resource)?;
+    let (p, lock) = Project::open_at(place.clone(), false)?;
+    // The project that keeps the turn defines what runs when it is taken.
+    let config = Config::read(&p.repo)?;
+    hook::trust::require(&p, &config, Event::PostTake, hooks)?;
+    let post_take = config.hooks_for(Event::PostTake);
     let liveness = Liveness::new(&p);
     let who = Party {
         name: args.holder.clone(),
@@ -544,7 +561,14 @@ pub(super) fn take(primary: &Path, own: Paths, args: &api::TurnTake) -> Result<V
     };
     let stored = read(&p, &args.resource)?;
     let mut turn = stored.clone();
-    let granted = turn.take(now(), &who, args.ttl, &|party| liveness.gone(party))?;
+    let now = now();
+    turn.settle(now, &|party| liveness.gone(party));
+    let before = turn
+        .holder
+        .as_ref()
+        .filter(|holder| holder.who.name == who.name)
+        .map(|holder| holder.who.grafts.clone());
+    let granted = turn.take(now, &who, args.ttl, &|party| liveness.gone(party))?;
     if turn != stored {
         write(&p, &args.resource, &turn)?;
     }
@@ -553,6 +577,48 @@ pub(super) fn take(primary: &Path, own: Paths, args: &api::TurnTake) -> Result<V
     if !granted {
         reply["position"] = json!(turn.position(&args.holder));
     }
+    let grafts: Vec<PathBuf> = turn
+        .holder
+        .as_ref()
+        .map(|holder| {
+            holder
+                .who
+                .grafts
+                .iter()
+                .map(|graft| graft.path.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let changed = granted
+        && before.is_none_or(|before| {
+            turn.holder
+                .as_ref()
+                .is_some_and(|holder| holder.who.grafts != before)
+        });
+    if !changed || post_take.is_empty() {
+        return Ok(reply);
+    }
+    drop(liveness);
+    drop(lock);
+    let taken = hook::Taken {
+        primary: &p.repo,
+        resource: &args.resource,
+        holder: &args.holder,
+        grafts: &grafts,
+    };
+    let entries = hook::after_take(hooks, &post_take, &taken);
+    if entries.iter().any(|entry| entry["status"] == "failed") {
+        let (p, _lock) = Project::open_at(place, false)?;
+        let liveness = Liveness::new(&p);
+        let mut turn = read(&p, &args.resource)?;
+        if turn.release(crate::registry::now(), &args.holder, &who.lease, &|party| {
+            liveness.gone(party)
+        })? {
+            write(&p, &args.resource, &turn)?;
+        }
+        return Err(hook::take_failed(&args.resource, &args.holder, entries));
+    }
+    reply["hooks"] = json!(entries);
     Ok(reply)
 }
 
@@ -978,6 +1044,7 @@ mod tests {
                     wait: 0,
                     ttl: None,
                 },
+                Policy::Run,
             )
         }
 
@@ -1108,6 +1175,7 @@ mod tests {
                 wait: 0,
                 ttl: None,
             },
+            Policy::Run,
         )
         .unwrap_err();
         assert_eq!(api::error_json(&error)["code"], "invalid_config");
@@ -1158,6 +1226,7 @@ mod tests {
                 wait: 0,
                 ttl: None,
             },
+            Policy::Run,
         )
         .unwrap_err();
         assert_eq!(api::error_json(&error)["code"], "invalid_holder");
@@ -1216,5 +1285,99 @@ mod tests {
         ] {
             take(wait, ttl).check().unwrap_err();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_take_hooks_of_the_keeping_project_run_when_a_turn_is_newly_granted() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new()?;
+        let log = f.root.join("hook.log");
+        let script = f.root.join("switch");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s|%s|%s|%s\\n' \"$GIT_GRAFT_HOOK\" \"$GIT_GRAFT_TURN_RESOURCE\" \"$GIT_GRAFT_TURN_HOLDER\" \"$GIT_GRAFT_TURN_GRAFTS\" \"$(pwd)\" >> '{}'\n[ \"$GIT_GRAFT_TURN_HOLDER\" != broken ]\n",
+                log.display()
+            ),
+        )?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+        fs::write(
+            f.root.join(crate::config::LOCAL),
+            format!(
+                r#"{{"turns": ["stack"], "hooks": {{"switch": {{"event": "post-take", "argv": [{}]}}}}}}"#,
+                json!(script)
+            ),
+        )?;
+        let lines = || -> Vec<String> {
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        };
+        let granted = f.ask(&f.app, "stack", "agent-1", None)?;
+        assert_eq!(granted["hooks"][0]["status"], "ok", "{granted}");
+        assert_eq!(granted["hooks"][0]["event"], "post-take");
+        assert_eq!(
+            lines(),
+            [format!("post-take|stack|agent-1||{}", f.root.display())]
+        );
+        // A renewal, a queued ask and a resource the root does not keep run nothing.
+        assert!(
+            f.ask(&f.api, "stack", "agent-1", None)?
+                .get("hooks")
+                .is_none()
+        );
+        assert!(
+            f.ask(&f.api, "stack", "agent-2", None)?
+                .get("hooks")
+                .is_none()
+        );
+        assert!(
+            f.ask(&f.app, "web", "agent-1", None)?
+                .get("hooks")
+                .is_none()
+        );
+        assert_eq!(lines().len(), 1);
+        f.give_up(&f.app, "stack", "agent-1")?;
+        f.give_up(&f.app, "stack", "agent-2")?;
+
+        // A failing hook gives the turn up again and refuses the take.
+        let error = f.ask(&f.app, "stack", "broken", None).unwrap_err();
+        let json = api::error_json(&error);
+        assert_eq!(json["code"], "hook_failed");
+        assert_eq!(json["details"]["hooks"][0]["exit_code"], 1);
+        assert!(
+            f.list(&f.app)?
+                .iter()
+                .all(|(resource, _, _)| resource != "stack")
+        );
+        assert_eq!(
+            f.ask(&f.app, "stack", "agent-2", None)?["hooks"][0]["status"],
+            "ok"
+        );
+
+        // A caller that may not run hooks takes the turn and reports them skipped.
+        f.give_up(&f.app, "stack", "agent-2")?;
+        let quiet = super::take(
+            &f.app,
+            Project::paths(&f.app)?,
+            &api::TurnTake {
+                resource: "stack".into(),
+                holder: "quiet".into(),
+                lease: lease("quiet"),
+                pid: None,
+                grafts: Vec::new(),
+                wait: 0,
+                ttl: None,
+            },
+            Policy::Skip,
+        )?;
+        assert_eq!(
+            (&quiet["granted"], &quiet["hooks"][0]["status"]),
+            (&json!(true), &json!("skipped"))
+        );
+        Ok(())
     }
 }

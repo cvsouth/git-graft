@@ -884,19 +884,13 @@ pub(crate) fn turn_pause(reply: &Value, deadline: Instant) -> Option<Duration> {
 /// project as a whole command does: between asks this process holds no
 /// project, graft or build lock, and the next ask finds a graft archived
 /// meanwhile, or a replaced lease, as any other command would.
-fn wait_for_turn(repo: &Path, mut args: api::TurnTake) -> Result<Value> {
+fn wait_for_turn(repo: &Path, mut args: api::TurnTake, hooks: hook::Policy) -> Result<Value> {
     args.check()?;
     let deadline = Instant::now() + Duration::from_secs(args.wait);
     args.wait = 0;
     let found = find(repo, &Command::TurnTake(args.clone()))?;
     loop {
-        // A turn runs no hook.
-        let reply = run_found(
-            repo,
-            found.clone(),
-            Command::TurnTake(args.clone()),
-            hook::Policy::Skip,
-        )?;
+        let reply = run_found(repo, found.clone(), Command::TurnTake(args.clone()), hooks)?;
         match turn_pause(&reply, deadline) {
             Some(pause) => std::thread::sleep(pause),
             None => return Ok(reply),
@@ -912,7 +906,7 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
 /// [`run`] for a caller that says whether it may run the project's hooks.
 pub fn run_with(repo: &Path, command: Command, hooks: hook::Policy) -> Result<Value> {
     match command {
-        Command::TurnTake(args) if args.wait > 0 => wait_for_turn(repo, args),
+        Command::TurnTake(args) if args.wait > 0 => wait_for_turn(repo, args, hooks),
         command => run_once(repo, command, hooks),
     }
 }
@@ -995,7 +989,7 @@ pub(crate) fn run_found(
     // Listing creates no state in a project that has none.
     match command {
         Command::TurnList => return turns::list(&paths.0.clone(), paths),
-        Command::TurnTake(args) => return turns::take(&paths.0.clone(), paths, &args),
+        Command::TurnTake(args) => return turns::take(&paths.0.clone(), paths, &args, hooks),
         Command::TurnRelease(args) => return turns::release(&paths.0.clone(), paths, &args),
         _ => {}
     }
