@@ -51,6 +51,18 @@ then fix, commit and retry the merge with the same lease.
 Uncommitted edits in the primary checkout stay as they are. Only edits to
 paths the merge changes stop it, as destination_has_local_changes.")]
     Merge(api::Land),
+    /// Push a graft's commits to a branch on a remote of the primary repository.
+    #[command(after_help = "\
+Examples:
+  git graft push fix-parser --lease <lease>                   To origin, as the graft's branch
+  git graft push fix-parser --lease <lease> --to fix/parser   To another branch name
+  git graft push fix-parser --lease <lease> --remote fork     To another remote of the primary
+
+The push runs in the primary repository, so its remote URL, credentials and
+pre-push hook apply. Nothing is forced, and uncommitted work is not pushed.
+The graft stays active. To finish, archive it with `remove --discard` and
+keep the recovery lease: Graft does not treat pushed commits as merged.")]
+    Push(api::Push),
     /// Archive a graft and its files. Refuses if it has unmerged work unless --discard is given.
     #[command(after_help = "\
 Examples:
@@ -209,6 +221,7 @@ impl From<Cmd> for workspace::Command {
                 },
             },
             Cmd::Merge(args) => Op::land(args),
+            Cmd::Push(args) => Op::Push(args),
             Cmd::Remove(args) => Op::Drop(args),
             Cmd::Prune(args) => Op::Gc(args),
             Cmd::Restore(args) => Op::Restore(args),

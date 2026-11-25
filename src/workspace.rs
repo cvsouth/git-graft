@@ -1,6 +1,7 @@
 //! Graft creation, inspection, integration and recoverable retirement.
 mod land;
 mod objects;
+mod push;
 mod registry;
 mod turns;
 
@@ -42,6 +43,7 @@ pub enum Command {
     /// Save, restore or forget; the string is the action.
     Layer(&'static str, api::Layer),
     Land(api::Land),
+    Push(api::Push),
     Drop(api::DropWorkspace),
     Restore(api::Owned),
     UndoLand(api::Owned),
@@ -1059,6 +1061,7 @@ pub(crate) fn run_found(repo: &Path, found: Found, command: Command) -> Result<V
             turns::validate_resource(&a.resource)?;
             (&a.name, &a.lease)
         }
+        Command::Push(a) => (&a.name, &a.lease),
     };
     let mut r = registry::authenticate(p, name, lease)?;
     ensure!(
@@ -1107,6 +1110,7 @@ pub(crate) fn run_found(repo: &Path, found: Found, command: Command) -> Result<V
             drop((lock, builds));
             runtime.install(&a.manager, &a.packages, a.offline, attached)
         }
+        Command::Push(a) => push::run(p, &r, &a, (lock, builds)),
         _ => unreachable!(),
     }
 }

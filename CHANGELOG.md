@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A `.worktreeinclude` file at the root of the checkout sets default include patterns for every graft.
 - `git graft local-files` and the MCP tool `graft_local_files` list the checkout's untracked and ignored files, so an agent can choose what to bring.
 - `status`, `merge` and `remove` don't count included copies as changes until the graft edits them.
+- `git graft push NAME --lease TOKEN [--remote REMOTE] [--to BRANCH]` pushes a graft's commits to a branch on a remote of the primary repository, for work that goes through a pull request. It uses the primary's remote configuration, credentials and `pre-push` hook, never forces, and leaves the graft active. Without `--to` it refuses to update the remote's default branch, as recorded in `refs/remotes/REMOTE/HEAD`. SSH runs in batch mode unless an SSH command is configured. New error codes: `push_rejected`, `push_failed`, `remote_not_found`, `detached_head`, `default_branch` and `nothing_to_push`.
+- MCP hosts started with `mcp --allow-push` offer the `graft_push` tool. It is a separate opt-in from `--allow-exec`.
 - `git graft turn take`, `turn release` and `turn list`, and the MCP tools `graft_turn_take`, `graft_turn_release` and `graft_turn_list`: grafts take turns on something a project has only one of, such as a development server on a fixed port. Turns go in the order grafts asked, expire unless renewed, and are dropped when their graft is archived.
 
 ### Changed

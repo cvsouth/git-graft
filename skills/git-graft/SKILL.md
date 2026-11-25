@@ -1,6 +1,6 @@
 ---
 name: git-graft
-description: Give an agent task its own graft of a Git repository through the CLI or MCP, then merge, recover or remove it. Covers lease handling, request retries, package-manager reuse, taking turns on a shared resource and undoing a merge.
+description: Give an agent task its own graft of a Git repository through the CLI or MCP, then merge, push, recover or remove it. Covers lease handling, request retries, package-manager reuse, pushing for a pull request, taking turns on a shared resource and undoing a merge.
 ---
 
 # Use Graft for an agent task
@@ -25,6 +25,18 @@ A graft has its own files, but a project can have one development server on a fi
 
 `graft_turn_list` shows who holds and who waits for each resource. On the CLI these are `git graft turn take`, `turn release` and `turn list`. [Rules for turns](../../docs/operations.md#take-turns-on-a-shared-resource)
 
+## Publish a graft for a pull request
+
+`graft_push` sends a graft's commits to a branch on a remote of the primary repository. The host offers it only when started with `--allow-push`; if it is not listed, publishing is not permitted and there is nothing to work around. Use it only when the task asks for the work to be published, for example to push a branch or open a pull request. Otherwise merge with `graft_merge`, or leave the graft for the user.
+
+1. Commit the task's changes in the graft. Only commits are pushed.
+2. Call `graft_push` with the graft's `name` and `lease`. The remote branch takes the name of the graft's branch; pass `to` to choose another, which a detached `HEAD` requires. Pass `remote` only when the task names a remote other than `origin`.
+3. Check the result: `branch` and `commit` are what the remote now holds, and `uncommitted_changes` counts files that were left out.
+4. Open the pull request from `branch` with the tools the task provides. Graft does not open it.
+5. The graft stays active. For review changes, commit and call `graft_push` again. Do not also call `graft_merge` for work that goes through a pull request unless asked.
+
+Nothing is forced, and you must not look for another way to overwrite a remote branch. Pushed commits do not count as merged, so `graft_remove` still reports `unmerged_work`. When the user says the work is finished, ask before removing with `discard`, and keep the `recovery_lease`. [Push to a remote](../../docs/operations.md#push-to-a-remote)
+
 ## When Graft keeps work instead of finishing
 
 Graft never deletes or overwrites work to finish a command. These results mean it kept something; read `code` and `details`, then act as below. Never delete or edit Graft's record, archive or journal files to get past one.
@@ -41,6 +53,11 @@ Graft never deletes or overwrites work to finish a command. These results mean i
 - `dependencies_not_shareable` (CLI `deps share`): the project's install is not plain, lockfile-pinned registry packages, for example npm workspaces, overrides or linked packages. `details.reason`, `field`, `path` and `fallback` say why and what to do. Nothing was registered. Install in each graft instead with `npm ci`, or `deps add` with `--manager npm`; do not edit the manifest to get past it.
 - `checkout_recovery_required`: retry the same merge or undo with the same lease. If it names `paths`, ask the user how to keep those edits.
 - `checkout_update_set_aside`: the destination branch moved after an interrupted update. Ask the user to check `git status` in the primary, then retry the merge.
+- `push_rejected`: the remote refused the update (`details.reason`), usually because the remote branch has commits the graft lacks. Nothing was pushed. Tell the user, who can fetch the remote in the primary so that you can merge the branch into the graft and push again. Push under another name with `to` only if the task allows a new branch.
+- `push_failed`: the push could not be completed, for example for network or authentication reasons (`details.stderr`). Report it to the user. Do not retry in a loop or try another remote.
+- `remote_not_found`: the primary has no remote of that name; `details.remotes` lists the ones it has. Use one only if the task names it, otherwise ask the user.
+- `detached_head` or `nothing_to_push`: pass `to` to name the remote branch, or commit first.
+- `default_branch`: the graft's branch has the name of the remote's default branch. Pass `to` with another branch name. Pass `to` with the default branch only if the task says to update it.
 - `git_busy` or `workspace_busy`: another Git or Graft command, or a background job started with `graft_exec`, is running. Wait or stop your own background job, then retry.
 - `retained_path` and `kept` (CLI `deps layer remove` and `gc --purge-cache`): layers were kept, not deleted. Leave them for the user.
 

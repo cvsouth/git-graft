@@ -34,6 +34,7 @@ Workflow:
   git graft add fix\-parser                               Create a graft; prints its path and lease
   cd ../<repo>.graft/fix\-parser                          Edit, test and commit with ordinary Git
   git graft merge fix\-parser \-\-lease <lease>             Merge into main and archive the graft
+  git graft push fix\-parser \-\-lease <lease>              Or push its commits to origin for a pull request
   git graft restore fix\-parser \-\-lease <recovery_lease>  Reopen an archived graft
 
 Leases:
@@ -76,6 +77,9 @@ Install and reuse dependencies
 .TP
 \fBmerge\fR
 Merge a graft's commits into a local branch, then archive the graft
+.TP
+\fBpush\fR
+Push a graft's commits to a branch on a remote of the primary repository
 .TP
 \fBremove\fR
 Archive a graft and its files. Refuses if it has unmerged work unless \-\-discard is given

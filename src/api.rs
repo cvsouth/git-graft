@@ -11,6 +11,9 @@ fn head() -> String {
 fn main_branch() -> String {
     "main".into()
 }
+fn origin() -> String {
+    "origin".into()
+}
 
 #[derive(Debug, Args, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -424,6 +427,26 @@ pub struct TurnRelease {
     /// Lease returned when the graft was created.
     #[arg(long, env = "GIT_GRAFT_LEASE", hide_env_values = true)]
     pub lease: String,
+}
+
+/// Arguments of `push` and the MCP `graft_push` tool: publish a graft's
+/// commits to a remote of the primary repository.
+#[derive(Debug, Args, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Push {
+    /// Name of the graft.
+    pub name: String,
+    /// The graft's lease, returned when it was added.
+    #[arg(long, env = "GIT_GRAFT_LEASE", hide_env_values = true)]
+    pub lease: String,
+    /// Name of a remote configured in the primary repository.
+    #[arg(long, default_value = "origin")]
+    #[serde(default = "origin")]
+    pub remote: String,
+    /// Branch to update on the remote. Defaults to the graft's current branch, except that the
+    /// remote's default branch is updated only when named here.
+    #[arg(long, value_name = "BRANCH")]
+    pub to: Option<String>,
 }
 
 /// Arguments of `prune`: preview or archive every expired graft.

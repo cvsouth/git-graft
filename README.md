@@ -131,7 +131,7 @@ Cursor, in `.cursor/mcp.json`:
 }
 ```
 
-Any other MCP client works the same way: a stdio server whose command is `git-graft` with the arguments `--repo <path> mcp`. Add `--allow-exec` after `mcp` to let agents run commands and install packages inside their grafts.
+Any other MCP client works the same way: a stdio server whose command is `git-graft` with the arguments `--repo <path> mcp`. Add `--allow-exec` after `mcp` to let agents run commands and install packages inside their grafts. Add `--allow-push` to let them push a graft's commits to your checkout's remotes, for example to open a pull request; each option is a separate opt-in.
 
 Each agent creates, works in and merges its own graft, and proves ownership with its lease, so agents can't interfere with each other or with your checkout. The [agent guide](skills/git-graft/SKILL.md) describes the tools.
 
