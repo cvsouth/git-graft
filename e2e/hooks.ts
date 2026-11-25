@@ -145,6 +145,9 @@ function retained(result: Record<string, unknown>): Map<unknown, Entry> {
   return new Map(result.retained.map(objectResult).map((item): [unknown, Entry] => [item.name, item]));
 }
 
+// An absolute program path on this platform; Windows needs a drive.
+const SETUP = process.platform === 'win32' ? 'C:\\tools\\setup.exe' : '/usr/local/bin/setup';
+
 export const cases: Scenario[] = [
   {
     name: 'hook list shows the configured hooks in run order, each with its file, and creates no Graft state',
@@ -152,7 +155,7 @@ export const cases: Scenario[] = [
       const state = join(ctx.repo, '.git', 'graft');
       assert.deepEqual(ctx.cli(['hook', 'list']), { hooks: [] });
       writeConfig(ctx, SHARED, {
-        setup: { event: 'post-add', argv: ['/usr/local/bin/setup', 'two words'] },
+        setup: { event: 'post-add', argv: [SETUP, 'two words'] },
         teardown: { event: 'pre-archive', argv: ['teardown'] },
         assets: { event: 'post-add', argv: ['assets'] },
         reopen: { event: 'post-restore', argv: ['reopen'] },
@@ -160,14 +163,14 @@ export const cases: Scenario[] = [
       writeConfig(ctx, LOCAL, {
         notify: { event: 'post-add', argv: ['notify'] },
         assets: null,
-        setup: { event: 'post-add', argv: ['/usr/local/bin/setup', '--small'] },
+        setup: { event: 'post-add', argv: [SETUP, '--small'] },
         'not-shared': null,
       });
       // A replaced hook keeps its place; a new local one runs after the shared
       // ones. Shared hooks are untrusted until `hook trust`; untracked local ones
       // are the person's own.
       assert.deepEqual(ctx.cli(['hook', 'list']), { hooks: [
-        { name: 'setup', event: 'post-add', argv: ['/usr/local/bin/setup', '--small'], file: LOCAL, trusted: true },
+        { name: 'setup', event: 'post-add', argv: [SETUP, '--small'], file: LOCAL, trusted: true },
         { name: 'teardown', event: 'pre-archive', argv: ['teardown'], file: SHARED, trusted: false },
         { name: 'reopen', event: 'post-restore', argv: ['reopen'], file: SHARED, trusted: false },
         { name: 'notify', event: 'post-add', argv: ['notify'], file: LOCAL, trusted: true },
