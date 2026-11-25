@@ -8,6 +8,42 @@ Ordinary Git commands operate on the graft's private repository. A branch or sta
 
 Use `lock` and `unlock` to protect an active graft from moves, removal and pruning. `move` changes its path on the same filesystem. After a manual rename, `repair` verifies its recorded identity before accepting the new path. `remove NAME` archives one graft. `prune` previews the expired grafts that can be archived and `prune --apply` archives them.
 
+## Configure a project
+
+Two JSON files at the root of the primary checkout configure Graft for a project. `.graftconfig` is the project's: commit it and every clone shares it. `.graftconfig.local` is yours: add it to `.gitignore`. Either may be missing, and a missing file sets nothing. Both may set:
+
+- `include`: the [untracked and ignored files](#copy-untracked-and-ignored-files) a new graft copies when the request names none.
+- `hooks`: the [commands](#hooks) Graft runs when a graft is added, about to be archived or restored, keyed by a name of up to 64 letters, digits, `-`, `_` or `.`.
+
+```json
+{
+  "include": [".env", "config/*.local.json"],
+  "hooks": {
+    "database": {"event": "post-add", "argv": ["/opt/project/bin/graft-setup"]},
+    "reopen": {"event": "post-restore", "argv": ["/opt/project/bin/graft-setup"]},
+    "teardown": {"event": "pre-archive", "argv": ["/opt/project/bin/graft-teardown"]}
+  }
+}
+```
+
+`.graftconfig.local` overrides `.graftconfig` setting by setting:
+
+```json
+{
+  "include": ["!config/*.local.json", "fixtures/large/"],
+  "hooks": {
+    "database": {"event": "post-add", "argv": ["/opt/project/bin/graft-setup", "--small"]},
+    "reopen": null,
+    "notify": {"event": "post-add", "argv": ["notify-send", "graft ready"]}
+  }
+}
+```
+
+- `include` lists are joined, the shared patterns first. A local `!pattern` removes the same pattern from the shared list. A `!pattern` that matches no shared pattern stays in the list as a `.gitignore` negation, which leaves out files that the patterns before it match. With the two files above, a graft copies `.env` and `fixtures/large/`.
+- A local hook with the name of a shared hook replaces it whole, program, arguments and event together, and keeps its place in the order. A local `null` turns the shared hook off. A new name adds a hook, which runs after the shared ones. With the two files above, `post-add` runs `graft-setup --small` and then `notify-send`, `post-restore` runs nothing, and `pre-archive` runs `graft-teardown`.
+
+Hooks for the same event run in the order they are written. `null` is only meaningful in `.graftconfig.local`; `.graftconfig` refuses it. Graft reads both files from the primary checkout's working tree every time it needs them, never from a graft: a graft's own copy of `.graftconfig`, edited or committed, changes nothing until it is merged into the primary. `git graft hook list` shows the hooks in effect, in the order they run, each with the file that defined it. A file that is not valid JSON, holds anything but a JSON object, has a key Graft does not know or a hook it would refuse, stops every command that reads it with `invalid_config`, naming the file.
+
 ## Copy untracked and ignored files
 
 A graft starts with only the files of its commit. Untracked and ignored files in the checkout, such as `.env`, local configuration or build output, stay behind unless the request names them:
@@ -19,9 +55,9 @@ git graft add api --include '*'      # every untracked and ignored file
 
 Over MCP, `graft_add` takes the same patterns as `include`, and `graft_local_files` (CLI `git graft local-files`) lists the checkout's untracked and ignored files and directories, so an agent can choose what its task needs. Patterns use `.gitignore` syntax and match only files Git does not track; a nested repository is skipped. `*` also brings build output and environments such as `target/` and `.venv/`, which can be large where files cannot be cloned, so name what the task needs where you can. To leave a directory out of `*`, exclude both the directory and its contents: `--include '*' --include '!target/' --include '!target/**'`.
 
-When a request names no patterns, a `.worktreeinclude` file at the root of the invoking checkout supplies them, in the same syntax, so a project can set a default once. Without one, nothing is copied. Patterns in a request replace the file's, and an empty MCP `include` list copies nothing.
+When a request names no patterns, the `include` lists of the project's [configuration](#configure-a-project) supply them, so a project can set a default once. Without any, nothing is copied. Patterns in a request replace the configured ones, and an empty MCP `include` list copies nothing. The patterns come from the primary checkout's files, and the files are copied from the checkout `add` runs in, which is a parent graft for a nested `add`. `local-files` reports the configured patterns as `defaults`, with `patterns` and the `files` that set them.
 
-Copies are clones on a filesystem that supports them, and full copies elsewhere. A copy never replaces a file of the checkout, nothing is copied into an attached dependency install, and a copy is never written through a symlink; such paths are listed in the receipt's `skipped` with a reason (`exists`, `blocked`, `tracked`, `attached_install` (one entry for the whole install), `nested_repository`, `vanished`, `unreadable`, `symlink` on Windows, or `special`). The `add` receipt records them as `storage.included`: `source` (`request` or `.worktreeinclude`), `patterns`, `files`, `bytes`, `skipped_count` and up to 50 `skipped` entries.
+Copies are clones on a filesystem that supports them, and full copies elsewhere. A copy never replaces a file of the checkout, nothing is copied into an attached dependency install, and a copy is never written through a symlink; such paths are listed in the receipt's `skipped` with a reason (`exists`, `blocked`, `tracked`, `attached_install` (one entry for the whole install), `nested_repository`, `vanished`, `unreadable`, `symlink` on Windows, or `special`). The `add` receipt records them as `storage.included`: `source` (`request`, or `config` with the `config_files` that set the patterns), `patterns`, `files`, `bytes`, `skipped_count` and up to 50 `skipped` entries.
 
 A copied file that is untracked in the graft is added to the graft's `.git/info/exclude`, so `merge --commit` never commits it; commit one deliberately with `git add -f`. `status`, `merge` and `remove` do not count a copy as a change while it is the file Graft installed. Once the graft edits, replaces or deletes it, it is listed as `ignored` again. Copies stay in the graft's archive, like every other file.
 
@@ -138,6 +174,78 @@ A turn lasts for its ttl, counted from the last time its holder took it: 1800 se
 The MCP tools `graft_turn_take`, `graft_turn_release` and `graft_turn_list` take the same arguments and give the same replies. They do not need the host's `--allow-exec` option: they run nothing and change only Graft's own state. Give `wait` a value shorter than the client's limit for one tool call. A call the client cancels stops asking, and gives up a turn it was granted after the cancellation unless it only renewed a turn the graft already held.
 
 Turn state is kept in `.git/graft/turns/`, one file for each resource. If a file there cannot be read, commands for that resource fail, name the file and leave it unchanged; move it aside to start that resource's queue again.
+
+## Hooks
+
+A hook is a command that Graft runs at a point in a graft's life, defined in the project's [configuration](#configure-a-project). Use one for setup and cleanup that belongs to the project and not to Git: creating a database for the graft and dropping it again, writing a settings file that names the graft's port, or deleting a secret before the graft is archived.
+
+```json
+{"hooks": {"database": {"event": "post-add", "argv": ["/opt/project/bin/graft-setup"]}}}
+```
+
+`argv` is the program and its arguments. An event can have any number of hooks, which run in the order the configuration gives; once one fails, the rest for that command are skipped. `git graft hook list` shows them. There is no command or MCP tool that defines a hook: edit the files. A hook in a committed `.graftconfig` runs for everyone who uses Graft in a clone of the repository; see [safety](safety.md).
+
+| Event | When the hook runs |
+| --- | --- |
+| `post-add` | After `add` has created the graft and recorded it active, before `add` replies. |
+| `pre-archive` | Before `remove`, `merge` or `prune --apply` archives a graft: after the lease is checked and before Graft looks for untracked or ignored files, which the hook may remove. A plain `remove` refuses a pending merge, a Git operation in progress, a change to a tracked file and unmerged work before the hook runs. `merge --undo` runs no hook. |
+| `post-restore` | After `restore` has reopened an archived graft, before it replies. |
+
+Graft starts the program directly, without a shell, with the graft as its working directory. It waits for the hook to exit, and for its standard output and standard error to close, and sets no time limit. A job the hook starts in the background must redirect both streams, for example `nohup server >server.log 2>&1 &`, or the command does not return until that job exits. Name the program by an absolute path outside the grafts, or by a bare name that is looked up in `PATH`. The configuration refuses a relative path with a directory in it, such as `./scripts/setup`: on Unix it would name the graft's own copy, so the graft's files would decide what runs, and on Windows it would name a program in the caller's directory instead. The hook gets the environment of the `git graft` command, or of the MCP host, without `GIT_GRAFT_LEASE` and without the variables that point Git at another repository, such as `GIT_DIR`. A hook never receives a lease. Graft adds these variables:
+
+| Variable | Value |
+| --- | --- |
+| `GIT_GRAFT_HOOK` | The event: `post-add`, `pre-archive` or `post-restore`. |
+| `GIT_GRAFT_HOOK_NAME` | The hook's name in the configuration. |
+| `GIT_GRAFT_NAME` | The graft's name. |
+| `GIT_GRAFT_PATH` | The graft's path, which is also the working directory. |
+| `GIT_GRAFT_PRIMARY` | The primary checkout's path. |
+| `GIT_GRAFT_BRANCH` | The branch the graft was created on. Empty for a graft created with `--detach`. |
+| `GIT_GRAFT_BASE` | The commit the graft was created from. Empty for a graft created with `--orphan`. |
+| `GIT_GRAFT_PORT` | The graft's port, the one `exec` passes as `PORT`. `restore` can assign a different one. |
+
+For example, a setup script configured for both `post-add` and `post-restore`, and a teardown script for `pre-archive`, as in the [configuration example](#configure-a-project):
+
+```sh
+#!/bin/sh
+# graft-setup: a database and a settings file for this graft.
+set -e
+createdb "app_$GIT_GRAFT_NAME"
+printf 'DATABASE=app_%s\nPORT=%s\n' "$GIT_GRAFT_NAME" "$GIT_GRAFT_PORT" > settings.local
+```
+
+```sh
+#!/bin/sh
+# graft-teardown: safe to run more than once.
+set -e
+dropdb --if-exists "app_$GIT_GRAFT_NAME"
+rm -f settings.local
+```
+
+If the project ignores `settings.local`, a plain `remove` would refuse the graft with `local_changes` because of that file. The teardown script deletes it first, so `remove` proceeds.
+
+A command that triggers hooks reports each in a `hooks` array, in the order they ran. With no hook configured for the event, the result has no `hooks` field.
+
+```json
+{"name": "database", "event": "post-add", "file": ".graftconfig", "status": "ok", "exit_code": 0, "stdout": "", "stderr": "", "stdout_truncated": false, "stderr_truncated": false}
+```
+
+`status` is `ok` for exit code 0, `failed` for any other exit, and `skipped` when the hook was not run, because the MCP host does not allow it or an earlier hook for the command failed. `stdout` and `stderr` are captured as for `exec` and cut at 256 KiB each. A `failed` entry whose hook could not be started, and every `skipped` entry, has a `reason`; `exit_code` is then `null`, as it is for a hook ended by a signal. `prune --apply` reports the hooks in the `hooks` array of that graft's entry.
+
+What a failure means depends on the event:
+
+- A failing `post-add` or `post-restore` hook does not fail the command, though the hooks after it are skipped. The graft exists, is active and keeps its lease; Graft never deletes it. Read the entry, then repair the setup by hand or archive the graft.
+- A failing `pre-archive` hook refuses `remove` and `merge` with `hook_failed`, and `details.hooks` carries every entry, the skipped ones too. Graft itself has changed nothing: the graft, its files and the primary are as the hook left them. `prune --apply` keeps that graft with the reason `hook_failed` and goes on with the others.
+
+A `pre-archive` hook must be safe to run more than once for the same graft. It can run before Graft knows whether the command will succeed. If `merge` then stops on a conflict, or `remove` on untracked files the hook left, the graft stays active with the hook's cleanup already done, and the hook runs again on the retry. A plain `remove` of a graft with unmerged commits or a changed tracked file refuses with `unmerged_work` or `local_changes` without running the hook, so the graft keeps its setup. `prune --apply` runs it for a graft it would archive and for one held back only by untracked or ignored files, which the hook may remove; a graft kept for a change to a tracked file, a Git operation in progress, its commits, refs or stash is left alone, hook unrun. A `prune` preview runs no hook, so it can report `dirty` for a graft whose hook would remove the files.
+
+A retried command that only repeats an earlier result runs no hook and has no `hooks` field: an `add` with the same `request_id` that returns the graft already created, a repeated `restore`, or a repeated `remove` or `merge` that returns its receipt. If `add` or `restore` is interrupted while its hook runs, the retry returns the graft without running the hook again, so run the setup by hand.
+
+While a hook runs, Graft holds that graft's lock and no project-wide lock. Other commands on the same graft report `workspace_busy`, and other grafts can be added, merged and removed meanwhile. A process that a hook leaves running is not tracked.
+
+Over MCP, hooks run on `graft_add`, `graft_remove`, `graft_merge` and `graft_restore` only when the host was started with `--allow-exec`. Without it they are not run, the entry has `"status": "skipped"`, and the command goes on, so `graft_remove` and `graft_merge` archive the graft without its `pre-archive` hook. The CLI always runs hooks.
+
+If the configuration cannot be read, `add`, `remove`, `merge` and `restore` refuse with `invalid_config` before changing anything, and `prune --apply` keeps each graft it would have archived, with the reason `error`.
 
 ## Merge and recover
 
@@ -269,9 +377,11 @@ These codes and fields tell you that Graft kept something instead of deleting or
 | `nothing_to_push` | `push` found a graft with no commits. | Commit in the graft, then push again. |
 | `default_branch` | `push` without `--to` would update the remote's default branch, because the graft's branch has its name. `details.remote` and `details.branch` name them. Nothing was pushed. | Push to another branch with `--to`, or name the default branch with `--to` if it is meant to be updated. |
 | `git_busy` | A Git lock or an unreadable index in the graft or primary is held by a command Graft did not start, or cannot prove has exited. | Wait for the Git command to finish. Remove a lock only once no Git command is running. |
-| `workspace_busy` | Another Graft command, or a process started by `exec` (including background jobs), holds the graft. | Wait, or stop the background job, then retry. |
+| `workspace_busy` | Another Graft command, a running hook, or a process started by `exec` (including background jobs), holds the graft. | Wait, or stop the background job, then retry. |
 | `"granted": false` (with `position`) | A `turn take` reply, not an error: another graft holds the turn on the resource or is ahead in its queue. | Leave the resource alone. Ask again within 300 seconds, or use `--wait`. See [take turns on a shared resource](#take-turns-on-a-shared-resource). |
 | `invalid_resource` | A `turn` command was given a resource name that is not 1 to 64 lowercase letters, numbers or hyphens starting with a letter or number. Nothing changed. | Use a name of that form. |
+| `invalid_config` | `.graftconfig` or `.graftconfig.local` is not valid JSON, is not a JSON object, has a key Graft does not know, or defines a hook or pattern Graft refuses. `details.file` names the file, and the message says what is wrong. Nothing was changed. | Fix the file and retry. See [configure a project](#configure-a-project). |
+| `hook_failed` | One of the project's `pre-archive` hooks exited with a non-zero code or could not be started, so `remove` or `merge` did not archive the graft. `details.hooks` carries the exit code and output of each hook, those skipped after it too. Graft changed nothing; the hook may have. As a prune `reason`, the same for one expired graft; prune went on with the others. | Fix what the hook reports, then retry. The hook runs again. See [hooks](#hooks). |
 | `kept` | A `gc --purge-cache` field listing saved layers (`saved_layer`) and the registered shared layer (`registered_shared_layer`) it did not delete. | Retire them with `deps layer remove` when no longer needed. |
 | `retained`, `retained_path` | `deps layer remove` moved the layer to `.git/graft/retained-layers/` instead of deleting it. | Delete `retained_path` yourself once you no longer need the install. |
 | prune `reason` `error`, `archive_occupied`, `busy` | Prune could not check or archive this graft (`error` carries the message), found its archive path occupied, or found it busy. It went on with the others. | Fix the named problem, then rerun `prune`. |

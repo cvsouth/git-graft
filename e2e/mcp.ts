@@ -489,7 +489,7 @@ export const cases: Scenario[] = [
         { path: '.env', status: 'untracked', kind: 'file' },
         { path: 'ignored/', status: 'ignored', kind: 'directory' },
       ]);
-      assert.equal(local.setup_file_present, false);
+      assert.deepEqual(local.defaults, { patterns: [], files: [] });
       ctx.coverTool('graft_local_files');
 
       // Nothing is copied unless the agent asks.

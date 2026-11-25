@@ -98,7 +98,7 @@ A graft starts with only the files Git tracks. To bring untracked or ignored fil
 git graft add fix-parser --include .env --include 'config/*.local.json'
 ```
 
-`--include '*'` brings every one of them, and `git graft local-files` lists what's there. Agents make this choice themselves through the MCP server. For a default, list patterns in a `.worktreeinclude` file at the root of your checkout; `--include` replaces it. Copies are clones where the filesystem supports it, never replace a tracked file, and don't count as changes in `merge` or `remove` until you edit them.
+`--include '*'` brings every one of them, and `git graft local-files` lists what's there. Agents make this choice themselves through the MCP server. For a default, list patterns under `include` in a `.graftconfig` file at the root of your checkout, or in `.graftconfig.local` for your own; `--include` replaces them. The same files define [hooks](docs/operations.md#hooks) that run your project's setup and cleanup when a graft is added, archived or restored. Copies are clones where the filesystem supports it, never replace a tracked file, and don't count as changes in `merge` or `remove` until you edit them.
 
 ## Using it with coding agents
 
