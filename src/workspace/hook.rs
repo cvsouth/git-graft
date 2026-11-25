@@ -11,7 +11,12 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fs::File, path::Path, process::Command};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    path::{Component, Path},
+    process::Command,
+};
 
 const REGISTRY_FILE: &str = "hooks-v1.json";
 const MAX_BYTES: usize = 1024 * 1024;
@@ -67,11 +72,28 @@ fn validate(argv: &[String]) -> Result<()> {
     );
     ensure!(!argv[0].is_empty(), "the hook program must not be empty");
     ensure!(
+        is_bare_name(&argv[0]) || Path::new(&argv[0]).is_absolute(),
+        "the hook program {:?} is a relative path; give an absolute path, or a bare name to look up in PATH. \
+         A relative path would name a program inside the graft on Unix and one in the caller's directory on Windows",
+        argv[0]
+    );
+    ensure!(
         argv.iter()
             .all(|arg| arg.len() <= MAX_ARGUMENT_BYTES && !arg.contains('\0')),
         "each hook argument must be at most {MAX_ARGUMENT_BYTES} bytes and contain no NUL character"
     );
     Ok(())
+}
+
+/// Whether `program` is a bare name, which the system looks up in `PATH`,
+/// rather than a path: one plain component with no separator, `/` on every
+/// platform and `\\` on Windows, and on Windows no drive such as `C:`.
+fn is_bare_name(program: &str) -> bool {
+    let separated = program.contains('/') || cfg!(windows) && program.contains('\\');
+    let mut components = Path::new(program).components();
+    !separated
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
 }
 
 impl Hooks {
@@ -441,8 +463,14 @@ mod tests {
         let argv = |parts: &[&str]| -> Vec<String> {
             parts.iter().map(|part| (*part).to_owned()).collect()
         };
+        let absolute = if cfg!(windows) {
+            r"C:\Program Files\prepare.exe"
+        } else {
+            "/usr/local/bin/prepare"
+        };
         for accepted in [
-            argv(&["/usr/local/bin/prepare"]),
+            argv(&[absolute]),
+            argv(&[absolute, "./relative/argument"]),
             argv(&[
                 "node",
                 "script with spaces.js",
@@ -463,6 +491,32 @@ mod tests {
             vec!["x".to_owned(); MAX_ARGUMENTS + 1],
         ] {
             assert!(validate(&refused).is_err(), "{refused:?}");
+        }
+        // A program with a directory in it must be absolute: Unix would run
+        // the graft's copy and Windows the one in the caller's directory.
+        let mut relative = vec![
+            "./scripts/setup",
+            "scripts/setup",
+            "../bin/setup",
+            "bin/",
+            ".",
+            "..",
+        ];
+        if cfg!(windows) {
+            relative.extend([
+                r"scripts\setup",
+                r".\setup.exe",
+                r"\bin\setup.exe",
+                "C:setup.exe",
+            ]);
+        }
+        for program in relative {
+            let error = validate(&argv(&[program])).expect_err(program);
+            assert!(format!("{error}").contains("relative path"), "{error}");
+        }
+        // Outside Windows a backslash is part of a file name, not a separator.
+        if !cfg!(windows) {
+            assert!(validate(&argv(&[r"odd\name"])).is_ok());
         }
     }
 

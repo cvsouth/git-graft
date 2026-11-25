@@ -45,9 +45,11 @@ Examples:
 
 A hook is started without a shell, in the graft, and is told about the graft
 through GIT_GRAFT_HOOK, GIT_GRAFT_NAME, GIT_GRAFT_PATH, GIT_GRAFT_PRIMARY,
-GIT_GRAFT_BRANCH, GIT_GRAFT_BASE and GIT_GRAFT_PORT. A pre-archive hook that
-fails stops remove, merge and prune from archiving the graft, and can run more
-than once for the same graft.")]
+GIT_GRAFT_BRANCH, GIT_GRAFT_BASE and GIT_GRAFT_PORT. Its program is an absolute
+path or a bare name looked up in PATH. Graft waits until the hook's output
+closes, so a job it starts in the background must redirect stdout and stderr.
+A pre-archive hook that fails stops remove, merge and prune from archiving the
+graft, and can run more than once for the same graft.")]
     Hook(HookArgs),
     /// Merge a graft's commits into a local branch, then archive the graft.
     #[command(after_help = "\

@@ -544,6 +544,23 @@ fn clean(path: &Path, allow_ignored: bool, retiring: Retiring, storage: &Value) 
     ))
 }
 
+/// Refuse a graft with a Git operation in progress or a change to a tracked
+/// file, naming every local change as `clean` does. Neither is a
+/// `pre-archive` hook's to undo, so `remove` checks them before the hook
+/// runs, and the hook's cleanup is not spent on a graft that would be refused
+/// anyway. A graft with only untracked or ignored files is left to `clean`.
+fn clean_tracked(path: &Path, retiring: Retiring, storage: &Value) -> Result<()> {
+    git::check_idle(path)?;
+    let tracked = git::changes(path)?
+        .iter()
+        .any(|change| change.status != "??" && change.status != "!!");
+    if tracked {
+        clean(path, false, retiring, storage)
+    } else {
+        Ok(())
+    }
+}
+
 /// What an archive did. A merge receipt says every commit of the graft was
 /// merged. When `remove --discard` archived commits made after an earlier
 /// merge had landed, the action is `remove`: the receipt still names the
@@ -705,6 +722,9 @@ fn keep_advanced(p: &Project, mut r: Record) -> Result<Value> {
     with_attempts(p, &r, value)
 }
 
+const PENDING_MERGE: &str =
+    "a merge is pending; retry merge or explicitly archive the complete repository with --discard";
+
 fn drop_workspace(
     p: &Project,
     opts: &api::DropWorkspace,
@@ -729,13 +749,17 @@ fn drop_workspace(
         registry::preflight_retire(p, &r)?;
         // A graft whose creation never finished has no hook to undo.
         if r.status == Status::Active && !r.placing() {
+            if !opts.discard {
+                // Refuse what the hook cannot clear before it runs, so a
+                // plain remove of a graft that holds work keeps its setup.
+                ensure!(r.plan.is_none(), PENDING_MERGE);
+                clean_tracked(&r.path, Retiring::Remove, &r.storage)?;
+                registry::require_merged(&r, &p.repo)?;
+            }
             hooks.pre_archive(p, &mut r)?;
         }
         if let Some(plan) = &r.plan {
-            ensure!(
-                opts.discard,
-                "a merge is pending; retry merge or explicitly archive the complete repository with --discard"
-            );
+            ensure!(opts.discard, PENDING_MERGE);
             // A disconnected land can leave a plan behind while someone
             // continues editing the private checkout. Preserve those edits
             // and the undo receipt if the destination already contains it.

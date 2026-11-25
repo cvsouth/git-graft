@@ -2375,6 +2375,17 @@ fn prune_eligibility(r: &Record, detached: Option<usize>) -> Result<Option<&'sta
     Ok(None)
 }
 
+/// Whether the only thing keeping an expired graft from being archived could
+/// be the `pre-archive` hook's to remove: untracked or ignored files, with no
+/// operation in progress, no change to a tracked file and no unmerged ref.
+fn hook_may_clear(r: &Record) -> Result<bool> {
+    Ok(git::check_idle(&r.path).is_ok()
+        && git::changes(&r.path)?
+            .iter()
+            .all(|change| change.status == "??" || change.status == "!!")
+        && unmerged_refs(r)?.is_empty())
+}
+
 /// Every way the graft's refs differ from how it was created: commits on its
 /// branch or a moved HEAD, other branches, tags, a stash or any other ref.
 /// Each is work that a merge never took, described for the person. New
@@ -2608,11 +2619,13 @@ fn prune_one(
                 } else {
                     let mut reason = eligibility(r, endpoint?);
                     // The hook runs for a graft prune would archive, and for
-                    // one kept back only by uncommitted or ignored files,
-                    // which may be the hook's own to remove. A graft kept for
-                    // its commits, refs or stash is left as it is, hook unrun.
+                    // one kept back only by untracked or ignored files, which
+                    // may be the hook's own to remove. A graft kept for
+                    // changes to tracked files, an operation in progress, its
+                    // commits, refs or stash is left as it is, hook unrun.
                     if apply
-                        && matches!(reason, None | Some("dirty"))
+                        && (reason.is_none()
+                            || reason == Some("dirty") && hook_may_clear(r).unwrap_or(false))
                         && let Some(entry) = pre_archive(r)?
                     {
                         let failed = entry["status"] == "failed";
@@ -3488,6 +3501,64 @@ mod tests {
         });
         assert!(stopped.is_err_and(|error| error.is::<super::super::hook::Unlocked>()));
         assert_eq!(load(p, &again.name)?.status, Status::Active);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_runs_no_pre_archive_hook_for_tracked_changes_or_commits() -> Result<()> {
+        let f = Fixture::new()?;
+        let p = &f.project;
+        let mixed = f.expired_at_base("mixed")?;
+        let edited = f.expired_at_base("edited")?;
+        let staged = f.expired_at_base("staged")?;
+        let busy = f.expired_at_base("busy")?;
+        let littered = f.expired_at_base("littered")?;
+        git::bytes(
+            &mixed.path,
+            &["commit", "-q", "--allow-empty", "-m", "work"],
+        )?;
+        for r in [&mixed, &edited, &staged] {
+            fs::write(r.path.join("tracked"), "edited\n")?;
+        }
+        git::bytes(&staged.path, &["add", "tracked"])?;
+        // An operation in progress is not the hook's to finish either.
+        fs::write(
+            busy.path.join(".git/MERGE_HEAD"),
+            git::oid(&busy.path, "HEAD")? + "\n",
+        )?;
+        fs::write(busy.path.join("made-by-setup"), "remove me")?;
+        fs::write(littered.path.join("made-by-setup"), "remove me")?;
+        let before: Vec<_> = [&mixed, &edited, &staged, &busy]
+            .iter()
+            .map(|r| work_in(&r.path))
+            .collect::<Result<_>>()?;
+        let mut called = Vec::new();
+        let mut hook = |r: &Record| -> Result<Option<Value>> {
+            called.push(r.name.clone());
+            let _ = fs::remove_file(r.path.join("made-by-setup"));
+            Ok(Some(json!({"event": "pre-archive", "status": "ok"})))
+        };
+        let mut reasons: Vec<_> = prune_with(p, true, &mut hook)?
+            .into_iter()
+            .map(|e| (e.name, e.reason.unwrap_or_default(), e.hooks.len()))
+            .collect();
+        reasons.sort();
+        let own = |name: &str, reason: &'static str, hooks: usize| (name.to_owned(), reason, hooks);
+        assert_eq!(
+            reasons,
+            [
+                own("busy", "dirty", 0),
+                own("edited", "dirty", 0),
+                own("littered", "archived", 1),
+                own("mixed", "dirty", 0),
+                own("staged", "dirty", 0),
+            ]
+        );
+        assert_eq!(called, ["littered"]);
+        for (r, before) in [&mixed, &edited, &staged, &busy].iter().zip(before) {
+            assert_eq!(work_in(&r.path)?, before, "{}", r.name);
+            assert_eq!(load(p, &r.name)?.status, Status::Active);
+        }
         Ok(())
     }
 

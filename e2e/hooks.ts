@@ -136,6 +136,10 @@ export const cases: Scenario[] = [
         assert.notEqual(refused.status, 0, args.join(' '));
       }
       assert.match(String(ctx.fail(['hook', 'set', 'post-add', '--', '']).message), /program must not be empty/);
+      // A program with a directory in it must be absolute.
+      for (const program of ['./scripts/setup', 'scripts/setup', '../setup']) {
+        assert.match(String(ctx.fail(['hook', 'set', 'post-add', '--', program]).message), /is a relative path/, program);
+      }
       assert.deepEqual(ctx.cli(['hook', 'list']), { hooks: [] });
 
       const first = ctx.cli(['hook', 'set', 'post-restore', '--', 'first program', '--flag', 'two words']);
@@ -307,22 +311,47 @@ export const cases: Scenario[] = [
       assert(!('hooks' in ctx.cli(['merge', 'merged', '--lease', merged.lease])));
       assert.equal(runs(log).length, 2);
 
-      // A command that refuses for another reason has run the hook, and runs it again on the retry.
+      // A plain remove refuses unmerged commits, a change to a tracked file
+      // or a pending operation before the hook runs, so the setup stays.
       const unmerged = ctx.spawn('unmerged');
       writeFileSync(join(unmerged.path, 'later.txt'), 'later\n');
       commit(ctx, unmerged.path, 'later');
+      const unmergedWork = work(ctx, unmerged.path);
       assert.equal(ctx.fail(['remove', 'unmerged', '--lease', unmerged.lease]).code, 'unmerged_work');
-      assert(!existsSync(join(unmerged.path, 'ignored')));
-      assert.equal(runs(log).length, 3);
+      writeFileSync(join(unmerged.path, 'tracked.txt'), 'edited\n');
+      assert.equal(ctx.fail(['remove', 'unmerged', '--lease', unmerged.lease]).code, 'local_changes');
+      ctx.git(['checkout', '--', 'tracked.txt'], unmerged.path);
+      assert.equal(work(ctx, unmerged.path), unmergedWork);
+      assert(existsSync(join(unmerged.path, 'ignored', 'prepared.txt')));
+      const edited = ctx.spawn('edited');
+      writeFileSync(join(edited.path, 'tracked.txt'), 'edited\n');
+      ctx.git(['add', 'tracked.txt'], edited.path);
+      const refusal = ctx.fail(['remove', 'edited', '--lease', edited.lease]);
+      assert.equal(refusal.code, 'local_changes');
+      // The refusal names every local change, the setup's ignored file too.
+      assert.deepEqual(objectResult(refusal.details).paths,
+        [{ path: 'tracked.txt', status: 'modified' }, { path: 'ignored/', status: 'ignored' }]);
+      assert(existsSync(join(edited.path, 'ignored', 'prepared.txt')));
+      assert.equal(runs(log).length, 2);
+      // --discard archives the work, so the hook runs for it.
       const discarded = ctx.cli(['remove', 'unmerged', '--lease', unmerged.lease, '--discard']);
       assert.deepEqual(entries(discarded), [ran('pre-archive', 'clean unmerged')]);
+      assert.equal(runs(log).length, 3);
+      // A command that refuses after the hook ran runs it again on the retry.
+      ctx.git(['reset', '-q', '--hard'], edited.path);
+      writeFileSync(join(edited.path, 'notes.txt'), 'notes\n');
+      assert.equal(ctx.fail(['remove', 'edited', '--lease', edited.lease]).code, 'local_changes');
+      assert(!existsSync(join(edited.path, 'ignored')));
       assert.equal(runs(log).length, 4);
+      rmSync(join(edited.path, 'notes.txt'));
+      assert.deepEqual(entries(ctx.cli(['remove', 'edited', '--lease', edited.lease])), [ran('pre-archive', 'clean edited')]);
+      assert.equal(runs(log).length, 5);
 
       // A locked graft is refused before its hook runs.
       const locked = ctx.spawn('locked', ['--lock']);
       assert.equal(ctx.fail(['remove', 'locked', '--lease', locked.lease, '--discard']).code, 'workspace_locked');
       assert.equal(ctx.fail(['merge', 'locked', '--lease', locked.lease]).code, 'workspace_locked');
-      assert.equal(runs(log).length, 4);
+      assert.equal(runs(log).length, 5);
       assert(existsSync(join(locked.path, 'ignored', 'prepared.txt')));
     },
   },
@@ -346,8 +375,11 @@ export const cases: Scenario[] = [
         assert.equal(status.phase, 'ready');
         assert.equal(status.path, graft.path);
       };
+      // A plain remove refuses the unmerged commit before the hook runs.
+      assert.equal(ctx.fail(['remove', 'guarded', '--lease', graft.lease]).code, 'unmerged_work');
+      assert.equal(runs(log).length, 0);
+      unchanged();
       const commands = [
-        ['remove', 'guarded', '--lease', graft.lease],
         ['remove', 'guarded', '--lease', graft.lease, '--discard'],
         ['merge', 'guarded', '--lease', graft.lease],
         ['merge', 'guarded', '--lease', graft.lease, '--commit', 'Add notes', '--squash'],
@@ -387,34 +419,47 @@ export const cases: Scenario[] = [
       const second = ctx.spawn('second');
       const refused = ctx.spawn('refused');
       const worked = ctx.spawn('worked');
+      const mixed = ctx.spawn('mixed');
+      const edited = ctx.spawn('edited');
       ctx.cli(['hook', 'remove', 'post-add']);
       const clean = ctx.spawn('clean');
       const live = ctx.spawn('live');
       rmSync(join(worked.path, 'ignored'), { recursive: true });
       writeFileSync(join(worked.path, 'feature.txt'), 'unmerged\n');
       commit(ctx, worked.path, 'unmerged work');
+      // Commits with an uncommitted edit, and an edit alone: both report
+      // dirty, and neither is the hook's to clear.
+      writeFileSync(join(mixed.path, 'feature.txt'), 'unmerged\n');
+      commit(ctx, mixed.path, 'unmerged work');
+      for (const graft of [mixed, edited]) writeFileSync(join(graft.path, 'tracked.txt'), 'edited\n');
       const log = register(ctx, 'pre-archive', 'clean');
-      for (const graft of [prepared, second, refused, worked, clean]) expire(ctx, graft.result.id);
+      for (const graft of [prepared, second, refused, worked, clean, mixed, edited]) expire(ctx, graft.result.id);
       const keptWork = work(ctx, refused.path);
+      const editedWork = [mixed, edited].map((graft) => work(ctx, graft.path));
 
       // A preview runs no hook, so it still reports what the hook would remove.
       const preview = retained(ctx.cli(['prune']));
       assert.deepEqual(Object.fromEntries([...preview].map(([name, item]) => [name, item.reason])),
-        { prepared: 'dirty', second: 'dirty', refused: 'dirty', worked: 'changed', clean: 'eligible' });
+        { prepared: 'dirty', second: 'dirty', refused: 'dirty', worked: 'changed', clean: 'eligible', mixed: 'dirty',
+          edited: 'dirty' });
       assert.equal(runs(log).length, 0);
       assert([...preview.values()].every((item) => !('hooks' in item)));
 
       const result = ctx.cli(['prune', '--apply']);
       const applied = retained(result);
       assert.deepEqual(Object.fromEntries([...applied].map(([name, item]) => [name, item.reason])),
-        { prepared: 'archived', second: 'archived', refused: 'hook_failed', worked: 'changed', clean: 'archived' });
+        { prepared: 'archived', second: 'archived', refused: 'hook_failed', worked: 'changed', clean: 'archived',
+          mixed: 'dirty', edited: 'dirty' });
       assert.deepEqual(entries(applied.get('prepared')!), [ran('pre-archive', 'clean prepared')]);
       assert.deepEqual(entries(applied.get('clean')!), [ran('pre-archive', 'clean clean')]);
       assert.deepEqual(entries(applied.get('refused')!), [failed('pre-archive')]);
-      // A graft kept for its unmerged commits is left alone, hook unrun.
-      assert(!('hooks' in applied.get('worked')!));
+      // A graft kept for its unmerged commits or a tracked change is left
+      // alone, hook unrun, with the file its setup made still there.
+      for (const name of ['worked', 'mixed', 'edited']) assert(!('hooks' in applied.get(name)!), name);
+      assert.deepEqual([mixed, edited].map((graft) => work(ctx, graft.path)), editedWork);
+      for (const graft of [mixed, edited]) assert(existsSync(join(graft.path, 'ignored', 'prepared.txt')));
       assert.deepEqual(runs(log).map((item) => item.env.GIT_GRAFT_NAME).sort(), ['clean', 'prepared', 'refused', 'second']);
-      for (const graft of [prepared, second, refused, worked, clean]) {
+      for (const graft of [prepared, second, refused, worked, clean, mixed, edited]) {
         assert(!JSON.stringify(result).includes(graft.lease), 'prune disclosed a lease');
       }
       for (const graft of [prepared, second, clean]) assert(!existsSync(graft.path));
