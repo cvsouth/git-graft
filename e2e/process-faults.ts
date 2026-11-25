@@ -434,7 +434,7 @@ const backgroundBody = [
  * detached from every output pipe. Windows has no such shell, so Node starts
  * a detached process instead.
  */
-function background(ctx: Context, started: string, release: string): string[] {
+export function background(ctx: Context, started: string, release: string): string[] {
   const script = join(ctx.root, 'background.js');
   writeFileSync(script, backgroundBody);
   if (process.platform !== 'win32') {

@@ -3,8 +3,12 @@ mod land;
 mod objects;
 mod push;
 mod registry;
+mod turns;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -57,6 +61,9 @@ pub enum Command {
         path: PathBuf,
     },
     Gc(api::Gc),
+    TurnTake(api::TurnTake),
+    TurnRelease(api::TurnRelease),
+    TurnList,
 }
 
 impl Command {
@@ -807,18 +814,65 @@ fn invoking(p: &Project, location: Option<registry::Location>, repo: &Path) -> R
     Ok(parent.path)
 }
 
+/// How long a waiting `turn take` pauses before it asks again.
+const TURN_POLL: Duration = Duration::from_secs(1);
+
+/// After a `turn take` replied `reply`, how long to pause before asking
+/// again, or `None` when the turn was granted or the wait ended at `deadline`.
+pub(crate) fn turn_pause(reply: &Value, deadline: Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    (reply["granted"] == false && !left.is_zero()).then(|| left.min(TURN_POLL))
+}
+
+/// `turn take --wait`: ask until the turn is granted or the wait runs out.
+/// The Git version and the project are found once. Each ask then opens the
+/// project as a whole command does: between asks this process holds no
+/// project, graft or build lock, and the next ask finds a graft archived
+/// meanwhile, or a replaced lease, as any other command would.
+fn wait_for_turn(repo: &Path, mut args: api::TurnTake) -> Result<Value> {
+    args.check()?;
+    let deadline = Instant::now() + Duration::from_secs(args.wait);
+    args.wait = 0;
+    let found = find(repo, &Command::TurnTake(args.clone()))?;
+    loop {
+        let reply = run_found(repo, found.clone(), Command::TurnTake(args.clone()))?;
+        match turn_pause(&reply, deadline) {
+            Some(pause) => std::thread::sleep(pause),
+            None => return Ok(reply),
+        }
+    }
+}
+
 pub fn run(repo: &Path, command: Command) -> Result<Value> {
-    // Resolving the project is read-only, so it runs beside the version check;
-    // a version failure is still reported first.
+    match command {
+        Command::TurnTake(args) if args.wait > 0 => wait_for_turn(repo, args),
+        command => run_once(repo, command),
+    }
+}
+
+/// What every command finds first: the Git version, and where the project
+/// and the invoking graft are.
+#[derive(Clone)]
+pub(crate) struct Found {
+    version: String,
+    supported: bool,
+    location: Option<registry::Location>,
+    paths: crate::registry::Paths,
+}
+
+/// Find what `command` needs before it opens the project. Refuses a Git older
+/// than Graft supports, except to `doctor`, which reports it. A version
+/// failure is reported before a failure to find the project.
+pub(crate) fn find(repo: &Path, command: &Command) -> Result<Found> {
+    // Resolving the project is read-only, so it runs beside the version check.
     let (version, located) = std::thread::scope(|scope| {
         let version = scope.spawn(|| git::text(repo, &["--version"]));
-        let located = registry::discover(repo).map(|location| {
+        let located = registry::discover(repo).and_then(|location| {
             let primary = location
                 .as_ref()
                 .map_or(repo, |where_| where_.project.as_path())
                 .to_path_buf();
-            let paths = Project::paths(&primary);
-            (location, primary, paths)
+            Ok((location, Project::paths(&primary)?))
         });
         (joined(version), located)
     });
@@ -835,17 +889,46 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             Value::Null,
         ));
     }
-    let (location, _, paths) = located?;
+    let (location, paths) = located?;
+    Ok(Found {
+        version,
+        supported,
+        location,
+        paths,
+    })
+}
+
+fn run_once(repo: &Path, command: Command) -> Result<Value> {
+    let found = find(repo, &command)?;
+    run_found(repo, found, command)
+}
+
+/// Run `command` with what [`find`] found for it.
+pub(crate) fn run_found(repo: &Path, found: Found, command: Command) -> Result<Value> {
+    let Found {
+        version,
+        supported,
+        location,
+        paths,
+    } = found;
     if matches!(command, Command::ListManagers) {
-        return match Project::open_existing_at(paths?)? {
+        return match Project::open_existing_at(paths)? {
             Some((project, _lock)) => crate::package_manager::list(&project),
             None => Ok(json!({"managers": []})),
         };
     }
-    let (p, lock) = Project::open_at(paths?, !matches!(&command, Command::Spawn(_)))?;
+    // Listing turns likewise creates no state in a project that has none.
+    if matches!(command, Command::TurnList) {
+        return match Project::open_existing_at(paths)? {
+            Some((project, _lock)) => turns::list(&project),
+            None => Ok(json!({"turns": []})),
+        };
+    }
+    let (p, lock) = Project::open_at(paths, !matches!(&command, Command::Spawn(_)))?;
     let p = &p;
-    // Commands that only read, or change one graft's record, run beside
-    // builds. Adds share the build lock; every other command excludes builds.
+    // Commands that only read, or change one graft's record or a turn, run
+    // beside builds. Adds share the build lock; every other command excludes
+    // builds.
     let builds = match &command {
         Command::Doctor
         | Command::List
@@ -855,7 +938,9 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
         | Command::Env(_)
         | Command::Heartbeat(_)
         | Command::Lock { .. }
-        | Command::Unlock(_) => None,
+        | Command::Unlock(_)
+        | Command::TurnTake(_)
+        | Command::TurnRelease(_) => None,
         Command::Gc(args) if !args.apply => None,
         Command::Spawn(_) => Some(p.lock_builds(true)?),
         _ => Some(p.lock_builds(false)?),
@@ -890,6 +975,7 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
             return Ok(listed);
         }
         Command::ListManagers => return crate::package_manager::list(p),
+        Command::TurnList => unreachable!("turn list returns before the project opens"),
         Command::UnregisterManager(a) => return crate::package_manager::unregister(p, &a.manager),
         Command::RegisterManager(a) => match (&a.workspace, &a.lease) {
             (Some(name), Some(lease)) => {
@@ -966,6 +1052,15 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
         Command::AddDep(a) => (&a.name, &a.lease),
         Command::Heartbeat(a) => (&a.name, &a.lease),
         Command::Layer(_, a) => (&a.name, &a.lease),
+        Command::TurnTake(a) => {
+            turns::validate_resource(&a.resource)?;
+            a.check()?;
+            (&a.name, &a.lease)
+        }
+        Command::TurnRelease(a) => {
+            turns::validate_resource(&a.resource)?;
+            (&a.name, &a.lease)
+        }
         Command::Push(a) => (&a.name, &a.lease),
     };
     let mut r = registry::authenticate(p, name, lease)?;
@@ -975,9 +1070,13 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
     );
     // Exec shares the graft lock with the process it starts, so a process
     // left running in the background still blocks merge, remove and prune.
-    // Heartbeats share it too, so an agent can renew its lease meanwhile.
+    // Heartbeats and turns share it too, so an agent can renew its lease and
+    // take or give up a turn meanwhile, such as the turn its server runs under.
     let (_workspace_lock, exec_lock) = match command {
-        Command::Exec(_) | Command::Heartbeat(_) => (None, Some(registry::exec_lock(p, name)?)),
+        Command::Exec(_)
+        | Command::Heartbeat(_)
+        | Command::TurnTake(_)
+        | Command::TurnRelease(_) => (None, Some(registry::exec_lock(p, name)?)),
         _ => (Some(registry::workspace_lock(p, name)?), None),
     };
     registry::verify(p, &r)?;
@@ -988,6 +1087,8 @@ pub fn run(repo: &Path, command: Command) -> Result<Value> {
     }
     match command {
         Command::Heartbeat(_) => Ok(summary(&r)),
+        Command::TurnTake(a) => turns::take(p, &r, &a),
+        Command::TurnRelease(a) => turns::release(p, &r, &a.resource),
         Command::Layer(action, a) => layer::run(&r.path, &p.state, action, &a.key, a.copy),
         Command::Exec(a) => {
             ensure!(!a.argv.is_empty(), "program and arguments are required");

@@ -362,6 +362,73 @@ pub struct DropWorkspace {
     pub discard: bool,
 }
 
+/// Longest `turn take` wait, in seconds.
+pub const TURN_WAIT_MAX: u64 = 60 * 60;
+/// How long a new turn lasts unless its `ttl` says otherwise, in seconds.
+pub const TURN_TTL_DEFAULT: u64 = 30 * 60;
+/// Longest turn `ttl`, in seconds.
+pub const TURN_TTL_MAX: u64 = 24 * 60 * 60;
+
+/// Arguments of `turn take` and the MCP `graft_turn_take` tool.
+#[derive(Debug, Clone, Args, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TurnTake {
+    /// Name of the graft.
+    pub name: String,
+    /// Shared resource, a name the project chooses, such as web or database: 1 to 64 lowercase letters, numbers or hyphens.
+    pub resource: String,
+    /// Lease returned when the graft was created.
+    #[arg(long, env = "GIT_GRAFT_LEASE", hide_env_values = true)]
+    pub lease: String,
+    /// Keep asking for up to this many seconds, at most 3600, until the turn is granted. The default asks once.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u64).range(..=TURN_WAIT_MAX)
+    )]
+    #[serde(default)]
+    #[schemars(range(max = TURN_WAIT_MAX))]
+    pub wait: u64,
+    /// Seconds the turn lasts unless it is taken again, from 1 to 86400. A new turn defaults to 1800; a renewal keeps the turn's current value.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..=TURN_TTL_MAX)
+    )]
+    #[schemars(range(min = 1, max = TURN_TTL_MAX))]
+    pub ttl: Option<u64>,
+}
+
+impl TurnTake {
+    /// Reject a `wait` or `ttl` outside its range. The CLI enforces the
+    /// ranges through clap; JSON callers need the same check.
+    pub(crate) fn check(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.wait <= TURN_WAIT_MAX,
+            "wait must be at most {TURN_WAIT_MAX} seconds"
+        );
+        anyhow::ensure!(
+            self.ttl.is_none_or(|ttl| (1..=TURN_TTL_MAX).contains(&ttl)),
+            "ttl must be from 1 to {TURN_TTL_MAX} seconds"
+        );
+        Ok(())
+    }
+}
+
+/// Arguments of `turn release` and the MCP `graft_turn_release` tool.
+#[derive(Debug, Args, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TurnRelease {
+    /// Name of the graft.
+    pub name: String,
+    /// Shared resource whose turn to give up, or whose queue to leave.
+    pub resource: String,
+    /// Lease returned when the graft was created.
+    #[arg(long, env = "GIT_GRAFT_LEASE", hide_env_values = true)]
+    pub lease: String,
+}
+
 /// Arguments of `push` and the MCP `graft_push` tool: publish a graft's
 /// commits to a remote of the primary repository.
 #[derive(Debug, Args, Deserialize, Serialize, JsonSchema)]

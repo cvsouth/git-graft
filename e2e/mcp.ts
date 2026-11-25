@@ -21,11 +21,11 @@ const maxRequestBytes = 256 * 1024;
 const executionTools = ['graft_exec', 'graft_add_dependency'];
 const publishingTools = ['graft_push'];
 const defaultTools = ['graft_list', 'graft_local_files', 'graft_add', 'graft_status', 'graft_renew', 'graft_merge', 'graft_remove',
-  'graft_restore'];
+  'graft_restore', 'graft_turn_take', 'graft_turn_release', 'graft_turn_list'];
 const spawnOptions = ['base', 'branch', 'detach', 'history', 'include', 'lock', 'name', 'no_checkout', 'no_deps', 'orphan',
   'reason', 'request_id', 'sparse'];
 const leaseTools = new Set(['graft_add_dependency', 'graft_remove', 'graft_exec', 'graft_renew', 'graft_merge',
-  'graft_push', 'graft_restore']);
+  'graft_push', 'graft_restore', 'graft_turn_take', 'graft_turn_release']);
 
 function isObject(value: unknown): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -245,7 +245,7 @@ export async function call(client: McpClient, name: string, args: JsonObject = {
   return structured;
 }
 
-async function invalidCall(client: McpClient, name: string, args: JsonObject): Promise<void> {
+export async function invalidCall(client: McpClient, name: string, args: JsonObject): Promise<void> {
   const reply = await client.request('tools/call', { name, arguments: args });
   const error = object(reply.error, `${name} JSON-RPC error`);
   assert.equal(error.code, -32602);

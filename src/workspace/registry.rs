@@ -1361,6 +1361,7 @@ fn verify_git_location(path: &Path, detached: Option<usize>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct Location {
     pub project: PathBuf,
     pub name: String,
@@ -2294,6 +2295,18 @@ pub fn has_live(p: &Project) -> Result<bool> {
             .records
             .iter()
             .any(|r| !r.status.retired() || r.transition.is_some()))
+}
+
+/// The IDs of the grafts that are not archived. A damaged record counts, as
+/// in [`has_live`]: its graft may still be active.
+pub fn live_ids(p: &Project) -> Result<HashSet<String>> {
+    let registry = scan(p)?;
+    let live = registry.records.iter().filter(|r| !r.status.retired());
+    let damaged = registry
+        .damaged
+        .iter()
+        .filter_map(|d| Some(d.file.file_stem()?.to_str()?.to_owned()));
+    Ok(live.map(|r| r.id.clone()).chain(damaged).collect())
 }
 
 pub fn list(p: &Project) -> Result<Vec<Summary>> {

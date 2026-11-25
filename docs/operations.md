@@ -105,6 +105,40 @@ A shared install that Graft attached counts as the graft's own, not as local wor
 
 For an exact-source manual snapshot, use `deps share --snapshot --key KEY` (from the primary checkout) or `deps layer save NAME --key KEY` (from a graft), then `deps layer restore NAME --key KEY`. `deps layer remove NAME --key KEY` retires a saved layer: on every platform it moves the layer to `.git/graft/retained-layers/` and reports `retained_path`, so a patched install is never lost. Delete that directory yourself once you no longer need it; Graft never deletes it. Manual transfers require copy-on-write unless `--copy` is explicitly supplied. Review `--help` for leases and options. Treat installed layers as executable content shared within one trust domain.
 
+## Take turns on a shared resource
+
+Grafts separate source files, but a project can have something that exists once and cannot be copied for each graft: a development server on a fixed port, a local database, a simulator or device, a licensed tool. Grafts that need it take turns. A resource is a name the project chooses, such as `web` or `database`: 1 to 64 lowercase letters, numbers or hyphens, starting with a letter or number. Any other name is refused with `invalid_resource`. Graft attaches no meaning to the name and does nothing to the resource itself. It does not start, stop or lock anything. A turn is a promise between cooperating clients, like a lease: it records whose turn it is, and each agent has to ask before it uses the resource.
+
+```sh
+git graft turn take task web --lease "<lease>"
+git graft turn take task web --lease "<lease>" --wait 600
+git graft turn release task web --lease "<lease>"
+git graft turn list
+```
+
+`turn take` exits with status 0 whether or not the turn was granted, because waiting in the queue is not a failure. Read `granted` in the reply. The first reply below went to `task-a`, the second to `task-b`:
+
+```json
+{"expires_at":1795501800,"granted":true,"holder":"task-a","queue":[],"resource":"web","since":1795500000}
+{"expires_at":1795501800,"granted":false,"holder":"task-a","position":1,"queue":["task-b"],"resource":"web","since":1795500000}
+```
+
+`holder` and `queue` are graft names, `since` and `expires_at` are Unix times in seconds, and `position` is the caller's place in the queue, with 1 next in line. While nobody holds the turn, `holder`, `since` and `expires_at` are `null`. Replies never contain a lease.
+
+Grafts get the turn in the order they first asked. A `take` on a free resource with an empty queue is granted. Any other graft joins the end of the queue and keeps its place each time it asks again. When the holder releases the turn, the first graft in the queue becomes the holder the next time it calls `take`; a graft further back is not granted while one ahead of it is still waiting. A queued graft must ask again within 300 seconds to keep its place. After that it is dropped, and joins the end of the queue when it next asks.
+
+A turn lasts for its ttl, counted from the last time its holder took it: 1800 seconds unless `--ttl` gives another value from 1 to 86400. The holder renews the turn by calling `take` again, which keeps the turn's ttl unless `--ttl` is given again. A turn that is not renewed by `expires_at` is free, and a holder that asks after that queues like any other graft.
+
+`--wait N`, up to 3600, asks about once a second for up to N seconds and returns as soon as the turn is granted. It holds no lock between asks, so other commands are not kept waiting. If a waiting `take` is interrupted, the graft stays in the queue: run `turn release` when the graft no longer wants the turn, or the grafts behind it wait until its 300 seconds have passed.
+
+`turn release` gives up the caller's turn or takes it out of the queue, and replies `{"next":"task-b","released":true,"resource":"web"}`. `next` names the graft now first in line, or is `null`. `released` is `false` when the graft neither held the turn nor waited for it, which is not an error. `turn list` replies with `turns`: for each resource that has a holder or a queue, its `resource`, `holder`, `since`, `expires_at` and `queue`. It needs no lease and creates no Graft state in a project that has none.
+
+`take` and `release` need the graft's lease and renew it, as other commands that take the lease do. They work while a process started with `exec` is still running in the graft, such as the server the turn is for, and they do not wait for grafts that are being built. `merge`, `remove` and `prune` do not change turn state. A holder or queued graft that has been archived no longer counts: `take`, `release` and `list` leave it out the next time they read that resource. A graft restored before another graft took its turn, and before the turn expired, still holds it.
+
+The MCP tools `graft_turn_take`, `graft_turn_release` and `graft_turn_list` take the same arguments and give the same replies. They do not need the host's `--allow-exec` option: they run nothing and change only Graft's own state. Give `wait` a value shorter than the client's limit for one tool call. A call the client cancels stops asking, and gives up a turn it was granted after the cancellation unless it only renewed a turn the graft already held.
+
+Turn state is kept in `.git/graft/turns/`, one file for each resource. If a file there cannot be read, commands for that resource fail, name the file and leave it unchanged; move it aside to start that resource's queue again.
+
 ## Merge and recover
 
 `merge` integrates committed work into a local branch by fast-forward, a merge commit or `--squash`, subject to the destination's state. `--commit MESSAGE` stages nonignored changes in the graft first; use it only when all such changes belong in the task. If `--commit` detects a path with both staged and unstaged changes, it returns `partially_staged` without replacing the staged version. Commit the staged version or unstage it explicitly before retrying. This also applies to a staged deletion whose path has been recreated. Conflicts remain available for inspection. `--reconcile` supports a narrow offline npm lockfile conflict case; other conflicts need normal resolution. Ignored files block a normal merge; `--discard-ignored` retains them in the archived graft.
@@ -236,6 +270,8 @@ These codes and fields tell you that Graft kept something instead of deleting or
 | `default_branch` | `push` without `--to` would update the remote's default branch, because the graft's branch has its name. `details.remote` and `details.branch` name them. Nothing was pushed. | Push to another branch with `--to`, or name the default branch with `--to` if it is meant to be updated. |
 | `git_busy` | A Git lock or an unreadable index in the graft or primary is held by a command Graft did not start, or cannot prove has exited. | Wait for the Git command to finish. Remove a lock only once no Git command is running. |
 | `workspace_busy` | Another Graft command, or a process started by `exec` (including background jobs), holds the graft. | Wait, or stop the background job, then retry. |
+| `"granted": false` (with `position`) | A `turn take` reply, not an error: another graft holds the turn on the resource or is ahead in its queue. | Leave the resource alone. Ask again within 300 seconds, or use `--wait`. See [take turns on a shared resource](#take-turns-on-a-shared-resource). |
+| `invalid_resource` | A `turn` command was given a resource name that is not 1 to 64 lowercase letters, numbers or hyphens starting with a letter or number. Nothing changed. | Use a name of that form. |
 | `kept` | A `gc --purge-cache` field listing saved layers (`saved_layer`) and the registered shared layer (`registered_shared_layer`) it did not delete. | Retire them with `deps layer remove` when no longer needed. |
 | `retained`, `retained_path` | `deps layer remove` moved the layer to `.git/graft/retained-layers/` instead of deleting it. | Delete `retained_path` yourself once you no longer need the install. |
 | prune `reason` `error`, `archive_occupied`, `busy` | Prune could not check or archive this graft (`error` carries the message), found its archive path occupied, or found it busy. It went on with the others. | Fix the named problem, then rerun `prune`. |

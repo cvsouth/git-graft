@@ -1,5 +1,10 @@
 //! MCP stdio adapter for grafts.
-use std::path::PathBuf;
+use std::{
+    future::Future,
+    path::PathBuf,
+    pin::pin,
+    time::{Duration, Instant},
+};
 
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
@@ -14,7 +19,10 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 
-use crate::api::{self, AddDep, DropWorkspace, Exec, Land, Name, Owned, Push};
+use crate::api::{
+    self, AddDep, DropWorkspace, Exec, Land, Name, Owned, Push, TurnRelease, TurnTake,
+};
+use crate::registry;
 use crate::workspace::{self, Command, Spawn};
 
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -49,8 +57,28 @@ fn tool<T: JsonSchema>(
 }
 
 fn parse<T: DeserializeOwned>(args: Map<String, Value>) -> Result<T, ErrorData> {
-    serde_json::from_value(Value::Object(args))
-        .map_err(|e| ErrorData::invalid_params(format!("Invalid tool arguments: {e}"), None))
+    serde_json::from_value(Value::Object(args)).map_err(invalid)
+}
+
+fn invalid(error: impl std::fmt::Display) -> ErrorData {
+    ErrorData::invalid_params(format!("Invalid tool arguments: {error}"), None)
+}
+
+impl Server {
+    /// Run one operation off the async thread.
+    async fn run(&self, op: Command) -> Result<anyhow::Result<Value>, ErrorData> {
+        let repo = self.repo.clone();
+        blocking(move || workspace::run(&repo, op)).await
+    }
+}
+
+/// Run `work` off the async thread.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ErrorData> {
+    tokio::task::spawn_blocking(work).await.map_err(|e| {
+        ErrorData::internal_error(format!("Graft operation failed to join: {e}"), None)
+    })
 }
 
 impl ServerHandler for Server {
@@ -71,7 +99,7 @@ impl ServerHandler for Server {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(format!(
-                "{instructions} {publishing} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for just the ones to bring. Prefer naming them: [\"*\"] copies all of them, including build output and directories such as target/ and .venv/, which can be large. Omitting include uses the project's .worktreeinclude file if it has one, and copies nothing otherwise. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
+                "{instructions} {publishing} A graft is an independent copy of the repository for one task. Call graft_add, work inside the returned path, then graft_merge to merge it into a branch. Before using something every graft shares, such as a development server on a fixed port, call graft_turn_take, and graft_turn_release when done. A graft holds only tracked files: untracked and ignored files such as .env, local config or build output stay behind unless you copy them. Decide what the task needs: call graft_local_files to see them, then pass include to graft_add with .gitignore-style patterns for just the ones to bring. Prefer naming them: [\"*\"] copies all of them, including build output and directories such as target/ and .venv/, which can be large. Omitting include uses the project's .worktreeinclude file if it has one, and copies nothing otherwise. For ordinary work in a trusted clone, omit history from graft_add to honor the project setting (default: local). Choose isolated when the graft should only receive the selected commit's reachable history. Each newline-delimited message may contain up to {MAX_REQUEST_BYTES} bytes. Larger messages are discarded."
             ))
     }
 
@@ -155,6 +183,24 @@ impl ServerHandler for Server {
                 false,
                 false,
             ),
+            tool::<TurnTake>(
+                "graft_turn_take",
+                "Take a turn on something the grafts share and cannot each have a copy of, such as a development server on a fixed port or a local database. resource is a name the project chooses. granted true means this graft holds the turn. Otherwise it is queued and position is its place in line, 1 being next: call again within 300 seconds to keep the place, or set wait to keep asking, for less time than your client allows a tool call. Call again while you hold the turn to renew it before expires_at. Graft does nothing to the resource: a turn is a promise between cooperating grafts. Give it up with graft_turn_release as soon as you finish.",
+                false,
+                false,
+            ),
+            tool::<TurnRelease>(
+                "graft_turn_release",
+                "Give up this graft's turn on a shared resource, or leave its queue. next names the graft now first in line; it gets the turn when it next calls graft_turn_take.",
+                false,
+                false,
+            ),
+            tool::<Empty>(
+                "graft_turn_list",
+                "List the shared resources that have a holder or a queue: who holds each turn, when it expires and who waits, in order.",
+                true,
+                false,
+            ),
         ]);
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -162,7 +208,7 @@ impl ServerHandler for Server {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let name = request.name.as_ref();
         let refuse = |message: String| -> Result<CallToolResponse, ErrorData> {
@@ -184,9 +230,7 @@ impl ServerHandler for Server {
             "graft_list" => parse::<Empty>(args).map(|_| Command::List)?,
             "graft_local_files" => parse::<Empty>(args).map(|_| Command::LocalFiles)?,
             "graft_add" => {
-                Command::Spawn(Spawn::from_mcp(args, !self.allow_exec).map_err(|e| {
-                    ErrorData::invalid_params(format!("Invalid tool arguments: {e}"), None)
-                })?)
+                Command::Spawn(Spawn::from_mcp(args, !self.allow_exec).map_err(invalid)?)
             }
             "graft_status" => Command::Status(parse(args)?),
             "graft_renew" => Command::Heartbeat(parse(args)?),
@@ -196,9 +240,7 @@ impl ServerHandler for Server {
             "graft_merge" => {
                 let explicit_into = args.contains_key("into");
                 let land: Land = parse(args)?;
-                land.check_undo(explicit_into).map_err(|e| {
-                    ErrorData::invalid_params(format!("Invalid tool arguments: {e}"), None)
-                })?;
+                land.check_undo(explicit_into).map_err(invalid)?;
                 if land.reconcile && !self.allow_exec {
                     return refuse(
                         "Lockfile reconciliation requires the host to start with --allow-exec"
@@ -209,6 +251,13 @@ impl ServerHandler for Server {
             }
             "graft_push" => Command::Push(parse(args)?),
             "graft_remove" => Command::Drop(parse(args)?),
+            "graft_turn_take" => {
+                let take: TurnTake = parse(args)?;
+                take.check().map_err(invalid)?;
+                Command::TurnTake(take)
+            }
+            "graft_turn_release" => Command::TurnRelease(parse(args)?),
+            "graft_turn_list" => parse::<Empty>(args).map(|_| Command::TurnList)?,
             _ => {
                 return Err(ErrorData::invalid_params(
                     format!("Unknown tool: {name}"),
@@ -216,12 +265,34 @@ impl ServerHandler for Server {
                 ));
             }
         };
-        let repo = self.repo.clone();
-        let result = tokio::task::spawn_blocking(move || workspace::run(&repo, op))
-            .await
-            .map_err(|e| {
-                ErrorData::internal_error(format!("Graft operation failed to join: {e}"), None)
-            })?;
+        let result = match op {
+            Command::TurnTake(take) => {
+                // The Git version and the project are found once, not on
+                // every ask.
+                let repo = self.repo.clone();
+                let command = Command::TurnTake(take.clone());
+                match blocking(move || workspace::find(&repo, &command)).await? {
+                    Err(error) => Err(error),
+                    Ok(found) => {
+                        let ask = |take| {
+                            let (repo, found) = (self.repo.clone(), found.clone());
+                            blocking(move || {
+                                workspace::run_found(&repo, found, Command::TurnTake(take))
+                            })
+                        };
+                        take_turn(
+                            take,
+                            || context.ct.is_cancelled(),
+                            context.ct.cancelled(),
+                            ask,
+                            |release| self.run(Command::TurnRelease(release)),
+                        )
+                        .await?
+                    }
+                }
+            }
+            op => self.run(op).await?,
+        };
         Ok(match result {
             Ok(value) if value.get("success") == Some(&Value::Bool(false)) => {
                 CallToolResult::structured_error(value)
@@ -230,6 +301,71 @@ impl ServerHandler for Server {
             Err(error) => CallToolResult::structured_error(api::error_json(&error)),
         }
         .into())
+    }
+}
+
+type Reply = Result<anyhow::Result<Value>, ErrorData>;
+
+/// `graft_turn_take`. A waiting take asks from here, one ask at a time, so
+/// it stops asking when the client cancels the request or
+/// disconnects instead of taking a turn nobody will use. `cancelled`
+/// completes when the request is cancelled, and `is_cancelled` reports
+/// whether it has been.
+///
+/// A turn granted after the request was cancelled has no reader: the
+/// response is dropped. This call then releases it, unless the graft held
+/// the turn before the call and the grant only renewed it.
+async fn take_turn<Ask, Asked, Release, Released>(
+    mut take: TurnTake,
+    is_cancelled: impl Fn() -> bool,
+    cancelled: impl Future<Output = ()>,
+    mut ask: Ask,
+    release: Release,
+) -> Reply
+where
+    Ask: FnMut(TurnTake) -> Asked,
+    Asked: Future<Output = Reply>,
+    Release: FnOnce(TurnRelease) -> Released,
+    Released: Future<Output = Reply>,
+{
+    let asked = registry::now();
+    let deadline = Instant::now() + Duration::from_secs(take.wait);
+    take.wait = 0;
+    let mut cancelled = pin!(cancelled);
+    loop {
+        let reply = ask(take.clone()).await?;
+        if let Ok(granted) = &reply
+            && granted["granted"] == true
+            && is_cancelled()
+        {
+            // A new turn starts during this call; a renewed one started before.
+            if granted["since"]
+                .as_u64()
+                .is_some_and(|since| since >= asked)
+            {
+                // If the release fails, the turn still runs out after its ttl.
+                let _ = release(TurnRelease {
+                    name: take.name,
+                    resource: take.resource,
+                    lease: take.lease,
+                })
+                .await;
+            }
+            return Ok(reply);
+        }
+        let pause = reply
+            .as_ref()
+            .ok()
+            .and_then(|reply| workspace::turn_pause(reply, deadline));
+        let Some(pause) = pause else {
+            return Ok(reply);
+        };
+        if tokio::time::timeout(pause, cancelled.as_mut())
+            .await
+            .is_ok()
+        {
+            return Ok(reply);
+        }
     }
 }
 
@@ -282,4 +418,122 @@ pub fn serve(repo: PathBuf, allow_exec: bool, allow_push: bool) -> anyhow::Resul
             .await?;
             Ok(())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::future::{pending, ready};
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn take(wait: u64) -> TurnTake {
+        TurnTake {
+            name: "task".into(),
+            resource: "web".into(),
+            lease: "lease".into(),
+            wait,
+            ttl: None,
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime builds")
+            .block_on(future)
+    }
+
+    /// Runs `take_turn` against `replies`, one per ask, and returns its
+    /// reply, the number of asks and the releases it sent.
+    fn run(
+        wait: u64,
+        replies: Vec<Value>,
+        is_cancelled: impl Fn(usize) -> bool,
+        cancelled: impl Future<Output = ()>,
+    ) -> (Value, usize, Vec<TurnRelease>) {
+        let asks = Cell::new(0);
+        let releases = RefCell::new(Vec::new());
+        let reply = block_on(take_turn(
+            take(wait),
+            || is_cancelled(asks.get()),
+            cancelled,
+            |take| {
+                assert_eq!(take.wait, 0, "each ask is a single ask");
+                let reply = replies[asks.get()].clone();
+                asks.set(asks.get() + 1);
+                ready(Ok(Ok(reply)))
+            },
+            |release| {
+                releases.borrow_mut().push(release);
+                ready(Ok(Ok(json!({"released": true}))))
+            },
+        ));
+        let reply = reply.expect("joins").expect("succeeds");
+        (reply, asks.get(), releases.into_inner())
+    }
+
+    fn queued() -> Value {
+        json!({"granted": false, "position": 1})
+    }
+
+    fn granted(since: u64) -> Value {
+        json!({"granted": true, "since": since})
+    }
+
+    #[test]
+    fn a_take_that_is_not_cancelled_returns_the_grant() {
+        let (reply, asks, releases) = run(60, vec![granted(registry::now())], |_| false, pending());
+        assert_eq!(reply["granted"], true);
+        assert_eq!(asks, 1);
+        assert!(releases.is_empty());
+    }
+
+    #[test]
+    fn a_wait_cancelled_during_the_pause_stops_asking() {
+        let (reply, asks, releases) = run(60, vec![queued(), granted(0)], |_| false, ready(()));
+        assert_eq!(reply, queued());
+        assert_eq!(asks, 1);
+        assert!(releases.is_empty());
+    }
+
+    #[test]
+    fn a_turn_granted_after_cancellation_is_released() {
+        let now = registry::now();
+        for wait in [0, 60] {
+            let (reply, asks, releases) = run(wait, vec![granted(now)], |_| true, pending());
+            assert_eq!(reply["granted"], true);
+            assert_eq!(asks, 1);
+            let [release] = &releases[..] else {
+                panic!("expected one release, got {}", releases.len());
+            };
+            assert_eq!(
+                (&*release.name, &*release.resource, &*release.lease),
+                ("task", "web", "lease")
+            );
+        }
+    }
+
+    #[test]
+    fn a_wait_granted_after_cancellation_is_released() {
+        // Cancelled while the second ask runs, which grants the turn.
+        let now = registry::now();
+        let (reply, asks, releases) =
+            run(1, vec![queued(), granted(now)], |asks| asks == 2, pending());
+        assert_eq!(reply["granted"], true);
+        assert_eq!(asks, 2);
+        assert_eq!(releases.len(), 1);
+    }
+
+    #[test]
+    fn a_renewal_after_cancellation_keeps_the_turn() {
+        let before = registry::now().saturating_sub(60);
+        let (reply, asks, releases) = run(60, vec![granted(before)], |_| true, pending());
+        assert_eq!(reply["granted"], true);
+        assert_eq!(asks, 1);
+        assert!(releases.is_empty());
+    }
 }

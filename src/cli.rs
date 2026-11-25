@@ -108,9 +108,37 @@ Use `git graft list` to see recoverable grafts. Restore returns a new lease.")]
         /// Where the graft is now.
         path: PathBuf,
     },
+    /// Take turns on something the grafts share, such as a development server or database.
+    Turn(Turn),
     /// Renew a graft's lease.
     #[command(hide = true)]
     Heartbeat(api::Owned),
+}
+
+#[derive(Debug, Args)]
+pub struct Turn {
+    #[command(subcommand)]
+    command: TurnCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TurnCommand {
+    /// Take the turn on a shared resource, join its queue, or renew a turn already held.
+    #[command(after_help = "\
+Examples:
+  git graft turn take fix-parser web --lease <lease>             Ask once
+  git graft turn take fix-parser web --lease <lease> --wait 600  Keep asking for ten minutes
+  git graft turn take fix-parser web --lease <lease> --ttl 3600  Hold for an hour between renewals
+
+Prints \"granted\": true when the graft holds the turn. Otherwise the graft is
+queued and \"position\" is its place in line; ask again within 300 seconds to
+keep it. Being queued is not a failure: the exit status is 0 either way.
+Graft does nothing to the resource itself.")]
+    Take(api::TurnTake),
+    /// Give up the turn on a shared resource, or leave its queue.
+    Release(api::TurnRelease),
+    /// List shared resources that have a holder or a queue.
+    List,
 }
 
 #[derive(Debug, Args)]
@@ -201,6 +229,11 @@ impl From<Cmd> for workspace::Command {
             Cmd::Unlock(args) => Op::Unlock(args),
             Cmd::Move { workspace, path } => Op::Move { workspace, path },
             Cmd::Repair { workspace, path } => Op::Repair { workspace, path },
+            Cmd::Turn(Turn { command }) => match command {
+                TurnCommand::Take(args) => Op::TurnTake(args),
+                TurnCommand::Release(args) => Op::TurnRelease(args),
+                TurnCommand::List => Op::TurnList,
+            },
             Cmd::Heartbeat(args) => Op::Heartbeat(args),
         }
     }
