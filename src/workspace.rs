@@ -4,6 +4,7 @@ mod land;
 mod objects;
 mod push;
 mod registry;
+mod remotes;
 mod turns;
 
 use std::{
@@ -336,7 +337,8 @@ fn spawn(
             json!({"name":r.name,"lease":r.lease,"path":r.path,"recovery":format!("Retry the same request: Graft archives this attempt whole and builds the graft again. {guard}")}),
         ));
     }
-    let reply = with_leftovers(p, &r)?;
+    let mut reply = with_leftovers(p, &r)?;
+    with_remotes(p, &r, &config, history, &mut reply);
     if post_add.is_empty() {
         return Ok(reply);
     }
@@ -345,6 +347,35 @@ fn spawn(
     let mut hooks = hook::Runner::new(hooks, lock, None);
     hooks.after(p, &post_add, &r)?;
     Ok(hooks.report(reply))
+}
+
+/// Give the graft `r` the remotes `config` names, and report them in `reply`
+/// as `remotes`. The graft is usable either way, so a failure is reported,
+/// not returned. Remote-tracking refs are copied only with local history,
+/// which already holds their objects.
+fn with_remotes(
+    p: &Project,
+    r: &Record,
+    config: &Config,
+    history: api::History,
+    reply: &mut Value,
+) {
+    if config.remotes.is_empty() {
+        return;
+    }
+    let copy = history == api::History::Local;
+    reply["remotes"] = match remotes::configure(&p.repo, &r.path, &config.remotes, copy) {
+        Ok(entries) => json!(entries),
+        Err(error) => json!([{"status": "failed", "reason": format!("{error:#}")}]),
+    };
+}
+
+/// The history a recorded request built its graft with.
+fn history_of(request: &Value) -> api::History {
+    serde_json::from_value::<Option<api::History>>(request["history"].clone())
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| recorded_history(request))
 }
 
 /// The reply for a finished graft, with its lease.
@@ -1099,7 +1130,12 @@ pub(crate) fn run_found(
             let mut hooks = hook::Runner::new(hooks, &lock, builds);
             let post_restore = hooks.hooks(p, hook::Event::PostRestore)?;
             let (r, reopened) = registry::restore_locked(p, &a.name, &a.lease)?;
-            let reply = with_leftovers(p, &r)?;
+            let mut reply = with_leftovers(p, &r)?;
+            // An archive made before the configuration named remotes gets them now.
+            if reopened.is_some() && r.status == Status::Active {
+                let config = Config::read(&p.repo)?;
+                with_remotes(p, &r, &config, history_of(&r.request), &mut reply);
+            }
             // A repeated restore returns the graft without running the hooks
             // again. One this call reopened keeps the graft's lock for them.
             let (false, Some(_graft_lock), Status::Active) =

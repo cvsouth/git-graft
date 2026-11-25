@@ -15,6 +15,7 @@ Two JSON files at the root of the primary checkout configure Graft for a project
 - `include`: the [untracked and ignored files](#copy-untracked-and-ignored-files) a new graft copies when the request names none.
 - `hooks`: the [commands](#hooks) Graft runs when a graft is added, about to be archived or restored, keyed by a name of up to 64 letters, digits, `-`, `_` or `.`.
 - `turns`, at the top level only: the [shared resources](#share-a-resource-between-repositories) whose turns every repository the file configures shares.
+- `remotes`: names of the primary's remotes that every new graft gets, such as `["origin"]`. See [remotes in a graft](#remotes-in-a-graft).
 
 ```json
 {
@@ -70,6 +71,15 @@ Some projects keep several repositories side by side in one directory, which may
 - On Unix, both files there must belong to you or to the superuser, as must the directory and any link to them; otherwise every command that reads them refuses with `invalid_config`. A file in a shared directory such as `/tmp` could otherwise run another user's commands as you. Windows does not check who owns them, so there every hook from either file in that directory needs trust, whether Git tracks the file or not.
 - Hooks from that directory's `.graftconfig`, and from its `.graftconfig.local` while the directory's own repository tracks that file or on Windows, need [trust](#hooks) as the primary's own do. The trust is recorded for each repository in its own Graft state, so run `git graft hook trust` in each.
 - A key under `repositories` that names no repository, such as a mistyped path, configures nothing. `git graft hook list` reports each one in `missing_repositories`, with the file that has it.
+
+### Remotes in a graft
+
+A graft has no remotes unless the configuration names some. With `"remotes": ["origin"]`, `add` configures `origin` in the new graft with the primary's `remote.origin.url`, any `pushurl`, and its `fetch` refspecs, so `git fetch origin` and `git push origin <branch>` work in the graft as in any clone, and `push` is not needed. With local history it also copies the primary's `refs/remotes/origin/*`, whose objects the graft already holds; with isolated or tip history it copies none, which would bring other history in, and a `git fetch` in the graft gets them. `restore` gives a reopened graft any named remote it lacks.
+
+- Only those keys are copied. Credentials stay in the user's credential helpers and SSH configuration, and a remote whose URL names a user and password, such as `https://user:token@host/repo`, is left out with the reason `url_has_credentials`; an SSH user, as in `git@host:repo`, is no credential. A name the primary does not configure is left out with `not_configured`. A remote the graft already has is `kept` as it is.
+- The receipt of `add` and `restore` reports each as `remotes`: `{"name": "origin", "status": "configured", "refs": 12}`, or `"status": "skipped"` with a `reason`, or `"kept"`. A failure to set them up does not fail the command; it is reported as `"status": "failed"` with a `reason`.
+- Lists from `.graftconfig` and `.graftconfig.local` are joined; a local `!name` removes a shared one.
+- It is opt-in: a project that wants every graft to push and fetch by itself names its remotes, and a graft of any other stays without them. `merge`, `remove` and `prune` still count only work that a local branch of the primary contains as merged, whatever a graft pushed.
 
 ## Copy untracked and ignored files
 
