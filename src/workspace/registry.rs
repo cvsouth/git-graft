@@ -1361,6 +1361,7 @@ fn verify_git_location(path: &Path, detached: Option<usize>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct Location {
     pub project: PathBuf,
     pub name: String,

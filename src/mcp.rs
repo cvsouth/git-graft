@@ -1,6 +1,8 @@
 //! MCP stdio adapter for grafts.
 use std::{
+    future::Future,
     path::PathBuf,
+    pin::pin,
     time::{Duration, Instant},
 };
 
@@ -18,6 +20,7 @@ use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 
 use crate::api::{self, AddDep, DropWorkspace, Exec, Land, Name, Owned, TurnRelease, TurnTake};
+use crate::registry;
 use crate::workspace::{self, Command, Spawn};
 
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -62,12 +65,17 @@ impl Server {
     /// Run one operation off the async thread.
     async fn run(&self, op: Command) -> Result<anyhow::Result<Value>, ErrorData> {
         let repo = self.repo.clone();
-        tokio::task::spawn_blocking(move || workspace::run(&repo, op))
-            .await
-            .map_err(|e| {
-                ErrorData::internal_error(format!("Graft operation failed to join: {e}"), None)
-            })
+        blocking(move || workspace::run(&repo, op)).await
     }
+}
+
+/// Run `work` off the async thread.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ErrorData> {
+    tokio::task::spawn_blocking(work).await.map_err(|e| {
+        ErrorData::internal_error(format!("Graft operation failed to join: {e}"), None)
+    })
 }
 
 impl ServerHandler for Server {
@@ -234,22 +242,28 @@ impl ServerHandler for Server {
             }
         };
         let result = match op {
-            // A waiting take asks from here, one whole operation at a time,
-            // so it stops asking when the client cancels the request or
-            // disconnects instead of taking a turn nobody will use.
-            Command::TurnTake(mut take) => {
-                let deadline = Instant::now() + Duration::from_secs(take.wait);
-                take.wait = 0;
-                loop {
-                    let reply = self.run(Command::TurnTake(take.clone())).await?;
-                    let pause = reply
-                        .as_ref()
-                        .ok()
-                        .and_then(|reply| workspace::turn_pause(reply, deadline));
-                    let Some(pause) = pause else { break reply };
-                    let cancelled = tokio::time::timeout(pause, context.ct.cancelled());
-                    if cancelled.await.is_ok() {
-                        break reply;
+            Command::TurnTake(take) => {
+                // The Git version and the project are found once, not on
+                // every ask.
+                let repo = self.repo.clone();
+                let command = Command::TurnTake(take.clone());
+                match blocking(move || workspace::find(&repo, &command)).await? {
+                    Err(error) => Err(error),
+                    Ok(found) => {
+                        let ask = |take| {
+                            let (repo, found) = (self.repo.clone(), found.clone());
+                            blocking(move || {
+                                workspace::run_found(&repo, found, Command::TurnTake(take))
+                            })
+                        };
+                        take_turn(
+                            take,
+                            || context.ct.is_cancelled(),
+                            context.ct.cancelled(),
+                            ask,
+                            |release| self.run(Command::TurnRelease(release)),
+                        )
+                        .await?
                     }
                 }
             }
@@ -263,6 +277,71 @@ impl ServerHandler for Server {
             Err(error) => CallToolResult::structured_error(api::error_json(&error)),
         }
         .into())
+    }
+}
+
+type Reply = Result<anyhow::Result<Value>, ErrorData>;
+
+/// `graft_turn_take`. A waiting take asks from here, one ask at a time, so
+/// it stops asking when the client cancels the request or
+/// disconnects instead of taking a turn nobody will use. `cancelled`
+/// completes when the request is cancelled, and `is_cancelled` reports
+/// whether it has been.
+///
+/// A turn granted after the request was cancelled has no reader: the
+/// response is dropped. This call then releases it, unless the graft held
+/// the turn before the call and the grant only renewed it.
+async fn take_turn<Ask, Asked, Release, Released>(
+    mut take: TurnTake,
+    is_cancelled: impl Fn() -> bool,
+    cancelled: impl Future<Output = ()>,
+    mut ask: Ask,
+    release: Release,
+) -> Reply
+where
+    Ask: FnMut(TurnTake) -> Asked,
+    Asked: Future<Output = Reply>,
+    Release: FnOnce(TurnRelease) -> Released,
+    Released: Future<Output = Reply>,
+{
+    let asked = registry::now();
+    let deadline = Instant::now() + Duration::from_secs(take.wait);
+    take.wait = 0;
+    let mut cancelled = pin!(cancelled);
+    loop {
+        let reply = ask(take.clone()).await?;
+        if let Ok(granted) = &reply
+            && granted["granted"] == true
+            && is_cancelled()
+        {
+            // A new turn starts during this call; a renewed one started before.
+            if granted["since"]
+                .as_u64()
+                .is_some_and(|since| since >= asked)
+            {
+                // If the release fails, the turn still runs out after its ttl.
+                let _ = release(TurnRelease {
+                    name: take.name,
+                    resource: take.resource,
+                    lease: take.lease,
+                })
+                .await;
+            }
+            return Ok(reply);
+        }
+        let pause = reply
+            .as_ref()
+            .ok()
+            .and_then(|reply| workspace::turn_pause(reply, deadline));
+        let Some(pause) = pause else {
+            return Ok(reply);
+        };
+        if tokio::time::timeout(pause, cancelled.as_mut())
+            .await
+            .is_ok()
+        {
+            return Ok(reply);
+        }
     }
 }
 
@@ -311,4 +390,122 @@ pub fn serve(repo: PathBuf, allow_exec: bool) -> anyhow::Result<()> {
                 .await?;
             Ok(())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::future::{pending, ready};
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn take(wait: u64) -> TurnTake {
+        TurnTake {
+            name: "task".into(),
+            resource: "web".into(),
+            lease: "lease".into(),
+            wait,
+            ttl: None,
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime builds")
+            .block_on(future)
+    }
+
+    /// Runs `take_turn` against `replies`, one per ask, and returns its
+    /// reply, the number of asks and the releases it sent.
+    fn run(
+        wait: u64,
+        replies: Vec<Value>,
+        is_cancelled: impl Fn(usize) -> bool,
+        cancelled: impl Future<Output = ()>,
+    ) -> (Value, usize, Vec<TurnRelease>) {
+        let asks = Cell::new(0);
+        let releases = RefCell::new(Vec::new());
+        let reply = block_on(take_turn(
+            take(wait),
+            || is_cancelled(asks.get()),
+            cancelled,
+            |take| {
+                assert_eq!(take.wait, 0, "each ask is a single ask");
+                let reply = replies[asks.get()].clone();
+                asks.set(asks.get() + 1);
+                ready(Ok(Ok(reply)))
+            },
+            |release| {
+                releases.borrow_mut().push(release);
+                ready(Ok(Ok(json!({"released": true}))))
+            },
+        ));
+        let reply = reply.expect("joins").expect("succeeds");
+        (reply, asks.get(), releases.into_inner())
+    }
+
+    fn queued() -> Value {
+        json!({"granted": false, "position": 1})
+    }
+
+    fn granted(since: u64) -> Value {
+        json!({"granted": true, "since": since})
+    }
+
+    #[test]
+    fn a_take_that_is_not_cancelled_returns_the_grant() {
+        let (reply, asks, releases) = run(60, vec![granted(registry::now())], |_| false, pending());
+        assert_eq!(reply["granted"], true);
+        assert_eq!(asks, 1);
+        assert!(releases.is_empty());
+    }
+
+    #[test]
+    fn a_wait_cancelled_during_the_pause_stops_asking() {
+        let (reply, asks, releases) = run(60, vec![queued(), granted(0)], |_| false, ready(()));
+        assert_eq!(reply, queued());
+        assert_eq!(asks, 1);
+        assert!(releases.is_empty());
+    }
+
+    #[test]
+    fn a_turn_granted_after_cancellation_is_released() {
+        let now = registry::now();
+        for wait in [0, 60] {
+            let (reply, asks, releases) = run(wait, vec![granted(now)], |_| true, pending());
+            assert_eq!(reply["granted"], true);
+            assert_eq!(asks, 1);
+            let [release] = &releases[..] else {
+                panic!("expected one release, got {}", releases.len());
+            };
+            assert_eq!(
+                (&*release.name, &*release.resource, &*release.lease),
+                ("task", "web", "lease")
+            );
+        }
+    }
+
+    #[test]
+    fn a_wait_granted_after_cancellation_is_released() {
+        // Cancelled while the second ask runs, which grants the turn.
+        let now = registry::now();
+        let (reply, asks, releases) =
+            run(1, vec![queued(), granted(now)], |asks| asks == 2, pending());
+        assert_eq!(reply["granted"], true);
+        assert_eq!(asks, 2);
+        assert_eq!(releases.len(), 1);
+    }
+
+    #[test]
+    fn a_renewal_after_cancellation_keeps_the_turn() {
+        let before = registry::now().saturating_sub(60);
+        let (reply, asks, releases) = run(60, vec![granted(before)], |_| true, pending());
+        assert_eq!(reply["granted"], true);
+        assert_eq!(asks, 1);
+        assert!(releases.is_empty());
+    }
 }

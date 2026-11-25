@@ -135,7 +135,7 @@ A turn lasts for its ttl, counted from the last time its holder took it: 1800 se
 
 `take` and `release` need the graft's lease and renew it, as other commands that take the lease do. They work while a process started with `exec` is still running in the graft, such as the server the turn is for, and they do not wait for grafts that are being built. `merge`, `remove` and `prune` do not change turn state. A holder or queued graft that has been archived no longer counts: `take`, `release` and `list` leave it out the next time they read that resource. A graft restored before another graft took its turn, and before the turn expired, still holds it.
 
-The MCP tools `graft_turn_take`, `graft_turn_release` and `graft_turn_list` take the same arguments and give the same replies. They do not need the host's `--allow-exec` option: they run nothing and change only Graft's own state. Give `wait` a value shorter than the client's limit for one tool call. A call the client cancels stops asking.
+The MCP tools `graft_turn_take`, `graft_turn_release` and `graft_turn_list` take the same arguments and give the same replies. They do not need the host's `--allow-exec` option: they run nothing and change only Graft's own state. Give `wait` a value shorter than the client's limit for one tool call. A call the client cancels stops asking, and gives up a turn it was granted after the cancellation unless it only renewed a turn the graft already held.
 
 Turn state is kept in `.git/graft/turns/`, one file for each resource. If a file there cannot be read, commands for that resource fail, name the file and leave it unchanged; move it aside to start that resource's queue again.
 
