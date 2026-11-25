@@ -1090,7 +1090,7 @@ mod tests {
         let f = Fixture::new()?;
         let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
             .args(if cfg!(windows) {
-                &["/C", "timeout", "30"][..]
+                &["/C", "ping", "-n", "30", "127.0.0.1"][..]
             } else {
                 &["30"][..]
             })
