@@ -3,7 +3,7 @@
 //! A graft has no remotes. Its commits are copied into the primary's object
 //! store under a private ref, and the primary's own Git pushes them, so the
 //! remote's URL, credentials and hooks are the ones the user already set up.
-use std::path::Path;
+use std::{path::Path, process::Stdio};
 
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
@@ -74,6 +74,38 @@ fn source(r: &Record, to: Option<&str>) -> Result<(String, String)> {
     }
 }
 
+/// The remote's default branch as the primary last recorded it in
+/// `refs/remotes/<remote>/HEAD`, which `git clone` and `git remote set-head`
+/// write. `None` when the primary has no such record.
+fn default_branch(primary: &Path, remote: &str) -> Result<Option<String>> {
+    let prefix = format!("refs/remotes/{remote}/");
+    Ok(git::symbolic_ref(primary, &format!("{prefix}HEAD"))?
+        .and_then(|target| target.strip_prefix(&prefix).map(str::to_owned)))
+}
+
+/// Refuse to push the graft's own branch name to the remote's default
+/// branch. A graft added with `--branch main` would otherwise update the
+/// remote's `main` on a plain `push`, which is meant for review branches.
+/// Naming the branch with `to` is taken as the intent to update it.
+fn require_review_branch(
+    primary: &Path,
+    name: &str,
+    remote: &str,
+    branch: &str,
+    to: Option<&str>,
+) -> Result<()> {
+    if to.is_some() || default_branch(primary, remote)?.as_deref() != Some(branch) {
+        return Ok(());
+    }
+    Err(api::fault(
+        "default_branch",
+        format!(
+            "Graft {name} is on branch {branch}, which is the default branch of remote {remote}. Nothing was pushed. To update it, name it with --to {branch} (to over MCP); otherwise push to another branch with --to"
+        ),
+        json!({"name": name, "remote": remote, "branch": branch}),
+    ))
+}
+
 /// Let Git decide whether `name` is a branch name. Git also expands
 /// `@{-1}` here; a name it rewrites is not the name that was asked for.
 /// `refs/heads/x` is a valid name for the branch `refs/heads/refs/heads/x`,
@@ -118,8 +150,9 @@ fn import(primary: &Path, graft: &Path, commit: &str, pin: &str) -> Result<()> {
 /// `https://user:secret@host/path` reads `https://host/path`. Git's messages,
 /// and those of remote helpers and hooks, can quote the remote's URL.
 ///
-/// As Git does, this takes the authority to end at the first `/`. It also
-/// ends at whitespace, so an address later on the line is left alone.
+/// As Git does, this takes the authority to end at the first `/`, `?` or
+/// `#`. It also ends at whitespace, so an address later on the line is left
+/// alone.
 fn redact(text: &str) -> String {
     let mut clean = String::with_capacity(text.len());
     let mut rest = text;
@@ -127,7 +160,7 @@ fn redact(text: &str) -> String {
         let (before, after) = rest.split_at(scheme + 3);
         clean.push_str(before);
         let end = after
-            .find(|c: char| c == '/' || c.is_whitespace() || c.is_control())
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace() || c.is_control())
             .unwrap_or(after.len());
         rest = match after[..end].rfind('@') {
             Some(at) => &after[at + 1..],
@@ -187,6 +220,25 @@ fn classify(success: bool, porcelain: &str, branch: &str) -> Outcome {
     Outcome::Failed
 }
 
+/// The SSH command for a push when the user has not chosen one: OpenSSH in
+/// batch mode, so a passphrase, password or host-key question fails the push
+/// instead of waiting for an answer nobody can give. `None` when
+/// `GIT_SSH_COMMAND`, `GIT_SSH` or `core.sshCommand` names a command, which
+/// is then used as it is.
+fn batch_ssh(primary: &Path) -> Result<Option<&'static str>> {
+    if ["GIT_SSH_COMMAND", "GIT_SSH"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+    {
+        return Ok(None);
+    }
+    let mut read = git::user_command(primary);
+    read.args(["config", "--get", "core.sshCommand"]);
+    let configured = read.stdout(Stdio::null()).stderr(Stdio::null()).status()?;
+    // Exit 1 means the key is not set; any other failure keeps Git's default.
+    Ok((configured.code() == Some(1)).then_some("ssh -o BatchMode=yes"))
+}
+
 /// Run the push in the primary with the user's own Git configuration and
 /// environment. The commit is named by its ID and the destination in full,
 /// so no local branch, upstream setting or configured refspec takes part.
@@ -203,6 +255,9 @@ fn send(primary: &Path, remote: &str, commit: &str, branch: &str) -> Result<()> 
         remote,
         &format!("{commit}:refs/heads/{branch}"),
     ]);
+    if let Some(ssh) = batch_ssh(primary)? {
+        push.env("GIT_SSH_COMMAND", ssh);
+    }
     let pushed = Runtime::capture_command(push, "git")?;
     let outcome = classify(
         pushed["success"] == true,
@@ -259,6 +314,7 @@ pub(super) fn run(
     require_remote(&p.repo, &args.remote)?;
     let (commit, branch) = source(r, args.to.as_deref())?;
     check_branch(&p.repo, &branch)?;
+    require_review_branch(&p.repo, &r.name, &args.remote, &branch, args.to.as_deref())?;
     let receipt = super::with_attempts(
         p,
         r,
@@ -307,6 +363,11 @@ mod tests {
                 "https://example.com/a@b and https://u:p@h/x@y",
                 "https://example.com/a@b and https://h/x@y",
             ),
+            // A query or fragment also ends the authority.
+            ("https://example.com?a@b", "https://example.com?a@b"),
+            ("https://example.com#a@b", "https://example.com#a@b"),
+            ("https://u:p@example.com?a@b", "https://example.com?a@b"),
+            ("https://u:p@example.com#x", "https://example.com#x"),
             // The last @ before the path ends the user-info.
             ("https://user:p@ss@example.com/x", "https://example.com/x"),
             // An address after the URL is not part of it.
@@ -510,6 +571,74 @@ mod tests {
         assert_eq!(refs(&primary)?, branches);
         // Removing a pin that is already gone is not an error.
         objects::remove_import_pin(&primary, &pin, &second)?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_remote_default_branch_is_pushed_only_when_named() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        repository(&repo)?;
+        let base = commit(&repo, "base")?;
+        git::bytes(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        )?;
+        // No record of the remote's default branch: nothing is refused.
+        assert_eq!(default_branch(&repo, "origin")?, None);
+        require_review_branch(&repo, "task", "origin", "main", None)?;
+
+        git::bytes(&repo, &["update-ref", "refs/remotes/origin/main", &base])?;
+        git::bytes(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        )?;
+        assert_eq!(default_branch(&repo, "origin")?.as_deref(), Some("main"));
+        assert_eq!(default_branch(&repo, "fork")?, None);
+        let error = api::error_json(
+            &require_review_branch(&repo, "task", "origin", "main", None).unwrap_err(),
+        );
+        assert_eq!(error["code"], "default_branch", "{error}");
+        assert_eq!(
+            error["details"],
+            json!({"name": "task", "remote": "origin", "branch": "main"})
+        );
+        // Named with --to, another branch, or another remote: allowed.
+        require_review_branch(&repo, "task", "origin", "main", Some("main"))?;
+        require_review_branch(&repo, "task", "origin", "graft/task", None)?;
+        require_review_branch(&repo, "task", "fork", "main", None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_runs_in_batch_mode_unless_the_user_chose_a_command() -> Result<()> {
+        // The caller's own SSH command always wins; nothing to check here.
+        if ["GIT_SSH_COMMAND", "GIT_SSH"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+        {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        repository(&repo)?;
+        let global = git::user_command(&repo)
+            .args(["config", "--get", "core.sshCommand"])
+            .output()?;
+        if global.status.code() == Some(1) {
+            assert_eq!(batch_ssh(&repo)?, Some("ssh -o BatchMode=yes"));
+        }
+        git::bytes(&repo, &["config", "core.sshCommand", "ssh -i key"])?;
+        assert_eq!(batch_ssh(&repo)?, None);
         Ok(())
     }
 

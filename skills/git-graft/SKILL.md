@@ -46,6 +46,7 @@ Graft never deletes or overwrites work to finish a command. These results mean i
 - `push_failed`: the push could not be completed, for example for network or authentication reasons (`details.stderr`). Report it to the user. Do not retry in a loop or try another remote.
 - `remote_not_found`: the primary has no remote of that name; `details.remotes` lists the ones it has. Use one only if the task names it, otherwise ask the user.
 - `detached_head` or `nothing_to_push`: pass `to` to name the remote branch, or commit first.
+- `default_branch`: the graft's branch has the name of the remote's default branch. Pass `to` with another branch name. Pass `to` with the default branch only if the task says to update it.
 - `git_busy` or `workspace_busy`: another Git or Graft command, or a background job started with `graft_exec`, is running. Wait or stop your own background job, then retry.
 - `retained_path` and `kept` (CLI `deps layer remove` and `gc --purge-cache`): layers were kept, not deleted. Leave them for the user.
 

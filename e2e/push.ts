@@ -132,6 +132,29 @@ export const cases: Scenario[] = [
     },
   },
   {
+    name: "a graft on the remote's default branch is refused unless --to names that branch",
+    run(ctx) {
+      const bare = remote(ctx);
+      ctx.git(['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+      ctx.git(['remote', 'set-head', 'origin', 'main']);
+      const base = ctx.git(['rev-parse', 'HEAD']);
+      const graft = ctx.spawn('trunk', ['--branch', 'main']);
+      const tip = commit(ctx, graft.path, 'trunk.txt', 'work\n');
+
+      const refused = ctx.fail(push('trunk', graft));
+      assert.equal(refused.code, 'default_branch', String(refused.message));
+      assert.match(String(refused.message), /--to main/);
+      assert.deepEqual(refused.details, { name: 'trunk', remote: 'origin', branch: 'main' });
+      assert.equal(refs(ctx, bare), 'refs/heads/main ' + base);
+      assert.equal(privateRefs(ctx), '');
+
+      assert.equal(ctx.cli(push('trunk', graft, '--to', 'review/trunk')).branch, 'review/trunk');
+      const named = ctx.cli(push('trunk', graft, '--to', 'main'));
+      assert.equal(named.branch, 'main');
+      assert.equal(ctx.git(['rev-parse', 'refs/heads/main'], bare), tip);
+    },
+  },
+  {
     name: 'a graft that diverged from the remote branch is refused and pushes once it has merged it',
     run(ctx) {
       const bare = remote(ctx);
@@ -311,6 +334,41 @@ export const cases: Scenario[] = [
       clean(unknown.text);
       assert(!unknown.text.includes('127.0.0.1'), unknown.text);
       assert.equal(privateRefs(ctx), '');
+    },
+  },
+  {
+    name: 'SSH runs in batch mode unless the user chose an SSH command',
+    run(ctx) {
+      remote(ctx);
+      const log = join(ctx.root, 'ssh.log');
+      const hooks = join(ctx.git(['rev-parse', '--absolute-git-dir']), 'hooks');
+      mkdirSync(hooks, { recursive: true });
+      // Git passes the push's environment to the hook, so it sees the SSH command Git would run.
+      writeFileSync(join(hooks, 'pre-push'),
+        '#!/bin/sh\nprintf \'%s\\n\' "${GIT_SSH_COMMAND-unset}" >> "$GRAFT_E2E_SSH_LOG"\n');
+      chmodSync(join(hooks, 'pre-push'), 0o755);
+      ctx.env.GRAFT_E2E_SSH_LOG = log.replaceAll('\\', '/');
+      const graft = ctx.spawn('ssh');
+      const last = () => readFileSync(log, 'utf8').trim().split('\n').at(-1);
+      try {
+        commit(ctx, graft.path, 'one.txt', 'one\n');
+        ctx.cli(push('ssh', graft));
+        assert.equal(last(), 'ssh -o BatchMode=yes');
+
+        ctx.git(['config', 'core.sshCommand', 'ssh -i chosen']);
+        commit(ctx, graft.path, 'two.txt', 'two\n');
+        ctx.cli(push('ssh', graft));
+        assert.equal(last(), 'unset');
+        ctx.git(['config', '--unset', 'core.sshCommand']);
+
+        ctx.env.GIT_SSH_COMMAND = 'ssh -F chosen';
+        commit(ctx, graft.path, 'three.txt', 'three\n');
+        ctx.cli(push('ssh', graft));
+        assert.equal(last(), 'ssh -F chosen');
+      } finally {
+        delete ctx.env.GIT_SSH_COMMAND;
+        delete ctx.env.GRAFT_E2E_SSH_LOG;
+      }
     },
   },
   {

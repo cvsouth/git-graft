@@ -131,7 +131,7 @@ impl ServerHandler for Server {
             // and nothing here can take it back.
             tools.push(tool::<Push>(
                 "graft_push",
-                "Push a graft's commits to a branch on a remote of the primary repository, for example to open a pull request. Uses the primary's remote configuration and credentials, never forces, and leaves the graft active; uncommitted work is not pushed. Use it only when the task asks for the work to be published. Needs host --allow-push.",
+                "Push a graft's commits to a branch on a remote of the primary repository, for example to open a pull request. Uses the primary's remote configuration and credentials, never forces, updates the remote's default branch only when to names it, and leaves the graft active; uncommitted work is not pushed. Use it only when the task asks for the work to be published. Needs host --allow-push.",
                 false,
                 true,
             ));

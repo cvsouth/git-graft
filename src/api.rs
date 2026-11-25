@@ -376,7 +376,8 @@ pub struct Push {
     #[arg(long, default_value = "origin")]
     #[serde(default = "origin")]
     pub remote: String,
-    /// Branch to update on the remote. Defaults to the graft's current branch.
+    /// Branch to update on the remote. Defaults to the graft's current branch, except that the
+    /// remote's default branch is updated only when named here.
     #[arg(long, value_name = "BRANCH")]
     pub to: Option<String>,
 }
