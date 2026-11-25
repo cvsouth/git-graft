@@ -42,6 +42,8 @@ pub enum Command {
     ListManagers,
     UnregisterManager(api::ManagerName),
     ListHooks,
+    /// Record the hooks the repository carries as trusted.
+    TrustHooks,
     AddDep(api::AddDep),
     SeedLayer(api::SeedLayer),
     /// Save, restore or forget; the string is the action.
@@ -155,6 +157,7 @@ fn spawn(
     // file Graft cannot read refuses the add instead of leaving a graft whose
     // hooks never ran or that copied the wrong files.
     let config = Config::read(&p.repo)?;
+    hook::trust::require(p, &config, hook::Event::PostAdd, hooks)?;
     let include = if populated {
         include::select(args.include.as_deref(), &config)?
     } else {
@@ -996,8 +999,8 @@ pub(crate) fn run_found(
     // Hooks live in the primary checkout's configuration files, so listing
     // them needs no Graft state.
     if matches!(command, Command::ListHooks) {
-        let (primary, ..) = paths;
-        return hook::list(&primary);
+        let (primary, _, state, _) = paths;
+        return hook::list(&primary, &state);
     }
     let (p, lock) = Project::open_at(paths, !matches!(&command, Command::Spawn(_)))?;
     let p = &p;
@@ -1015,7 +1018,8 @@ pub(crate) fn run_found(
         | Command::Lock { .. }
         | Command::Unlock(_)
         | Command::TurnTake(_)
-        | Command::TurnRelease(_) => None,
+        | Command::TurnRelease(_)
+        | Command::TrustHooks => None,
         Command::Gc(args) if !args.apply => None,
         Command::Spawn(_) => Some(p.lock_builds(true)?),
         _ => Some(p.lock_builds(false)?),
@@ -1053,6 +1057,7 @@ pub(crate) fn run_found(
         Command::TurnList => unreachable!("turn list returns before the project opens"),
         Command::UnregisterManager(a) => return crate::package_manager::unregister(p, &a.manager),
         Command::ListHooks => unreachable!("handled above"),
+        Command::TrustHooks => return hook::trust::trust(p),
         Command::RegisterManager(a) => match (&a.workspace, &a.lease) {
             (Some(name), Some(lease)) => {
                 let source = registry::authenticate(p, name, lease)?;
@@ -1137,6 +1142,11 @@ pub(crate) fn run_found(
         }
         Command::Gc(a) => {
             let mut hooks = hook::Runner::new(hooks, &lock, builds);
+            // Refuse before archiving anything when the pre-archive hooks
+            // need trust they do not have.
+            if a.apply {
+                hooks.hooks(p, hook::Event::PreArchive)?;
+            }
             let retained = registry::prune_with(p, a.apply, &mut |r| hooks.before_prune(p, r))?;
             let cache = if !a.purge_cache {
                 json!({"requested":false,"purged":false})

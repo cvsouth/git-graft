@@ -56,6 +56,9 @@ pub(crate) struct Config {
     pub include_files: Vec<&'static str>,
     /// Every hook, in the order they run.
     pub hooks: Vec<Hook>,
+    /// Every hook as each file defines it, before the local file overrides
+    /// the shared one: the shared file's, then the local file's.
+    pub defined: Vec<Hook>,
 }
 
 impl Config {
@@ -262,7 +265,16 @@ fn merge(shared: Option<File>, local: Option<File>) -> Result<Config> {
             });
         }
     }
+    config.defined = config.hooks.clone();
     for (name, spec) in local.hooks.unwrap_or_default().0 {
+        if let Some(spec) = &spec {
+            config.defined.push(Hook {
+                name: name.clone(),
+                event: spec.event,
+                argv: spec.argv.clone(),
+                file: LOCAL,
+            });
+        }
         let known = config.hooks.iter().position(|hook| hook.name == name);
         match (known, spec) {
             // Replacing a shared hook keeps its place in the order.

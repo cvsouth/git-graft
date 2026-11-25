@@ -1,7 +1,8 @@
 //! Commands a project's configuration runs when a graft is added, is about
 //! to be archived, or is restored. They are defined in `.graftconfig` and
 //! `.graftconfig.local` at the root of the primary checkout (see
-//! [`crate::config`]); no MCP tool defines one.
+//! [`crate::config`]); no MCP tool defines one. A hook the repository
+//! carries runs only once the person has trusted it; see [`trust`].
 
 use super::registry::{self as grafts, Record, Status};
 use crate::{
@@ -18,6 +19,8 @@ use std::{
     path::{Component, Path},
     process::Command,
 };
+
+pub(crate) mod trust;
 
 const MAX_ARGUMENTS: usize = 64;
 const MAX_ARGUMENT_BYTES: usize = 4096;
@@ -86,10 +89,22 @@ fn is_bare_name(program: &str) -> bool {
 }
 
 /// The effective hooks of the project whose primary checkout is `primary`,
-/// in the order they run, with the file each came from.
-pub(crate) fn list(primary: &Path) -> Result<Value> {
+/// in the order they run, with the file each came from and whether it may
+/// run as trust stands in the Graft state directory `state`, which need not
+/// exist.
+pub(crate) fn list(primary: &Path, state: &Path) -> Result<Value> {
     let config = Config::read(primary)?;
-    let hooks: Vec<_> = config.hooks.iter().map(Hook::describe).collect();
+    let gate = trust::Gate::of(primary, &config)?;
+    let trusted = trust::is_trusted(state, &gate.hooks(&config))?;
+    let hooks: Vec<_> = config
+        .hooks
+        .iter()
+        .map(|hook| {
+            let mut described = hook.describe();
+            described["trusted"] = json!(trusted || !gate.needs_trust(hook.file));
+            described
+        })
+        .collect();
     Ok(json!({ "hooks": hooks }))
 }
 
@@ -212,16 +227,19 @@ impl<'a> Runner<'a> {
     }
 
     /// The hooks configured for `event`. The configuration is read once per
-    /// command, so every graft a prune archives runs the same hooks.
+    /// command, so every graft a prune archives runs the same hooks. Refuses
+    /// with `hooks_untrusted` when the caller would run a hook that needs
+    /// trust and has not been trusted.
     pub(crate) fn hooks(&mut self, p: &Project, event: Event) -> Result<Vec<Hook>> {
         if self.config.is_none() {
             self.config = Some(Config::read(&p.repo)?);
         }
-        Ok(self
+        let config = self
             .config
             .as_ref()
-            .map(|config| config.hooks_for(event))
-            .unwrap_or_default())
+            .context("the configuration was not read")?;
+        trust::require(p, config, event, self.policy)?;
+        Ok(config.hooks_for(event))
     }
 
     /// Add the collected reports to a command's result as `hooks`. A result
@@ -457,7 +475,8 @@ mod tests {
     fn hooks_are_listed_from_the_configuration() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         crate::git::bytes(tmp.path(), &["init", "-q", "--template="])?;
-        assert_eq!(list(tmp.path())?, json!({"hooks": []}));
+        let state = tmp.path().join("no-state");
+        assert_eq!(list(tmp.path(), &state)?, json!({"hooks": []}));
         std::fs::write(
             tmp.path().join(crate::config::SHARED),
             r#"{"hooks": {"db": {"event": "post-add", "argv": ["create-db", "--name"]}}}"#,
@@ -467,14 +486,14 @@ mod tests {
             r#"{"hooks": {"notify": {"event": "pre-archive", "argv": ["notify"]}}}"#,
         )?;
         assert_eq!(
-            list(tmp.path())?,
+            list(tmp.path(), &state)?,
             json!({"hooks": [
-                {"name": "db", "event": "post-add", "argv": ["create-db", "--name"], "file": ".graftconfig"},
-                {"name": "notify", "event": "pre-archive", "argv": ["notify"], "file": ".graftconfig.local"},
+                {"name": "db", "event": "post-add", "argv": ["create-db", "--name"], "file": ".graftconfig", "trusted": false},
+                {"name": "notify", "event": "pre-archive", "argv": ["notify"], "file": ".graftconfig.local", "trusted": true},
             ]})
         );
         std::fs::write(tmp.path().join(crate::config::LOCAL), "{")?;
-        let error = list(tmp.path()).unwrap_err();
+        let error = list(tmp.path(), &state).unwrap_err();
         assert_eq!(api::error_json(&error)["code"], "invalid_config");
         Ok(())
     }

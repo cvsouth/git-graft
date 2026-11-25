@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { objectResult, parseExact, type Scenario } from './harness.ts';
-import { call, initialize, withClient } from './mcp.ts';
+import { call, discover, initialize, withClient } from './mcp.ts';
 import { graft as start, waitFor } from './process-faults.ts';
 
 type Context = Parameters<Scenario['run']>[0];
@@ -55,9 +55,12 @@ const LOCAL = '.graftconfig.local';
 /** The hooks each test has written to the primary's `.graftconfig`, by name. */
 const configured = new WeakMap<Context, Record<string, unknown>>();
 
-/** Write the primary's `.graftconfig` with `hooks`, in the order given. */
-function writeConfig(ctx: Context, file: string, hooks: Record<string, unknown>): void {
+/** Write `file` in the primary with `hooks`, in the order given. Hooks in
+ * `.graftconfig` run only once trusted, so by default they are trusted as
+ * written; pass `trust` false to leave them untrusted. */
+function writeConfig(ctx: Context, file: string, hooks: Record<string, unknown>, trust = file === SHARED): void {
   writeFileSync(join(ctx.repo, file), JSON.stringify({ hooks }, null, 2));
+  if (trust) ctx.cli(['hook', 'trust']);
 }
 
 /** Define the hook `name` in the primary's `.graftconfig`, replacing one of
@@ -153,19 +156,21 @@ export const cases: Scenario[] = [
         teardown: { event: 'pre-archive', argv: ['teardown'] },
         assets: { event: 'post-add', argv: ['assets'] },
         reopen: { event: 'post-restore', argv: ['reopen'] },
-      });
+      }, false);
       writeConfig(ctx, LOCAL, {
         notify: { event: 'post-add', argv: ['notify'] },
         assets: null,
         setup: { event: 'post-add', argv: ['/usr/local/bin/setup', '--small'] },
         'not-shared': null,
       });
-      // A replaced hook keeps its place; a new local one runs after the shared ones.
+      // A replaced hook keeps its place; a new local one runs after the shared
+      // ones. Shared hooks are untrusted until `hook trust`; untracked local ones
+      // are the person's own.
       assert.deepEqual(ctx.cli(['hook', 'list']), { hooks: [
-        { name: 'setup', event: 'post-add', argv: ['/usr/local/bin/setup', '--small'], file: LOCAL },
-        { name: 'teardown', event: 'pre-archive', argv: ['teardown'], file: SHARED },
-        { name: 'reopen', event: 'post-restore', argv: ['reopen'], file: SHARED },
-        { name: 'notify', event: 'post-add', argv: ['notify'], file: LOCAL },
+        { name: 'setup', event: 'post-add', argv: ['/usr/local/bin/setup', '--small'], file: LOCAL, trusted: true },
+        { name: 'teardown', event: 'pre-archive', argv: ['teardown'], file: SHARED, trusted: false },
+        { name: 'reopen', event: 'post-restore', argv: ['reopen'], file: SHARED, trusted: false },
+        { name: 'notify', event: 'post-add', argv: ['notify'], file: LOCAL, trusted: true },
       ] });
       assert(!existsSync(state), 'listing hooks created Graft state');
       // Hooks are defined only in the files; there is no command to register one.
@@ -635,12 +640,95 @@ export const cases: Scenario[] = [
     },
   },
   {
+    name: 'hooks the repository carries run only once trusted, and again only after any change is trusted',
+    run(ctx) {
+      const log = join(ctx.root, 'trust.log');
+      const hooks = {
+        setup: { event: 'post-add', argv: fixtureArgv(ctx, 'prepare', log) },
+        teardown: { event: 'pre-archive', argv: fixtureArgv(ctx, 'clean', log) },
+        reopen: { event: 'post-restore', argv: fixtureArgv(ctx, 'prepare', log) },
+      };
+      const described = (config: Record<string, { event: string; argv: string[] }>) =>
+        Object.entries(config).map(([name, hook]) => ({ name, ...hook, file: SHARED }));
+      writeConfig(ctx, SHARED, hooks, false);
+      const before = ctx.cli(['list']);
+      const refused = ctx.fail(['add', 'early']);
+      assert.equal(refused.code, 'hooks_untrusted');
+      assert.match(String(refused.message), /\.graftconfig have not been trusted.*ran nothing.*git graft hook trust/);
+      assert.deepEqual(refused.details, { event: 'post-add', hooks: described(hooks), trusted: null,
+        command: 'git graft hook trust' });
+      assert.deepEqual(ctx.cli(['list']), before);
+      assert.deepEqual(runs(log), []);
+      assert.deepEqual((ctx.cli(['hook', 'list']).hooks as Entry[]).map((hook) => hook.trusted), [false, false, false]);
+
+      const trusted = ctx.cli(['hook', 'trust']);
+      assert.deepEqual(trusted.trusted, described(hooks));
+      assert.match(String(trusted.sha256), /^[0-9a-f]{64}$/);
+      assert.deepEqual((ctx.cli(['hook', 'list']).hooks as Entry[]).map((hook) => hook.trusted), [true, true, true]);
+      const one = ctx.spawn('one');
+      assert.deepEqual(entries(one.result), [ran('post-add', 'prepare one', 'setup')]);
+      const two = ctx.spawn('two');
+      const archived = ctx.cli(['remove', 'two', '--lease', two.lease]);
+      assert.deepEqual(entries(archived), [ran('pre-archive', 'clean two', 'teardown')]);
+      const count = runs(log).length;
+
+      // One changed argument makes every hook untrusted again, whatever the
+      // command's event, and each command refuses before running or changing anything.
+      const changed = { ...hooks, teardown: { ...hooks.teardown, argv: [...hooks.teardown.argv, 'extra'] } };
+      writeConfig(ctx, SHARED, changed, false);
+      expire(ctx, one.result.id);
+      const state = ctx.cli(['list']);
+      for (const args of [
+        ['add', 'three'],
+        ['remove', 'one', '--lease', one.lease],
+        ['merge', 'one', '--lease', one.lease],
+        ['restore', 'two', '--lease', String(archived.recovery_lease)],
+        ['prune', '--apply'],
+      ]) {
+        const error = ctx.fail(args);
+        assert.equal(error.code, 'hooks_untrusted', args.join(' '));
+        assert.match(String(error.message), /changed since they were last trusted/);
+        const details = objectResult(error.details);
+        assert.deepEqual(details.hooks, described(changed));
+        assert.deepEqual(details.trusted, described(hooks));
+      }
+      assert.deepEqual(ctx.cli(['list']), state);
+      assert.equal(runs(log).length, count);
+      // A preview runs no hook, so it needs no trust.
+      assert.equal(retained(ctx.cli(['prune'])).get('one')?.reason, 'dirty');
+
+      ctx.cli(['hook', 'trust']);
+      const removed = ctx.cli(['remove', 'one', '--lease', one.lease]);
+      assert.deepEqual(entries(removed), [ran('pre-archive', 'clean one', 'teardown')]);
+      const restored = ctx.cli(['restore', 'two', '--lease', String(archived.recovery_lease)]);
+      assert.deepEqual(entries(restored), [ran('post-restore', 'prepare two', 'reopen')]);
+
+      // An untracked .graftconfig.local is the person's own and needs no trust.
+      // Once Git tracks it, its hooks come with the repository too.
+      const local = { notify: { event: 'post-add', argv: fixtureArgv(ctx, 'clean', log) } };
+      writeConfig(ctx, LOCAL, local);
+      assert.deepEqual(entries(ctx.spawn('mine').result),
+        [ran('post-add', 'prepare mine', 'setup'), ran('post-add', 'clean mine', 'notify', LOCAL)]);
+      ctx.git(['add', '--', LOCAL]);
+      const tracked = ctx.fail(['add', 'tracked']);
+      assert.equal(tracked.code, 'hooks_untrusted');
+      assert.match(String(tracked.message), /\.graftconfig and \.graftconfig\.local/);
+      assert.deepEqual(objectResult(tracked.details).hooks,
+        [...described(changed), { name: 'notify', ...local.notify, file: LOCAL }]);
+      ctx.cli(['hook', 'trust']);
+      assert.equal(entries(ctx.spawn('tracked').result).length, 2);
+      ctx.git(['rm', '-q', '--cached', '--', LOCAL]);
+      rmSync(join(ctx.repo, LOCAL));
+    },
+  },
+  {
     name: 'a committed .graftconfig runs its hooks for every graft, and only the primary copy counts',
     run(ctx) {
       const log = join(ctx.root, 'committed.log');
       const setup = { event: 'post-add', argv: fixtureArgv(ctx, 'clean', log) };
       writeFileSync(join(ctx.repo, SHARED), JSON.stringify({ hooks: { setup } }));
       commit(ctx, ctx.repo, 'Configure Graft');
+      ctx.cli(['hook', 'trust']);
       const child = ctx.spawn('child');
       assert.deepEqual(entries(child.result), [ran('post-add', 'clean child', 'setup')]);
       assert(existsSync(join(child.path, SHARED)), 'the graft has its own copy of the committed file');
@@ -651,7 +739,7 @@ export const cases: Scenario[] = [
       const guard = { event: 'pre-archive', argv: fixtureArgv(ctx, 'fail', log) };
       writeFileSync(join(child.path, SHARED), JSON.stringify({ hooks: { setup, guard } }));
       commit(ctx, child.path, 'Guard archives');
-      assert.deepEqual(ctx.cli(['hook', 'list'], child.path).hooks, [{ name: 'setup', ...setup, file: SHARED }]);
+      assert.deepEqual(ctx.cli(['hook', 'list'], child.path).hooks, [{ name: 'setup', ...setup, file: SHARED, trusted: true }]);
       const grandchild = ctx.spawn('grandchild', [], child.path);
       assert.deepEqual(entries(grandchild.result), [ran('post-add', 'clean grandchild', 'setup')]);
       ctx.cli(['remove', 'grandchild', '--lease', grandchild.lease]);
@@ -660,7 +748,15 @@ export const cases: Scenario[] = [
       assert(!('hooks' in merged));
       assert.deepEqual(runs(log).map((item) => item.action), ['clean', 'clean']);
 
-      // Once merged into the primary, the new hook runs for later grafts.
+      // Once merged into the primary, the new hook needs trust: until then no
+      // command that would run the primary's hooks goes ahead.
+      const untrusted = ctx.fail(['add', 'later']);
+      assert.equal(untrusted.code, 'hooks_untrusted');
+      assert.match(String(untrusted.message), /changed since they were last trusted/);
+      assert.deepEqual(objectResult(untrusted.details).hooks,
+        [{ name: 'setup', ...setup, file: SHARED }, { name: 'guard', ...guard, file: SHARED }]);
+      assert.deepEqual(runs(log).map((item) => item.action), ['clean', 'clean']);
+      ctx.cli(['hook', 'trust']);
       const later = ctx.spawn('later');
       const refused = ctx.fail(['remove', 'later', '--lease', later.lease]);
       assert.equal(refused.code, 'hook_failed');
@@ -732,6 +828,29 @@ export const cases: Scenario[] = [
         assert(existsSync(String(guarded.path)));
         assert.equal((await call(client, 'graft_status', { name: 'refused' })).phase, 'ready');
       });
+    },
+  },
+  {
+    name: 'an MCP host cannot trust hooks, and one with --allow-exec refuses untrusted hooks',
+    async run(ctx) {
+      const log = join(ctx.root, 'mcp-trust.log');
+      writeConfig(ctx, SHARED, { setup: { event: 'post-add', argv: fixtureArgv(ctx, 'prepare', log) } }, false);
+      await withClient(ctx, true, async (client) => {
+        await initialize(client);
+        const tools = await discover(client, true, true);
+        assert.deepEqual([...tools.keys()].filter((name) => /trust|hook/.test(name)), []);
+        const refused = await call(client, 'graft_add', { name: 'agent' }, true);
+        assert.equal(refused.code, 'hooks_untrusted');
+        assert.match(String(refused.message), /No MCP tool can trust hooks/);
+        assert.equal(objectResult(refused.details).command, 'git graft hook trust');
+      }, true);
+      // A host that runs no hooks has nothing to refuse.
+      await withClient(ctx, false, async (client) => {
+        await initialize(client);
+        const added = await call(client, 'graft_add', { name: 'agent' });
+        assert.equal(entries(added)[0].status, 'skipped');
+      });
+      assert.deepEqual(runs(log), []);
     },
   },
 ];
