@@ -28,6 +28,12 @@ pub(crate) fn start_time(pid: u32) -> Option<String> {
     // SAFETY: `info` is a writable buffer of `size` bytes for the call.
     let written =
         unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    if written <= 0 {
+        // Another user's process cannot be inspected, but it is running:
+        // as elsewhere, only whether the ID is in use can be told.
+        let denied = std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        return denied.then(String::new);
+    }
     if written != size || info.pbi_status == libc::SZOMB {
         return None;
     }
@@ -106,5 +112,15 @@ mod tests {
             assert!(!alive(pid, &format!("{start}-earlier")));
         }
         assert_eq!(start_time(u32::MAX), None);
+    }
+
+    /// Process 1, the system's first process, runs as the superuser. When
+    /// the tests do not, it is another user's process, which may not be
+    /// inspectable but is still running.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn another_user_s_process_is_alive() {
+        let start = start_time(1).expect("process 1 is running");
+        assert!(alive(1, &start));
     }
 }
