@@ -403,7 +403,7 @@ If the destination branch moved or is no longer checked out, the update can no l
 
 ## Push to a remote
 
-A graft has no remotes of its own. `push` sends its commits to a remote of the primary repository without merging them into a local branch:
+A graft has no remotes of its own unless the configuration [names some](#remotes-in-a-graft). `push` sends its commits to a remote of the primary repository without merging them into a local branch:
 
 ```sh
 git graft push task --lease "<lease>"
