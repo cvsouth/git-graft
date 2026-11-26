@@ -21,12 +21,13 @@
 //! Both files are read from the primary checkout or a directory above it,
 //! never from a graft, so what a graft changes in its own copy does not
 //! change what Graft runs.
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde::de::{self, MapAccess, Visitor};
 use serde_json::{Value, json};
@@ -39,6 +40,13 @@ pub(crate) const SHARED: &str = ".graftconfig";
 pub(crate) const LOCAL: &str = ".graftconfig.local";
 const MAX_BYTES: u64 = 1024 * 1024;
 const MAX_NAME_BYTES: usize = 64;
+/// Whether Graft checks who owns a configuration file above the checkout.
+/// Where it does not, on Windows, a hook from such a file needs trust whether
+/// Git tracks the file or not.
+pub(crate) const OWNER_CHECKED: bool = cfg!(unix);
+/// Whether paths that differ only in case name the same file, as they do on
+/// the default filesystems of macOS and Windows.
+const FOLD_CASE: bool = cfg!(any(windows, target_os = "macos"));
 
 /// A hook as the configuration defines it: the program and arguments to run
 /// for an event, and the file that defined it.
@@ -87,6 +95,12 @@ pub(crate) struct Config {
     /// the primary checkout or a directory above it. `None` when there are
     /// no files.
     pub dir: Option<PathBuf>,
+    /// Whether that directory is above the primary checkout.
+    pub above: bool,
+    /// Each key under `repositories` in those files that names no repository
+    /// below the directory, with the file that has it, so that a mistyped
+    /// path can be reported rather than configure nothing unnoticed.
+    pub missing_repositories: Vec<Value>,
 }
 
 impl Config {
@@ -106,12 +120,14 @@ impl Config {
                 local: LOCAL.to_owned(),
                 dir: None,
             };
-            let config = merge(
+            let missing = missing(primary, &shared, &local, &names);
+            let mut config = merge(
                 shared.map(|file| file.own),
                 local.map(|file| file.own),
                 &names,
             )?;
-            return Ok(config.placed(primary));
+            config.missing_repositories = missing;
+            return Ok(config.placed(primary, false));
         }
         for (depth, dir) in primary.ancestors().enumerate().skip(1) {
             if !(present(dir, SHARED) || present(dir, LOCAL)) {
@@ -126,22 +142,26 @@ impl Config {
                 local: format!("{up}{LOCAL}"),
                 dir: Some(dir),
             };
-            let config = merge(
+            let missing = missing(dir, &shared, &local, &names);
+            let mut config = merge(
                 shared.and_then(|file| file.section(&key)),
                 local.and_then(|file| file.section(&key)),
                 &names,
             )?;
-            return Ok(config.placed(dir));
+            config.missing_repositories = missing;
+            return Ok(config.placed(dir, true));
         }
         Ok(Self::default())
     }
 
-    /// Record `dir` as the directory that holds the files.
-    fn placed(mut self, dir: &Path) -> Self {
+    /// Record `dir` as the directory that holds the files, and whether it is
+    /// above the primary checkout.
+    fn placed(mut self, dir: &Path, above: bool) -> Self {
         for hook in self.hooks.iter_mut().chain(self.defined.iter_mut()) {
             hook.dir = Some(dir.to_owned());
         }
         self.dir = Some(dir.to_owned());
+        self.above = above;
         self
     }
 
@@ -164,6 +184,26 @@ impl Config {
 /// Graft cannot read is reported rather than passed over.
 fn present(dir: &Path, name: &str) -> bool {
     dir.join(name).symlink_metadata().is_ok()
+}
+
+/// The keys under `repositories` in the files `shared` and `local` in `dir`
+/// that name no repository there: no `.git` at that path, as for a bare
+/// repository, which has no configuration either.
+fn missing(
+    dir: &Path,
+    shared: &Option<File>,
+    local: &Option<File>,
+    names: &Names<'_>,
+) -> Vec<Value> {
+    [(shared, &names.shared), (local, &names.local)]
+        .into_iter()
+        .flat_map(|(file, name)| {
+            file.iter()
+                .flat_map(|file| &file.repositories)
+                .filter(|(key, _)| !present(&dir.join(key), ".git"))
+                .map(move |(key, _)| json!({"file": name, "repository": key}))
+        })
+        .collect()
 }
 
 /// The key of the repository at `primary` in the `repositories` object of a
@@ -391,6 +431,8 @@ fn owned(dir: &Path, path: &Path, file: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
+/// Windows is not checked: there a hook from a file above the checkout
+/// needs trust whether Git tracks the file or not (see [`OWNER_CHECKED`]).
 #[cfg(not(unix))]
 fn owned(_: &Path, _: &Path, _: &fs::Metadata) -> Result<()> {
     Ok(())
@@ -427,16 +469,17 @@ fn load(dir: &Path, name: &'static str, above: bool) -> Result<Option<File>> {
         return Err(invalid(&path, "it must hold a JSON object"));
     }
     let parsed: File = serde_json::from_slice(&bytes).map_err(|error| invalid(&path, error))?;
-    check(&parsed, name).map_err(|error| invalid(&path, format!("{error:#}")))?;
+    check(&parsed, name, dir).map_err(|error| invalid(&path, format!("{error:#}")))?;
     Ok(Some(parsed))
 }
 
-/// Refuse what Graft could not use, in every part of the file.
-fn check(file: &File, name: &'static str) -> Result<()> {
+/// Refuse what Graft could not use, in every part of the file `name` in
+/// `dir`.
+fn check(file: &File, name: &'static str, dir: &Path) -> Result<()> {
     check_part(&file.own, name, None)?;
     for (key, part) in &file.repositories {
         check_key(key)?;
-        check_part(part, name, Some(key))
+        check_part(part, name, Some((key, dir)))
             .map_err(|error| anyhow::anyhow!("repository {key:?}: {error:#}"))?;
     }
     Ok(())
@@ -463,9 +506,9 @@ fn check_key(key: &str) -> Result<()> {
 }
 
 /// Refuse a pattern on more than one line, a hook name Graft could not
-/// report plainly, or a program it would not start. `key` names the
-/// repository a part of an enclosing file is for.
-fn check_part(part: &Part, name: &'static str, key: Option<&str>) -> Result<()> {
+/// report plainly, or a program it would not start. `below` names the
+/// repository a part of an enclosing file is for and the file's directory.
+fn check_part(part: &Part, name: &'static str, below: Option<(&str, &Path)>) -> Result<()> {
     if let Some(patterns) = &part.include {
         crate::include::validate(patterns)?;
     }
@@ -479,8 +522,8 @@ fn check_part(part: &Part, name: &'static str, key: Option<&str>) -> Result<()> 
             "hook name {hook:?} must be 1 to {MAX_NAME_BYTES} letters, digits, '-', '_' or '.'"
         );
         match spec {
-            Some(spec) => match key {
-                Some(key) => validate_below(&spec.argv, key),
+            Some(spec) => match below {
+                Some((key, dir)) => validate_below(&spec.argv, key, dir),
                 None => hook::validate(&spec.argv),
             }
             .map_err(|error| anyhow::anyhow!("hook {hook:?}: {error:#}"))?,
@@ -493,11 +536,13 @@ fn check_part(part: &Part, name: &'static str, key: Option<&str>) -> Result<()> 
     Ok(())
 }
 
-/// A hook for a repository below the configuration's directory may also
-/// name its program by a path relative to that directory, as long as the
-/// path stays inside it and outside the repository and its grafts, whose
-/// files a graft's work could change.
-fn validate_below(argv: &[String], key: &str) -> Result<()> {
+/// A hook for a repository below the configuration's directory `dir` may
+/// also name its program by a path relative to that directory, as long as
+/// the path stays inside it and outside the repository `key` and every
+/// directory of grafts, whose files a graft's work could change. Links are
+/// resolved first, and where the filesystem ignores case, so is the
+/// comparison.
+fn validate_below(argv: &[String], key: &str, dir: &Path) -> Result<()> {
     let Some(program) = argv.first().filter(|program| relative_program(program)) else {
         return hook::validate(argv);
     };
@@ -521,14 +566,100 @@ fn validate_below(argv: &[String], key: &str) -> Result<()> {
         .components()
         .filter(|component| matches!(component, Component::Normal(_)))
         .collect();
-    let repository = Path::new(key);
-    let grafts = PathBuf::from(format!("{key}.graft"));
+    let inside_repository = || {
+        anyhow::anyhow!(
+            "the hook program {program:?} is inside the repository {key:?}, \
+             whose files a graft's work can change; keep it outside it"
+        )
+    };
+    let in_grafts = |part: &OsStr| {
+        anyhow::anyhow!(
+            "the hook program {program:?} is inside {:?}, a directory of grafts, \
+             whose files a graft's work can change; keep it outside it",
+            part.to_string_lossy()
+        )
+    };
+    if inside(&normal, Path::new(key), FOLD_CASE) {
+        return Err(inside_repository());
+    }
+    if let Some(part) = normal.iter().find(|part| grafts(part)) {
+        return Err(in_grafts(part));
+    }
+    // A link on the way can lead anywhere, so check where it leads too.
+    let root = resolve(dir)?;
+    let resolved = resolve(&dir.join(&normal))?;
+    let repository = resolve(&dir.join(key))?;
     anyhow::ensure!(
-        !normal.starts_with(repository) && !normal.starts_with(&grafts),
-        "the hook program {program:?} is inside the repository {key:?} or its grafts, \
-         whose files a graft's work can change; keep it outside them"
+        inside(&resolved, &root, FOLD_CASE),
+        "the hook program {program:?} leads outside the configuration's directory, to {}, \
+         through a link; keep it inside the directory",
+        resolved.display()
     );
+    if inside(&resolved, &repository, FOLD_CASE) {
+        return Err(inside_repository());
+    }
+    if let Some(part) = resolved
+        .iter()
+        .skip(root.iter().count())
+        .find(|part| grafts(part))
+    {
+        return Err(in_grafts(part));
+    }
     Ok(())
+}
+
+/// Whether `path` is `base` or inside it, comparing component by component,
+/// and ignoring case when `fold` says the filesystem does.
+fn inside(path: &Path, base: &Path, fold: bool) -> bool {
+    let same = |a: &OsStr, b: &OsStr| {
+        a == b || fold && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    };
+    let mut parts = path.iter();
+    base.iter()
+        .all(|part| parts.next().is_some_and(|own| same(own, part)))
+}
+
+/// Whether the path component `part` names a directory of grafts, which
+/// Graft makes beside a repository as `NAME.graft`, in any case.
+fn grafts(part: &OsStr) -> bool {
+    part.to_string_lossy().to_lowercase().ends_with(".graft")
+}
+
+/// `path` with every link resolved in the part of it that exists: its
+/// nearest existing ancestor made canonical, and the rest appended as
+/// written. A link that leads nowhere is refused, since what it names could
+/// appear later.
+fn resolve(path: &Path) -> Result<PathBuf> {
+    let mut rest = Vec::new();
+    let mut existing = path;
+    loop {
+        match dunce::canonicalize(existing) {
+            Ok(canonical) => {
+                return Ok(rest
+                    .into_iter()
+                    .rev()
+                    .fold(canonical, |path: PathBuf, part| path.join(part)));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                anyhow::ensure!(
+                    existing.symlink_metadata().is_err(),
+                    "{} is a link that leads nowhere",
+                    existing.display()
+                );
+                rest.push(
+                    existing
+                        .file_name()
+                        .with_context(|| format!("no part of {} exists", path.display()))?,
+                );
+                existing = existing
+                    .parent()
+                    .with_context(|| format!("no part of {} exists", path.display()))?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("resolve {}", path.display()));
+            }
+        }
+    }
 }
 
 /// Whether `program` is a path with a directory in it that is not absolute.
@@ -1054,7 +1185,7 @@ mod tests {
             ),
             (
                 r#"{"repositories": {"app": {"hooks": {"a": {"event": "post-add", "argv": ["app.graft/x/setup"]}}}}}"#,
-                "inside the repository",
+                "a directory of grafts",
             ),
             (
                 r#"{"repositories": {"app": {"hooks": {"a": {"event": "post-add", "argv": ["./setup", "nul\u0000"]}}}}}"#,
@@ -1091,6 +1222,128 @@ mod tests {
             config.hooks[0].program.as_deref(),
             Some(root.join("tools").join("setup").as_path())
         );
+    }
+
+    /// The error reading `app`'s configuration gives when the directory's
+    /// `.graftconfig` gives its hook `program`, or `None` if it is accepted.
+    fn refusal(root: &Path, app: &Path, program: &str) -> Option<String> {
+        let argv = json!([program]);
+        write(
+            root,
+            SHARED,
+            &format!(
+                r#"{{"repositories": {{"app": {{"hooks": {{"a": {{"event": "post-add", "argv": {argv}}}}}}}}}}}"#
+            ),
+        );
+        Config::read(app).err().map(|error| {
+            let json = crate::api::error_json(&error);
+            assert_eq!(json["code"], "invalid_config", "{program}");
+            json["message"].as_str().unwrap().to_owned()
+        })
+    }
+
+    #[test]
+    fn a_program_in_the_repository_in_another_case_or_in_any_grafts_is_refused() {
+        let (_tmp, root, app, _api) = enclosing();
+        fs::create_dir_all(root.join("app.graft").join("x")).unwrap();
+        for (program, cause) in [
+            ("APP.graft/x/evil", "a directory of grafts"),
+            ("other.graft/g/evil", "a directory of grafts"),
+            ("./tools/Nested.Graft/evil", "a directory of grafts"),
+            ("app/bin/setup", "inside the repository"),
+        ] {
+            let message = refusal(&root, &app, program).expect(program);
+            assert!(message.contains(cause), "{program}: {message}");
+        }
+        // Where the filesystem ignores case, `App` is the repository.
+        let other_case = refusal(&root, &app, "App/bin/setup");
+        assert_eq!(other_case.is_some(), FOLD_CASE, "{other_case:?}");
+        if let Some(message) = other_case {
+            assert!(message.contains("inside the repository"), "{message}");
+        }
+        // A name that only contains `.graft`, or another repository's
+        // directory, is not refused.
+        assert_eq!(refusal(&root, &app, "tools/x.graft.d/setup"), None);
+        assert_eq!(refusal(&root, &app, "services/setup"), None);
+    }
+
+    #[test]
+    fn paths_are_compared_by_component_and_in_any_case_when_the_filesystem_ignores_it() {
+        let path = Path::new("App").join("bin").join("setup");
+        assert!(inside(&path, Path::new("App"), false));
+        assert!(!inside(&path, Path::new("app"), false));
+        assert!(inside(&path, Path::new("app"), true));
+        assert!(inside(&path, &Path::new("APP").join("BIN"), true));
+        assert!(!inside(Path::new("application"), Path::new("app"), true));
+        assert!(!inside(
+            Path::new("app"),
+            &Path::new("app").join("bin"),
+            true
+        ));
+        assert!(grafts(OsStr::new("x.GRAFT")) && grafts(OsStr::new(".graft")));
+        assert!(!grafts(OsStr::new("x.graft.d")) && !grafts(OsStr::new("graft")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_is_checked_where_its_links_lead() {
+        use std::os::unix::fs::symlink;
+        let (_tmp, root, app, _api) = enclosing();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.join("app.graft").join("x")).unwrap();
+        fs::create_dir(root.join("tools")).unwrap();
+        symlink(&app, root.join("linked")).unwrap();
+        symlink("app.graft", root.join("grafted")).unwrap();
+        symlink(outside.path(), root.join("out")).unwrap();
+        symlink("nowhere", root.join("dangling")).unwrap();
+        symlink("tools", root.join("kept")).unwrap();
+        for (program, cause) in [
+            ("./linked/setup", "inside the repository"),
+            ("./linked", "inside the repository"),
+            ("grafted/x/setup", "a directory of grafts"),
+            ("out/setup", "leads outside the configuration's directory"),
+            ("dangling/setup", "leads nowhere"),
+        ] {
+            let message = refusal(&root, &app, program).expect(program);
+            assert!(message.contains(cause), "{program}: {message}");
+        }
+        // A link that stays inside the directory and outside the repository
+        // is followed, and the hook keeps the path as written.
+        assert_eq!(refusal(&root, &app, "kept/setup"), None);
+        let config = Config::read(&app).unwrap();
+        assert_eq!(
+            config.hooks[0].program.as_deref(),
+            Some(root.join("kept").join("setup").as_path())
+        );
+    }
+
+    #[test]
+    fn keys_that_name_no_repository_are_reported() {
+        let (_tmp, root, app, _api) = enclosing();
+        write(
+            &root,
+            SHARED,
+            r#"{"repositories": {"app": {}, "ap": {"include": [".env"]}, "services": {}, "services/api": {}}}"#,
+        );
+        write(&root, LOCAL, r#"{"repositories": {"services/apl": {}}}"#);
+        let config = Config::read(&app).unwrap();
+        assert_eq!(
+            config.missing_repositories,
+            [
+                json!({"file": "../.graftconfig", "repository": "ap"}),
+                json!({"file": "../.graftconfig", "repository": "services"}),
+                json!({"file": "../.graftconfig.local", "repository": "services/apl"}),
+            ]
+        );
+        // So are those in the checkout's own files, for the repositories
+        // below it.
+        write(&app, SHARED, r#"{"repositories": {"vendor/lib": {}}}"#);
+        let config = Config::read(&app).unwrap();
+        assert_eq!(
+            config.missing_repositories,
+            [json!({"file": SHARED, "repository": "vendor/lib"})]
+        );
+        assert!(!config.above);
     }
 
     #[cfg(unix)]

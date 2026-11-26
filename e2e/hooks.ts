@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { objectResult, parseExact, type Scenario } from './harness.ts';
 import { call, discover, initialize, withClient } from './mcp.ts';
@@ -757,6 +757,8 @@ export const cases: Scenario[] = [
       const listed = (trusted: boolean) => Object.entries(hooks).map(([name, hook]) => (
         { name, ...hook, file, program: join(resolved, 'tools', windows ? 'hook.cmd' : 'hook'), trusted }));
       assert.deepEqual(ctx.cli(['hook', 'list']).hooks, listed(false));
+      // A key that names no repository configures nothing, and is reported.
+      assert.deepEqual(ctx.cli(['hook', 'list']).missing_repositories, [{ file, repository: 'elsewhere' }]);
       assert.deepEqual(objectResult(ctx.cli(['local-files']).defaults), { patterns: ['secret.env'], files: [file] });
 
       // A file above is shared like the primary's own: its hooks need trust.
@@ -788,8 +790,27 @@ export const cases: Scenario[] = [
       const removed = ctx.cli(['remove', 'above', '--lease', added.lease]);
       assert.deepEqual(entries(removed), [ran('pre-archive', 'clean above', 'clean', file)]);
 
-      // A program that leaves the directory or names the primary's own files is refused.
-      for (const argv of [['../outside'], ['./project/hook'], ['project.graft/above/hook']]) {
+      // An untracked .graftconfig.local above is the person's own where Graft
+      // checks who owns it. Windows does not, so there its hooks need trust.
+      writeFileSync(join(ctx.root, LOCAL), JSON.stringify({ repositories: { project: { hooks: {
+        mine: { event: 'post-add', argv: [program, 'prepare', log] } } } } }));
+      const mine = () => entries(ctx.cli(['hook', 'list'])).find((hook) => hook.name === 'mine');
+      assert.equal(mine()?.trusted, !windows);
+      if (windows) {
+        assert.equal(ctx.fail(['add', 'mine']).code, 'hooks_untrusted');
+        ctx.cli(['hook', 'trust']);
+        assert.equal(mine()?.trusted, true);
+      }
+      rmSync(join(ctx.root, LOCAL));
+
+      // A program that leaves the directory, names the primary's own files or
+      // any grafts, directly, in another case where the filesystem ignores
+      // case, or through a link, is refused.
+      symlinkSync(ctx.repo, join(ctx.root, 'linked'), 'junction');
+      const refusals = [['../outside'], ['./project/hook'], ['project.graft/above/hook'], ['PROJECT.graft/above/hook'],
+        ['other.graft/g/hook'], ['./linked/hook']];
+      if (windows || process.platform === 'darwin') refusals.push(['./Project/hook']);
+      for (const argv of refusals) {
         writeFileSync(join(ctx.root, SHARED), JSON.stringify({ repositories: { project: { hooks: { bad: { event: 'post-add', argv } } } } }));
         const error = ctx.fail(['hook', 'list']);
         assert.equal(error.code, 'invalid_config', argv[0]);

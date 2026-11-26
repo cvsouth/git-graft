@@ -4,15 +4,17 @@
 //! person has run `git graft hook trust`. That command records a digest of
 //! every hook those files define, by event, name and program with arguments,
 //! in the project's Graft state. A program named by a path relative to the
-//! configuration's directory is part of what is trusted, contents included. A command that would run one of them refuses
-//! with `hooks_untrusted` until the digest matches, and again after any
-//! change. What an untracked `.graftconfig.local` adds, replaces or turns off
-//! is the person's own and needs no trust. No MCP tool records trust, so an
-//! agent cannot approve its own hook.
+//! configuration's directory is part of what is trusted, contents included.
+//! A command that would run one of them refuses with `hooks_untrusted` until
+//! the digest matches, and again after any change. What an untracked
+//! `.graftconfig.local` adds, replaces or turns off is the person's own and
+//! needs no trust, except one in a directory above the checkout on Windows,
+//! where Graft cannot check that the person owns it. No MCP tool records
+//! trust, so an agent cannot approve its own hook.
 
 use crate::{
     api,
-    config::{Config, Hook, LOCAL},
+    config::{Config, Hook, LOCAL, OWNER_CHECKED},
     registry::{self, Project},
 };
 use anyhow::{Context, Result};
@@ -44,11 +46,20 @@ pub(crate) struct Gate {
 
 impl Gate {
     /// `.graftconfig` always does, and `.graftconfig.local` when Git tracks
-    /// it in the repository whose working tree holds it. Git is asked only
-    /// when the local file defines a hook.
+    /// it in the repository whose working tree holds it, or when it is in a
+    /// directory above the checkout and Graft does not check who owns it.
+    /// Git is asked only when the local file defines a hook.
     pub(crate) fn of(config: &Config) -> Result<Self> {
+        Self::with_owner_check(config, OWNER_CHECKED)
+    }
+
+    /// [`Self::of`], as on a platform that checks the owner of a file above
+    /// the checkout when `owner_checked` is set.
+    fn with_owner_check(config: &Config, owner_checked: bool) -> Result<Self> {
         let local = match &config.dir {
-            Some(dir) if config.defined.iter().any(|hook| hook.local) => tracked(dir, LOCAL)?,
+            Some(dir) if config.defined.iter().any(|hook| hook.local) => {
+                (config.above && !owner_checked) || tracked(dir, LOCAL)?
+            }
             _ => false,
         };
         Ok(Self { local })
@@ -282,6 +293,9 @@ mod tests {
         // shared definitions, and so their trust, as they were.
         let untracked = Gate::of(&config)?;
         assert!(!untracked.local);
+        // The checkout's own file needs no owner check, on any platform.
+        assert!(!config.above);
+        assert!(!Gate::with_owner_check(&config, false)?.local);
         assert_eq!(
             names(untracked.hooks(&config)),
             [
@@ -360,15 +374,29 @@ mod tests {
         let local = r#"{"repositories": {"app": {"hooks": {"setup": {"event": "post-add", "argv": ["./scripts/setup"]}}}}}"#;
         fs::write(root.join(LOCAL), local)?;
 
-        // Outside any working tree, the local file is the person's own.
+        // Outside any working tree, the local file is the person's own,
+        // where Graft checks that the person owns it.
         let config = Config::read(&app)?;
-        assert!(!Gate::of(&config)?.local);
-        assert!(Gate::of(&config)?.hooks(&config).is_empty());
+        assert!(config.above);
+        assert!(!Gate::with_owner_check(&config, true)?.local);
+        assert!(
+            Gate::with_owner_check(&config, true)?
+                .hooks(&config)
+                .is_empty()
+        );
+        // Where it does not, as on Windows, the hook needs trust.
+        assert!(Gate::with_owner_check(&config, false)?.local);
+        assert_eq!(
+            Gate::with_owner_check(&config, false)?.hooks(&config).len(),
+            1
+        );
+        assert_eq!(Gate::of(&config)?.local, !OWNER_CHECKED);
 
         // Once the directory's own repository tracks it, it needs trust.
         crate::git::bytes(&root, &["init", "-q", "--template="])?;
-        assert!(!Gate::of(&config)?.local);
+        assert!(!Gate::with_owner_check(&config, true)?.local);
         crate::git::bytes(&root, &["add", "--", LOCAL])?;
+        assert!(Gate::with_owner_check(&config, true)?.local);
         let gate = Gate::of(&config)?;
         assert!(gate.local);
         let gated = gate.hooks(&config);

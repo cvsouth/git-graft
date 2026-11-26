@@ -69,12 +69,13 @@ stdout and stderr. A pre-archive hook that fails stops remove, merge and prune
 from archiving the graft, and can run more than once for the same graft.
 
 A hook in .graftconfig, or in .graftconfig.local once Git tracks that file,
-comes with the repository, so it runs only after git graft hook trust. Trust
-covers a program named relative to a directory above the checkout by its
-contents too. Until
-then, and again after any change to those hooks, add, remove, merge, prune
---apply and restore refuse with hooks_untrusted before changing anything.
-There is no MCP tool that trusts hooks.")]
+comes with the repository, so it runs only after git graft hook trust. So
+does every hook from a directory above the checkout on Windows, which does not
+check who owns that directory's files. Trust covers a program named relative
+to a directory above the checkout by its contents too. Until then, and again
+after any change to those hooks, add, remove, merge, prune --apply and restore
+refuse with hooks_untrusted before changing anything. There is no MCP tool
+that trusts hooks.")]
     Hook(HookArgs),
     /// Merge a graft's commits into a local branch, then archive the graft.
     #[command(after_help = "\

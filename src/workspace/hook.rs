@@ -91,7 +91,8 @@ fn is_bare_name(program: &str) -> bool {
 /// The effective hooks of the project whose primary checkout is `primary`,
 /// in the order they run, with the file each came from and whether it may
 /// run as trust stands in the Graft state directory `state`, which need not
-/// exist.
+/// exist. Keys under `repositories` that name no repository are reported in
+/// `missing_repositories`, when there are any.
 pub(crate) fn list(primary: &Path, state: &Path) -> Result<Value> {
     let config = Config::read(primary)?;
     let gate = trust::Gate::of(&config)?;
@@ -105,7 +106,11 @@ pub(crate) fn list(primary: &Path, state: &Path) -> Result<Value> {
             described
         })
         .collect();
-    Ok(json!({ "hooks": hooks }))
+    let mut listed = json!({ "hooks": hooks });
+    if !config.missing_repositories.is_empty() {
+        listed["missing_repositories"] = json!(config.missing_repositories);
+    }
+    Ok(listed)
 }
 
 /// The graft a hook runs in, as the hook's environment describes it.
