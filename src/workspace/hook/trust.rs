@@ -12,17 +12,19 @@
 //! where Graft cannot check that the person owns it. No MCP tool records
 //! trust, so an agent cannot approve its own hook.
 //!
-//! The `remotes` those files list need trust by the same rule, as the files
-//! write them: a remote they name gives every graft a URL that `git fetch`
-//! and `git push` use. `git graft hook trust` records their digest beside
-//! the hooks' digest, which stays what it was, and the two are compared
+//! The `remotes` those files list need trust by the same rule: a remote they
+//! name gives every graft a URL that `git fetch` and `git push` use. Trust
+//! covers the remotes a graft would get from them, each with the file that
+//! brings it, so the same entries arranged to bring another remote need
+//! trust again. `git graft hook trust` records that digest beside the hooks'
+//! digest, which stays what it was, and the two are compared
 //! apart, so a change to the remotes does not stop a hook and a change to a
 //! hook does not hold back a remote. Until they are trusted, `add` and
 //! `restore` leave them out of the graft and report them as skipped.
 
 use crate::{
     api,
-    config::{Config, Hook, LOCAL, OWNER_CHECKED, Remote},
+    config::{Config, Hook, LOCAL, OWNER_CHECKED},
     registry::{self, Project},
 };
 use anyhow::{Context, Result};
@@ -82,13 +84,23 @@ impl Gate {
         Ok(Self { local })
     }
 
-    /// The entries of the `remotes` lists that need trust, as the files
-    /// write them.
-    pub(crate) fn remotes<'a>(&self, config: &'a Config) -> Vec<&'a Remote> {
+    /// The remotes a graft gets that need trust, in the order it gets them,
+    /// each as a pair of a file that needs trust and lists it and its name:
+    /// one pair for each such file that lists it. This is what trust covers,
+    /// so a change to what a graft would get, or to which file brings it,
+    /// needs trust again.
+    pub(crate) fn remotes<'a>(&self, config: &'a Config) -> Vec<(&'a str, &'a str)> {
         config
-            .listed_remotes
+            .remotes
             .iter()
-            .filter(|remote| !remote.local || self.local)
+            .filter(|name| self.remote_needs_trust(config, name))
+            .flat_map(|name| {
+                config
+                    .listed_remotes
+                    .iter()
+                    .filter(move |remote| remote.name == *name && (!remote.local || self.local))
+                    .map(|remote| (remote.file.as_str(), remote.name.as_str()))
+            })
             .collect()
     }
 
@@ -210,27 +222,34 @@ pub(crate) fn is_trusted(state: &Path, hooks: &[&Hook]) -> Result<bool> {
     Ok(recorded(state)?.is_some_and(|record| record.sha256 == digest(hooks)))
 }
 
-/// The digest of the entries of the `remotes` lists that need trust,
-/// `remotes`, in order. It is recorded apart from the hooks' digest, so a
-/// change to one leaves the trust of the other as it was.
-fn remotes_digest(remotes: &[&str]) -> String {
+/// The digest of the remotes that need trust, `remotes`, as
+/// [`Gate::remotes`] gives them: (file, name) pairs, in order. It is recorded
+/// apart from the hooks' digest, so a change to one leaves the trust of the
+/// other as it was.
+fn remotes_digest(remotes: &[(&str, &str)]) -> String {
     let bytes = serde_json::to_vec(remotes).expect("remote names serialize");
     hex(&Sha256::digest(&bytes))
 }
 
-/// The names of the `remotes` entries the gate says need trust.
-fn remote_names<'a>(remotes: &[&'a Remote]) -> Vec<&'a str> {
-    remotes.iter().map(|remote| remote.name.as_str()).collect()
+/// The names in `remotes`, each once, in order.
+fn remote_names<'a>(remotes: &[(&'a str, &'a str)]) -> Vec<&'a str> {
+    let mut names: Vec<&str> = Vec::new();
+    for (_, name) in remotes {
+        if !names.contains(name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// Whether the remotes that need trust, `remotes`, are the ones the record
 /// in `state` trusts. With none, there is nothing to trust. `state` need not
 /// exist.
-pub(crate) fn remotes_trusted(state: &Path, remotes: &[&Remote]) -> Result<bool> {
+pub(crate) fn remotes_trusted(state: &Path, remotes: &[(&str, &str)]) -> Result<bool> {
     if remotes.is_empty() {
         return Ok(true);
     }
-    let sha256 = remotes_digest(&remote_names(remotes));
+    let sha256 = remotes_digest(remotes);
     Ok(recorded(state)?.is_some_and(|record| record.remotes_sha256.as_ref() == Some(&sha256)))
 }
 
@@ -243,16 +262,11 @@ pub(crate) fn untrusted_remotes(p: &Project, config: &Config) -> Result<Vec<Stri
         return Ok(Vec::new());
     }
     let gate = Gate::of(config)?;
-    let due: Vec<String> = config
-        .remotes
-        .iter()
-        .filter(|name| gate.remote_needs_trust(config, name))
-        .cloned()
-        .collect();
-    if due.is_empty() || remotes_trusted(&p.state, &gate.remotes(config))? {
+    let due = gate.remotes(config);
+    if remotes_trusted(&p.state, &due)? {
         return Ok(Vec::new());
     }
-    Ok(due)
+    Ok(remote_names(&due).into_iter().map(str::to_owned).collect())
 }
 
 /// Refuse with `hooks_untrusted` when a caller that runs hooks would run one
@@ -307,12 +321,13 @@ pub(crate) fn trust(p: &Project) -> Result<Value> {
     let config = Config::read(&p.repo)?;
     let gate = Gate::of(&config)?;
     let gated = gate.hooks(&config);
-    let names = remote_names(&gate.remotes(&config));
+    let due = gate.remotes(&config);
+    let names = remote_names(&due);
     let hooks: Vec<Value> = gated.iter().map(|hook| hook.describe()).collect();
     let record = Record {
         sha256: digest(&gated),
         hooks: hooks.clone(),
-        remotes_sha256: (!names.is_empty()).then(|| remotes_digest(&names)),
+        remotes_sha256: (!due.is_empty()).then(|| remotes_digest(&due)),
         remotes: names.iter().map(|name| (*name).to_owned()).collect(),
     };
     registry::atomic(&p.state.join(FILE), &serde_json::to_vec_pretty(&record)?)?;
@@ -552,13 +567,14 @@ mod tests {
         // The digest of this hook before remotes could be listed.
         let before = "20929a4647d06e48cf9bd23c16711e8ea45e95d49a9ef68bfe255aa7bf59cbd0";
         assert_eq!(digest(&[&a]), before);
-        let origin = remotes_digest(&["origin"]);
+        let origin = remotes_digest(&[(SHARED, "origin")]);
         assert_eq!(origin.len(), 64);
         for changed in [
-            remotes_digest(&["upstream"]),
-            remotes_digest(&["origin", "upstream"]),
-            remotes_digest(&["upstream", "origin"]),
-            remotes_digest(&["!origin"]),
+            remotes_digest(&[(SHARED, "upstream")]),
+            remotes_digest(&[(LOCAL, "origin")]),
+            remotes_digest(&[(SHARED, "origin"), (LOCAL, "origin")]),
+            remotes_digest(&[(SHARED, "origin"), (SHARED, "upstream")]),
+            remotes_digest(&[(SHARED, "upstream"), (SHARED, "origin")]),
             remotes_digest(&[]),
         ] {
             assert_ne!(changed, origin);
@@ -577,17 +593,18 @@ mod tests {
         let names = |gate: &Gate| remote_names(&gate.remotes(&config)).join(" ");
 
         // An untracked local file is the person's own: what it lists needs
-        // no trust, and what it removes leaves the shared list's trust alone.
+        // no trust, and what it removes no graft gets, so nothing needs it.
         let untracked = Gate::of(&config)?;
         assert!(!untracked.local);
-        assert_eq!(names(&untracked), "origin");
+        assert_eq!(names(&untracked), "");
         assert!(!untracked.remote_needs_trust(&config, "fork"));
         assert!(untracked.remote_needs_trust(&config, "origin"));
 
         crate::git::bytes(primary, &["add", "--", LOCAL])?;
         let tracked = Gate::of(&config)?;
         assert!(tracked.local);
-        assert_eq!(names(&tracked), "origin fork !origin");
+        assert_eq!(names(&tracked), "fork");
+        assert_eq!(tracked.remotes(&config), [(LOCAL, "fork")]);
         assert!(tracked.remote_needs_trust(&config, "fork"));
 
         // The remotes' trust is recorded and compared apart from the hooks'.
@@ -599,12 +616,12 @@ mod tests {
         let record = Record {
             sha256: digest(&[]),
             hooks: Vec::new(),
-            remotes_sha256: Some(remotes_digest(&remote_names(&remotes))),
+            remotes_sha256: Some(remotes_digest(&remotes)),
             remotes: Vec::new(),
         };
         fs::write(state.join(FILE), serde_json::to_vec(&record)?)?;
         assert!(remotes_trusted(&state, &remotes)?);
-        assert!(!remotes_trusted(&state, &remotes[..1])?);
+        assert!(!remotes_trusted(&state, &[(SHARED, "fork")])?);
         assert!(is_trusted(&state, &[])?);
         // A record made before remotes could be listed trusts none.
         fs::write(state.join(FILE), r#"{"sha256": "x", "hooks": []}"#)?;
@@ -640,6 +657,50 @@ mod tests {
         assert!(unchecked.local);
         assert_eq!(remote_names(&unchecked.remotes(&config)), ["origin"]);
         assert!(unchecked.remote_needs_trust(&config, "origin"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_to_what_a_graft_gets_or_to_the_file_that_brings_it_needs_trust_again() -> Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let primary = tmp.path();
+        crate::git::bytes(primary, &["init", "-q", "--template="])?;
+        let due = |shared: &str, local: &str| -> Result<(Vec<String>, String)> {
+            fs::write(primary.join(SHARED), shared)?;
+            fs::write(primary.join(LOCAL), local)?;
+            crate::git::bytes(primary, &["add", "--", SHARED, LOCAL])?;
+            let config = Config::read(primary)?;
+            let remotes = Gate::of(&config)?.remotes(&config);
+            Ok((config.remotes.clone(), remotes_digest(&remotes)))
+        };
+        // The review's case: `a` removed by the tracked local file, then
+        // listed again once the `!a` moves.
+        let (remotes, trusted) = due(r#"{"remotes": ["a"]}"#, r#"{"remotes": ["!a", "b"]}"#)?;
+        assert_eq!(remotes, ["b"]);
+        // `!` in .graftconfig is refused, so the change as the review made
+        // it reads as an invalid configuration.
+        fs::write(primary.join(SHARED), r#"{"remotes": ["a", "!a"]}"#)?;
+        let error = Config::read(primary).unwrap_err();
+        assert_eq!(crate::api::error_json(&error)["code"], "invalid_config");
+        // Every way the same entries can bring `a` back changes the digest.
+        for (shared, local) in [
+            (r#"{"remotes": ["a"]}"#, r#"{"remotes": ["b"]}"#),
+            (r#"{"remotes": []}"#, r#"{"remotes": ["a", "b"]}"#),
+        ] {
+            let (remotes, changed) = due(shared, local)?;
+            assert!(remotes.contains(&"a".to_owned()), "{shared} {local}");
+            assert_ne!(changed, trusted, "{shared} {local}");
+        }
+        // So does moving `b` from one file to the other.
+        let (remotes, moved) = due(r#"{"remotes": ["b"]}"#, r#"{"remotes": []}"#)?;
+        assert_eq!(remotes, ["b"]);
+        assert_ne!(moved, trusted);
+        // And the same remotes from the same files keep it.
+        assert_eq!(
+            due(r#"{"remotes": ["a"]}"#, r#"{"remotes": ["!a", "b"]}"#)?.1,
+            trusted
+        );
         Ok(())
     }
 }

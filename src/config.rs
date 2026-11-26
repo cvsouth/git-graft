@@ -690,6 +690,10 @@ fn check_part(part: &Part, name: &'static str, below: Option<(&str, &Path)>) -> 
     for remote in part.remotes.iter().flatten() {
         let bare = remote.strip_prefix('!').unwrap_or(remote);
         anyhow::ensure!(
+            name == LOCAL || bare == remote,
+            "remote {remote:?} starts with '!', which removes a shared remote and belongs in {LOCAL}"
+        );
+        anyhow::ensure!(
             !bare.is_empty()
                 && bare.len() <= MAX_NAME_BYTES
                 && !bare.starts_with(['-', '.'])
@@ -1812,6 +1816,26 @@ mod tests {
             r#"{"remotes": "origin"}"#,
         ] {
             write(&root, LOCAL, bad);
+            let error = Config::read(&app).unwrap_err();
+            assert_eq!(
+                crate::api::error_json(&error)["code"],
+                "invalid_config",
+                "{bad}"
+            );
+        }
+        // `!name` removes a shared remote, so only the local file may say it.
+        write(&root, LOCAL, "{}");
+        for (file, bad) in [
+            (
+                SHARED,
+                r#"{"repositories": {"app": {"remotes": ["!origin"]}}}"#,
+            ),
+            (
+                SHARED,
+                r#"{"repositories": {"app": {"remotes": ["origin", "!origin"]}}}"#,
+            ),
+        ] {
+            write(&root, file, bad);
             let error = Config::read(&app).unwrap_err();
             assert_eq!(
                 crate::api::error_json(&error)["code"],
