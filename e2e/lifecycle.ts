@@ -556,18 +556,19 @@ export const cases: Scenario[] = [
       const blocked = join(archives, `.purging-${String(gone.result.id)}`);
       if (process.platform !== 'win32') {
         writeFileSync(blocked, '');
-        const applied = ctx.cli(['prune', '--apply', '--purge-archives', '0']);
+        // The command fails, and its error carries the whole reply.
+        const failed = ctx.fail(['prune', '--apply', '--purge-archives', '0']);
+        assert.equal(failed.code, 'purge_failed');
+        const applied = objectResult(failed.details);
+        assert.equal(applied.applied, true);
         assert.equal(reasons(applied).idle, 'archived');
-        const report = objectResult(applied.archives);
-        assert.equal(typeof report.error, 'string');
-        assert.deepEqual(report.purged, []);
+        assert.deepEqual(objectResult(applied.archives).purged, []);
         assert.ok(existsSync(join(archives, String(gone.result.id))));
         unlinkSync(blocked);
         ctx.cli(['restore', 'idle', '--lease', idle.lease]);
       }
       const applied = ctx.cli(['prune', '--apply', '--purge-archives', '0']);
       const report = objectResult(applied.archives);
-      assert.equal('error' in report, false);
       assert.deepEqual(array(report.purged).map(object).map(item => item.name), ['gone']);
       assert.equal(readFileSync(stray, 'utf8'), 'not an archive');
     },

@@ -1159,6 +1159,7 @@ pub(crate) fn run_found(
             } else {
                 engine::gc::purge_caches(p, a.apply)?
             };
+            let mut failed = None;
             let archives = match purge {
                 None => json!({"requested": false, "purged": []}),
                 Some(purge) => {
@@ -1168,12 +1169,8 @@ pub(crate) fn run_found(
                         "purged": purge.report(),
                     });
                     if a.apply {
-                        // Prune has archived grafts by now. A purge that
-                        // fails is reported beside them, not instead.
                         let mut purged = Vec::new();
-                        if let Err(error) = registry::purge_archives(p, &purge, &mut purged) {
-                            archives["error"] = json!(format!("{error:#}"));
-                        }
+                        failed = registry::purge_archives(p, &purge, &mut purged).err();
                         archives["purged"] = json!(purged);
                     }
                     archives
@@ -1182,6 +1179,17 @@ pub(crate) fn run_found(
             let mut pruned =
                 json!({"applied":a.apply,"retained":retained,"cache":cache,"archives":archives});
             with_damaged(p, &mut pruned)?;
+            // Prune has archived grafts by now, so a purge that fails carries
+            // the whole reply, with the archives it did delete.
+            if let Some(error) = failed {
+                return Err(api::fault(
+                    "purge_failed",
+                    format!(
+                        "The purge of archives did not complete: {error:#}. details has the prune reply, and details.archives.purged lists the archives deleted before the failure"
+                    ),
+                    pruned,
+                ));
+            }
             return Ok(pruned);
         }
         Command::Env(a) => {
