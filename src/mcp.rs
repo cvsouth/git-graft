@@ -137,7 +137,7 @@ impl ServerHandler for Server {
         } else {
             "Pushing a graft's commits to a remote is disabled; the host must start with --allow-push to enable it. A remote the remotes array of a graft_add or graft_restore result reports can fetch, but Git refuses to push through it."
         };
-        let remotes = "The project's .graftconfig and .graftconfig.local can name remotes of the primary that every new graft gets; the remotes array of a graft_add or graft_restore result reports each. Remotes that come with the repository are set up only once the user has trusted them in a terminal; until then graft_add and graft_restore fail with hooks_untrusted, which you report to the user and must not try to get past.";
+        let remotes = "The project's .graftconfig and .graftconfig.local can name remotes of the primary that every new graft gets; the remotes array of a graft_add or graft_restore result reports each. Remotes that come with the repository are set up only once the user has trusted them in a terminal; until then graft_add and graft_restore leave them out and report them as skipped with reason untrusted, which you report to the user if the task needs them and must not try to get past.";
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),

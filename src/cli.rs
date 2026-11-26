@@ -80,8 +80,9 @@ after any change to those hooks, add, remove, merge, prune --apply and restore
 refuse with hooks_untrusted before changing anything.
 
 The remotes those files list under \"remotes\", which every new graft gets,
-are trusted with the hooks, by the same rule: until then, and after any change
-to them, add and restore refuse with hooks_untrusted. There is no MCP tool that
+need trust by the same rule, recorded apart from the hooks: until then, and
+after any change to them, add and restore leave them out of the graft and
+report them as skipped with the reason untrusted. There is no MCP tool that
 trusts hooks or remotes.")]
     Hook(HookArgs),
     /// Merge a graft's commits into a local branch, then archive the graft.

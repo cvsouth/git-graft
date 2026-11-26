@@ -162,7 +162,8 @@ fn spawn(
     // hooks never ran or that copied the wrong files.
     let config = Config::read(&p.repo)?;
     hook::trust::require(p, &config, hook::Event::PostAdd, hooks)?;
-    hook::trust::require_remotes(p, &config, hook::Event::PostAdd)?;
+    // Remotes that need trust they lack are left out, not refused.
+    let untrusted = hook::trust::untrusted_remotes(p, &config)?;
     let include = if populated {
         include::select(args.include.as_deref(), &config)?
     } else {
@@ -341,7 +342,7 @@ fn spawn(
         ));
     }
     let mut reply = with_leftovers(p, &r)?;
-    with_remotes(p, &r, &config, history, pushing, &mut reply);
+    with_remotes(p, &r, &config, &untrusted, history, pushing, &mut reply);
     if post_add.is_empty() {
         return Ok(reply);
     }
@@ -355,12 +356,14 @@ fn spawn(
 /// Give the graft `r` the remotes `config` names, and report them in `reply`
 /// as `remotes`. The graft is usable either way, so a remote that fails is
 /// reported by name, not returned. Remote-tracking refs are copied only with
-/// local history, which already holds their objects. `pushing` says whether
+/// local history, which already holds their objects. The remotes in
+/// `untrusted` need trust they lack and are left out. `pushing` says whether
 /// the caller may push through them.
 fn with_remotes(
     p: &Project,
     r: &Record,
     config: &Config,
+    untrusted: &[String],
     history: api::History,
     pushing: Pushing,
     reply: &mut Value,
@@ -373,6 +376,7 @@ fn with_remotes(
         &p.repo,
         &r.path,
         &config.remotes,
+        untrusted,
         copy,
         pushing
     ));
@@ -1153,12 +1157,13 @@ pub(crate) fn run_found(
             let mut hooks = hook::Runner::new(hooks, &lock, builds);
             let post_restore = hooks.hooks(p, hook::Event::PostRestore)?;
             let config = Config::read(&p.repo)?;
-            hook::trust::require_remotes(p, &config, hook::Event::PostRestore)?;
+            let untrusted = hook::trust::untrusted_remotes(p, &config)?;
             let (r, reopened) = registry::restore_locked(p, &a.name, &a.lease)?;
             let mut reply = with_leftovers(p, &r)?;
             // An archive made before the configuration named remotes gets them now.
             if reopened.is_some() && r.status == Status::Active {
-                with_remotes(p, &r, &config, history_of(&r.request), pushing, &mut reply);
+                let history = history_of(&r.request);
+                with_remotes(p, &r, &config, &untrusted, history, pushing, &mut reply);
             }
             // A repeated restore returns the graft without running the hooks
             // again. One this call reopened keeps the graft's lock for them.
