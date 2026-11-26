@@ -51,10 +51,14 @@ export const cases: Scenario[] = [
     name: 'graft creation validates portable names and keeps same-named primary branches private',
     run(ctx) {
       const head = ctx.git(['rev-parse', 'HEAD']);
-      for (const name of ['../escape', 'CAPS', 'nul', '1agent', 'a'.repeat(49)]) {
+      for (const name of ['../escape', 'CAPS', 'nul', 'a_b', 'a'.repeat(49)]) {
         assert.equal(ctx.fail(['add', name]).code, 'invalid_name');
       }
       assert.equal(existsSync(join(ctx.root, 'escape')), false);
+      // A name may start with a number, as a ticket ID often does.
+      const numbered = ctx.spawn('1agent');
+      assert.equal(ctx.git(['branch', '--show-current'], numbered.path), 'graft/1agent');
+      ctx.cli(['remove', '1agent', '--lease', numbered.lease]);
       ctx.git(['branch', 'graft/occupied']);
       const workspace = ctx.spawn('occupied');
       const owned = ['occupied', '--lease', workspace.lease];

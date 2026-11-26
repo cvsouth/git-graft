@@ -26,7 +26,10 @@ pub fn validate_name(name: &str) -> Result<()> {
         "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
     ];
     if name.len() > 48
-        || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        || !name
+            .as_bytes()
+            .first()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         || !name
             .bytes()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
@@ -34,7 +37,7 @@ pub fn validate_name(name: &str) -> Result<()> {
     {
         return Err(fault(
             "invalid_name",
-            "Use a portable graft name of 1–48 lowercase letters, numbers or hyphens, starting with a letter",
+            "Use a portable graft name of 1–48 lowercase letters, numbers or hyphens, starting with a letter or number",
             Value::Null,
         ));
     }
@@ -930,6 +933,40 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_graft_name_may_start_with_a_letter_or_a_number() {
+        let longest = "a".repeat(48);
+        for name in [
+            "a",
+            "agent-1",
+            "1agent",
+            "4c2a9-fix-login",
+            "2026",
+            &longest,
+        ] {
+            assert!(validate_name(name).is_ok(), "{name}");
+        }
+        let long = "a".repeat(49);
+        for name in [
+            "",
+            "-agent",
+            "Agent",
+            "a_b",
+            "a.b",
+            "../escape",
+            "nul",
+            "com1",
+            &long,
+        ] {
+            let error = validate_name(name).expect_err(name);
+            assert_eq!(
+                crate::api::error_json(&error)["code"],
+                "invalid_name",
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
