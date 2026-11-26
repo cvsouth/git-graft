@@ -574,6 +574,27 @@ export const cases: Scenario[] = [
     },
   },
   {
+    name: 'prune --purge-archives finishes an interrupted purge whatever the age given',
+    run(ctx) {
+      const gone = ctx.spawn('gone');
+      ctx.cli(['remove', 'gone', '--lease', gone.lease]);
+      // A purge stopped after it set the archive aside, before it removed
+      // the record: the graft is still listed but cannot be restored.
+      const archives = join(ctx.root, 'project.graft', '.retired');
+      const id = String(gone.result.id);
+      renameSync(join(archives, id), join(archives, `.purging-${id}`));
+      const listed = () => array(ctx.cli(['list']).recoverable).map(object).some(item => item.name === 'gone');
+      assert.ok(listed());
+
+      const preview = objectResult(ctx.cli(['prune', '--purge-archives', '30']).archives);
+      assert.deepEqual(array(preview.purged).map(object).map(item => item.name), ['gone']);
+      const applied = objectResult(ctx.cli(['prune', '--apply', '--purge-archives', '30']).archives);
+      assert.deepEqual(applied.purged, preview.purged);
+      assert.equal(existsSync(join(archives, `.purging-${id}`)), false);
+      assert.equal(listed(), false);
+    },
+  },
+  {
     name: 'prune previews and applies only expired grafts with nothing unmerged or running',
     async run(ctx) {
       const clean = ctx.spawn('clean');

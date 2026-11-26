@@ -2561,6 +2561,15 @@ struct Purgeable {
 }
 
 impl Purgeable {
+    fn of(r: &Record, archived_at: u64) -> Self {
+        Self {
+            name: r.name.clone(),
+            id: r.id.clone(),
+            archived_at,
+            path: r.archive.clone().unwrap_or_default(),
+        }
+    }
+
     fn report(&self) -> Value {
         json!({"name": self.name, "id": self.id, "archived_at": self.archived_at, "path": self.path})
     }
@@ -2590,34 +2599,59 @@ fn owned_archives(p: &Project) -> Result<Option<PathBuf>> {
     Ok(Some(parent))
 }
 
-/// When the archive of `r` was made, if it was made at or before `cutoff` and
-/// may be purged. A record without an archive time counts from its last
-/// heartbeat. Records being changed, and those whose archive is not where
-/// Graft keeps archives, are left alone.
+/// Whether `path` is a directory a purge set aside: an ordinary directory,
+/// not a link to one.
+fn set_aside(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir() && !is_reparse_point(&metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether a purge set the archive of graft `id` at `archive` aside and
+/// stopped before removing its record: the archive is gone and the directory
+/// it was moved to is there. Anything that cannot be checked counts as not.
+fn purge_unfinished(archive: &Path, id: &str) -> bool {
+    !exists(archive).unwrap_or(true)
+        && archive.parent().is_some_and(|parent| {
+            set_aside(&parent.join(format!("{PURGING}{id}"))).unwrap_or(false)
+        })
+}
+
+/// When the archive of `r` was made, if it may be purged: it was made at or
+/// before `cutoff`, or an earlier purge of it was interrupted. A record
+/// without an archive time counts from its last heartbeat. Records being
+/// changed, and those whose archive is not where Graft keeps archives, are
+/// left alone.
 fn purgeable(p: &Project, r: &Record, cutoff: u64) -> Option<u64> {
     let archive = r.archive.as_ref()?;
     let archived = r.archived.unwrap_or(r.heartbeat);
     (r.status.retired()
         && r.transition.is_none()
-        && archived <= cutoff
-        && archive_path(p, r, false).ok().as_ref() == Some(archive))
+        && archive_path(p, r, false).ok().as_ref() == Some(archive)
+        && (archived <= cutoff || purge_unfinished(archive, &r.id)))
     .then_some(archived)
 }
 
-/// The archives of grafts archived at least `days` days ago. Damaged records
-/// are left alone.
+/// Remove the record of graft `id`, the last trace of it once its archive is
+/// set aside.
+fn remove_record(p: &Project, id: &str) -> Result<()> {
+    let records = record_directory(p, false)?;
+    fs::remove_file(records.join(format!("{id}.json")))?;
+    sync_directory(&records)
+}
+
+/// The archives of grafts archived at least `days` days ago, and those an
+/// interrupted purge set aside whatever their age. Damaged records are left
+/// alone.
 pub fn archives_to_purge(p: &Project, days: u64) -> Result<ArchivePurge> {
     let cutoff = now().saturating_sub(days.saturating_mul(24 * 60 * 60));
     let mut archives = Vec::new();
     if owned_archives(p)?.is_some() {
         for r in records(p)? {
             if let Some(archived_at) = purgeable(p, &r, cutoff) {
-                archives.push(Purgeable {
-                    archived_at,
-                    path: r.archive.clone().unwrap_or_default(),
-                    name: r.name,
-                    id: r.id,
-                });
+                archives.push(Purgeable::of(&r, archived_at));
             }
         }
     }
@@ -2638,17 +2672,32 @@ pub fn purge_archives(p: &Project, purge: &ArchivePurge, purged: &mut Vec<Value>
     let Some(parent) = owned_archives(p)? else {
         return Ok(());
     };
+    let current = records(p)?;
     for entry in fs::read_dir(&parent)? {
         let entry = entry?;
-        if !entry.file_name().to_string_lossy().starts_with(PURGING) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_prefix(PURGING) else {
             continue;
-        }
+        };
         // Only a directory a purge set aside is deleted: a link is not
         // followed, and anything else is not Graft's.
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.is_dir() && !is_reparse_point(&metadata) {
-            remove_tree(&entry.path())?;
+        if !set_aside(&entry.path())? {
+            continue;
         }
+        // A purge stopped before it removed the record leaves the graft in
+        // `list` with no archive to restore. Its record goes first, so a
+        // second interruption leaves only the directory. A record whose
+        // archive is back in place, or whose graft was restored, is kept.
+        if let Some(r) = current.iter().find(|r| r.id == id)
+            && let Some(archived_at) = purgeable(p, r, 0)
+            && r.archive
+                .as_deref()
+                .is_some_and(|archive| purge_unfinished(archive, id))
+        {
+            remove_record(p, id)?;
+            purged.push(Purgeable::of(r, archived_at).report());
+        }
+        remove_tree(&entry.path())?;
     }
     let current = records(p)?;
     for planned in &purge.archives {
@@ -2669,9 +2718,7 @@ pub fn purge_archives(p: &Project, purge: &ArchivePurge, purged: &mut Vec<Value>
                 .with_context(|| format!("set aside the archive at {}", archive.display()))?;
             sync_directory(&parent)?;
         }
-        let records = record_directory(p, false)?;
-        fs::remove_file(records.join(format!("{}.json", r.id)))?;
-        sync_directory(&records)?;
+        remove_record(p, &r.id)?;
         purged.push(planned.report());
         if exists(&doomed)? {
             remove_tree(&doomed)?;
@@ -3392,6 +3439,38 @@ mod tests {
             assert_eq!(fs::read_to_string(target.join("file"))?, "data");
         }
         assert!(kept.archive.unwrap().is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn purging_archives_finishes_an_interrupted_purge_whatever_the_age_given() -> Result<()> {
+        let f = Fixture::new()?;
+        let p = &f.project;
+        let [cut, intact, back] =
+            <[Record; 3]>::try_from(archived(&f, &["cut", "intact", "back"])?).unwrap();
+        restore(p, &back.name, &back.lease)?;
+        let archives = workspaces(p, false)?.join(ARCHIVES);
+        let set_aside = |r: &Record| archives.join(format!("{PURGING}{}", r.id));
+        // A purge stopped after it set the archive of cut aside, before it
+        // removed the record. Directories of the same name stand beside an
+        // archive still in place and beside a restored graft.
+        fs::rename(cut.archive.as_ref().unwrap(), set_aside(&cut))?;
+        fs::create_dir(set_aside(&intact))?;
+        fs::create_dir(set_aside(&back))?;
+
+        // Archived moments ago, none is old enough, but the preview names
+        // cut, and the purge removes its record with what was set aside.
+        assert_eq!(names(&purge_archived(p, 30, false)?), ["cut"]);
+        assert_eq!(names(&purge_archived(p, 30, true)?), ["cut"]);
+        assert!(!record_file(p, &cut)?.exists());
+        assert!(!set_aside(&cut).exists());
+        assert!(recoverable(p)?.iter().all(|summary| summary.name != "cut"));
+
+        assert!(record_file(p, &intact)?.exists());
+        assert!(intact.archive.as_ref().unwrap().is_dir());
+        assert!(!set_aside(&intact).exists());
+        assert_eq!(load(p, &back.name)?.status, Status::Active);
+        assert!(!set_aside(&back).exists());
         Ok(())
     }
 
