@@ -2552,10 +2552,22 @@ const PURGING: &str = ".purging-";
 pub fn purge_archives(p: &Project, days: u64, apply: bool) -> Result<Vec<Value>> {
     let cutoff = now().saturating_sub(days.saturating_mul(24 * 60 * 60));
     let parent = workspaces(p, false)?.join(ARCHIVES);
-    if apply && exists(&parent)? {
+    let owned = exists(&parent)?;
+    // Like every other command, the purge refuses a directory of archives
+    // that is not Graft's own, such as a symbolic link to another.
+    if owned {
+        marked_dir(&parent, p.id(), false)?;
+    }
+    if apply && owned {
         for entry in fs::read_dir(&parent)? {
             let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with(PURGING) {
+            if !entry.file_name().to_string_lossy().starts_with(PURGING) {
+                continue;
+            }
+            // Only a directory a purge set aside is deleted: a link is not
+            // followed, and anything else is not Graft's.
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.is_dir() && !is_reparse_point(&metadata) {
                 remove_tree(&entry.path())?;
             }
         }
@@ -3188,6 +3200,76 @@ mod tests {
         // A restored graft has no archive time again.
         let restored = restore(p, &recent.name, &recent.lease)?;
         assert_eq!(restored.archived, None);
+        Ok(())
+    }
+
+    /// Archive each of `names`, as `remove` does.
+    fn archived(f: &Fixture, names: &[&str]) -> Result<Vec<Record>> {
+        let p = &f.project;
+        names
+            .iter()
+            .map(|name| {
+                let r = f.expired_at_base(name)?;
+                let _lock = workspace_lock(p, &r.name)?;
+                retire(p, &r.name, &r.lease, Status::Dropped, None)?;
+                load_retired(p, &r.name, &r.lease)
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purging_archives_refuses_a_linked_archive_directory() -> Result<()> {
+        let f = Fixture::new()?;
+        let p = &f.project;
+        let [gone] = <[Record; 1]>::try_from(archived(&f, &["gone"])?).unwrap();
+
+        // The directory of archives is replaced by a link to another that
+        // holds a directory named as one a purge sets aside.
+        let archives = workspaces(p, false)?.join(ARCHIVES);
+        let elsewhere = f.temp.path().join("elsewhere");
+        let data = elsewhere.join(format!("{PURGING}data"));
+        fs::create_dir_all(&data)?;
+        fs::write(data.join("file"), "data")?;
+        fs::rename(&archives, f.temp.path().join("moved"))?;
+        std::os::unix::fs::symlink(&elsewhere, &archives)?;
+
+        assert!(purge_archives(p, 0, false).is_err());
+        assert!(purge_archives(p, 0, true).is_err());
+        assert_eq!(fs::read_to_string(data.join("file"))?, "data");
+        assert!(record_file(p, &gone)?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn purging_archives_skips_set_aside_names_that_are_not_directories() -> Result<()> {
+        let f = Fixture::new()?;
+        let p = &f.project;
+        let [kept] = <[Record; 1]>::try_from(archived(&f, &["kept"])?).unwrap();
+        let archives = workspaces(p, false)?.join(ARCHIVES);
+        let file = archives.join(format!("{PURGING}file"));
+        fs::write(&file, "not an archive")?;
+        #[cfg(unix)]
+        let (link, target) = {
+            let target = f.temp.path().join("target");
+            fs::create_dir(&target)?;
+            fs::write(target.join("file"), "data")?;
+            let link = archives.join(format!("{PURGING}link"));
+            std::os::unix::fs::symlink(&target, &link)?;
+            (link, target)
+        };
+
+        // Neither stops this purge nor the next.
+        for _ in 0..2 {
+            assert!(purge_archives(p, 30, true)?.is_empty());
+        }
+        assert_eq!(fs::read_to_string(&file)?, "not an archive");
+        #[cfg(unix)]
+        {
+            assert!(fs::symlink_metadata(&link)?.file_type().is_symlink());
+            assert_eq!(fs::read_to_string(target.join("file"))?, "data");
+        }
+        assert!(kept.archive.unwrap().is_dir());
         Ok(())
     }
 

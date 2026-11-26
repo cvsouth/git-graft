@@ -493,6 +493,33 @@ export const cases: Scenario[] = [
     },
   },
   {
+    name: 'prune --purge-archives refuses an archive directory that is a link',
+    run(ctx) {
+      const gone = ctx.spawn('gone');
+      ctx.cli(['remove', 'gone', '--lease', gone.lease]);
+      const archives = join(ctx.root, 'project.graft', '.retired');
+      const moved = join(ctx.root, 'moved-archives');
+      const data = join(ctx.root, 'elsewhere', '.purging-data');
+      mkdirSync(data, { recursive: true });
+      writeFileSync(join(data, 'file'), 'data');
+      renameSync(archives, moved);
+      try {
+        symlinkSync(dirname(data), archives, process.platform === 'win32' ? 'junction' : 'dir');
+      } catch (error) {
+        ctx.unavailable(`Cannot create directory symlink to verify redirection protection: ${String(error)}`);
+      }
+      try {
+        ctx.fail(['prune', '--purge-archives', '0']);
+        ctx.fail(['prune', '--apply', '--purge-archives', '0']);
+        assert.equal(readFileSync(join(data, 'file'), 'utf8'), 'data');
+      } finally {
+        unlinkSync(archives);
+      }
+      renameSync(moved, archives);
+      ctx.cli(['restore', 'gone', '--lease', gone.lease]);
+    },
+  },
+  {
     name: 'prune previews and applies only expired grafts with nothing unmerged or running',
     async run(ctx) {
       const clean = ctx.spawn('clean');
