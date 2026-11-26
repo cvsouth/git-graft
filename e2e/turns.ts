@@ -256,6 +256,68 @@ export const cases: Scenario[] = [
     },
   },
   {
+    name: 'post-take hooks run when a turn is newly granted or its grafts change, and a failing one gives the turn up',
+    run: async ctx => {
+      const log = join(ctx.root, 'post-take.log');
+      const script = join(ctx.root, 'post-take.cjs');
+      writeFileSync(script, `
+const fs = require('node:fs');
+const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith('GIT_GRAFT_')));
+fs.appendFileSync(process.argv[2], JSON.stringify({ cwd: process.cwd(), env }) + '\\n');
+process.stdout.write('switched to ' + process.env.GIT_GRAFT_TURN_HOLDER);
+if (process.env.GIT_GRAFT_TURN_HOLDER === 'broken') process.exit(4);
+`);
+      writeFileSync(join(ctx.repo, '.graftconfig.local'), JSON.stringify({
+        hooks: { switch: { event: 'post-take', argv: [process.execPath, script, log] } },
+      }));
+      const runs = () => existsSync(log)
+        ? readFileSync(log, 'utf8').trim().split('\n').map(line => objectResult(JSON.parse(line)))
+        : [];
+      const work = ctx.spawn('work');
+      const path = realpathSync(String(work.path));
+      const [a, b] = ['task-a', 'task-b'].map(holder);
+      const ran = (who: string) => [{ name: 'switch', event: 'post-take', file: '.graftconfig.local', status: 'ok',
+        exit_code: 0, stdout: `switched to ${who}`, stderr: '', stdout_truncated: false, stderr_truncated: false }];
+
+      const granted = take(ctx, a, 'web', '--graft', path);
+      assert.deepEqual(granted.hooks, ran('task-a'));
+      const [first] = runs();
+      assert.equal(realpathSync(String(first.cwd)), realpathSync(ctx.repo));
+      const env = objectResult(first.env);
+      assert.deepEqual([env.GIT_GRAFT_HOOK, env.GIT_GRAFT_HOOK_NAME, env.GIT_GRAFT_TURN_RESOURCE,
+        env.GIT_GRAFT_TURN_HOLDER, env.GIT_GRAFT_TURN_GRAFTS], ['post-take', 'switch', 'web', 'task-a', path]);
+      assert(!JSON.stringify(env).includes(a.lease), 'the hook saw the holder lease');
+      // A renewal or a queued ask runs nothing; new grafts run it again.
+      assert(!('hooks' in take(ctx, a, 'web')));
+      assert(!('hooks' in take(ctx, b, 'web')));
+      assert.equal(runs().length, 1);
+      const other = ctx.spawn('other');
+      assert.deepEqual(take(ctx, a, 'web', '--graft', String(other.path)).hooks, ran('task-a'));
+      release(ctx, a, 'web');
+      assert.deepEqual(take(ctx, b, 'web').hooks, ran('task-b'));
+      release(ctx, b, 'web');
+      assert.equal(runs().length, 3);
+
+      // A failing hook refuses the take and leaves the turn free.
+      const broken = holder('broken');
+      const error = ctx.fail(['turn', 'take', 'web', '--holder', broken.name, '--lease', broken.lease]);
+      assert.equal(error.code, 'hook_failed');
+      const details = objectResult(error.details);
+      assert.deepEqual([details.resource, details.holder], ['web', 'broken']);
+      assert.equal(objectResult((details.hooks as unknown[])[0]).exit_code, 4);
+      assert.deepEqual(turns(ctx), []);
+
+      // Without --allow-exec an MCP host takes the turn and runs no hook.
+      await withClient(ctx, false, async client => {
+        await initialize(client);
+        const quiet = await call(client, 'graft_turn_take', { holder: 'quiet', resource: 'web' });
+        assert.equal(quiet.granted, true);
+        assert.deepEqual((quiet.hooks as unknown[]).map(entry => objectResult(entry).status), ['skipped']);
+      });
+      assert.equal(runs().length, 4);
+    },
+  },
+  {
     name: 'take --wait returns soon after the holder gives up the turn and holds no lock meanwhile',
     async run(ctx) {
       const [a, b] = ['task-a', 'task-b'].map(holder);
