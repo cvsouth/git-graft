@@ -1147,14 +1147,49 @@ pub(crate) fn run_found(
             if a.apply {
                 hooks.hooks(p, hook::Event::PreArchive)?;
             }
+            // The archives to purge are found before prune archives
+            // anything, so it never purges a graft it has just archived.
+            let purge = a
+                .purge_archives
+                .map(|days| registry::archives_to_purge(p, days))
+                .transpose()?;
             let retained = registry::prune_with(p, a.apply, &mut |r| hooks.before_prune(p, r))?;
             let cache = if !a.purge_cache {
                 json!({"requested":false,"purged":false})
             } else {
                 engine::gc::purge_caches(p, a.apply)?
             };
-            let mut pruned = json!({"applied":a.apply,"retained":retained,"cache":cache});
+            let mut failed = None;
+            let archives = match purge {
+                None => json!({"requested": false, "purged": []}),
+                Some(purge) => {
+                    let mut archives = json!({
+                        "requested": true,
+                        "older_than_days": purge.days(),
+                        "purged": purge.report(),
+                    });
+                    if a.apply {
+                        let mut purged = Vec::new();
+                        failed = registry::purge_archives(p, &purge, &mut purged).err();
+                        archives["purged"] = json!(purged);
+                    }
+                    archives
+                }
+            };
+            let mut pruned =
+                json!({"applied":a.apply,"retained":retained,"cache":cache,"archives":archives});
             with_damaged(p, &mut pruned)?;
+            // Prune has archived grafts by now, so a purge that fails carries
+            // the whole reply, with the archives it did delete.
+            if let Some(error) = failed {
+                return Err(api::fault(
+                    "purge_failed",
+                    format!(
+                        "The purge of archives did not complete: {error:#}. details has the prune reply, and details.archives.purged lists the archives deleted before the failure"
+                    ),
+                    pruned,
+                ));
+            }
             return Ok(pruned);
         }
         Command::Env(a) => {

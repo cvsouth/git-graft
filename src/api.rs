@@ -459,6 +459,10 @@ pub struct Gc {
     /// Saved layers and the registered shared layer stay until `deps layer remove`.
     #[arg(long)]
     pub purge_cache: bool,
+    /// Also delete the archives of grafts archived at least this many days ago, with their
+    /// recovery records. They can no longer be restored.
+    #[arg(long, value_name = "DAYS")]
+    pub purge_archives: Option<u64>,
 }
 
 /// A stable machine-readable error, optionally with recovery information.

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn as spawnProcess } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -451,6 +451,147 @@ export const cases: Scenario[] = [
       assert.equal(readFileSync(join(restored, 'tracked.txt'), 'utf8'), 'uncommitted edit\n');
       assert.equal(readFileSync(join(restored, 'notes.txt'), 'utf8'), 'untracked notes\n');
       assert.equal(readFileSync(join(restored, 'build', 'out.txt'), 'utf8'), 'ignored output\n');
+    },
+  },
+  {
+    name: 'prune --purge-archives deletes archives of the age given, with their recovery records',
+    run(ctx) {
+      const kept = ctx.spawn('kept');
+      const gone = ctx.spawn('gone');
+      const archived = ctx.cli(['remove', 'gone', '--lease', gone.lease]);
+      const recovery = String(archived.recovery_lease);
+      const archives = join(ctx.root, 'project.graft', '.retired');
+      const ids = () => (existsSync(archives) ? readdirSync(archives) : []).filter(name => /^[0-9a-f-]{36}$/.test(name));
+      const before = ids();
+      assert.equal(before.length, 1);
+
+      // Without the option nothing is said about archives; a larger age finds none.
+      const plain = ctx.cli(['prune']);
+      assert.deepEqual(plain.archives, { requested: false, purged: [] });
+      assert.deepEqual(objectResult(ctx.cli(['prune', '--purge-archives', '1']).archives).purged, []);
+      const preview = objectResult(ctx.cli(['prune', '--purge-archives', '0']).archives);
+      assert.equal(preview.requested, true);
+      assert.equal(preview.older_than_days, 0);
+      assert(Array.isArray(preview.purged) && preview.purged.length === 1);
+      const entry = objectResult(preview.purged[0]);
+      assert.equal(entry.name, 'gone');
+      assert.equal(typeof entry.archived_at, 'number');
+      assert.deepEqual(ids(), before);
+      assert(!JSON.stringify(preview).includes(recovery));
+
+      const applied = ctx.cli(['prune', '--apply', '--purge-archives', '0']);
+      const purged = objectResult(applied.archives).purged;
+      assert(Array.isArray(purged) && purged.length === 1);
+      assert.deepEqual(ids(), []);
+      const listed = ctx.cli(['list']);
+      assert(Array.isArray(listed.recoverable));
+      assert(listed.recoverable.map(objectResult).every(item => item.name !== 'gone'));
+      assert.notEqual(ctx.fail(['restore', 'gone', '--lease', recovery]).code, undefined);
+      // An active graft is never touched.
+      assert.equal(ctx.cli(['status', 'kept']).phase, 'ready');
+      ctx.cli(['remove', 'kept', '--lease', kept.lease]);
+    },
+  },
+  {
+    name: 'prune --apply --purge-archives deletes the archives its preview names, not those it archives',
+    run(ctx) {
+      const gone = ctx.spawn('gone');
+      ctx.cli(['remove', 'gone', '--lease', gone.lease]);
+      const idle = ctx.spawn('idle');
+      expire(ctx, idle.result.id);
+      const preview = objectResult(ctx.cli(['prune', '--purge-archives', '0']).archives);
+      assert.deepEqual(array(preview.purged).map(object).map(item => item.name), ['gone']);
+
+      const applied = ctx.cli(['prune', '--apply', '--purge-archives', '0']);
+      assert.equal(reasons(applied).idle, 'archived');
+      const archives = objectResult(applied.archives);
+      assert.deepEqual(archives.purged, preview.purged);
+      assert.equal('error' in archives, false);
+      const kept = array(applied.retained).map(object).find(item => item.name === 'idle');
+      assert(kept !== undefined && typeof kept.archive_path === 'string');
+      assert.ok(existsSync(kept.archive_path));
+    },
+  },
+  {
+    name: 'prune --purge-archives refuses an archive directory that is a link',
+    run(ctx) {
+      const gone = ctx.spawn('gone');
+      ctx.cli(['remove', 'gone', '--lease', gone.lease]);
+      const archives = join(ctx.root, 'project.graft', '.retired');
+      const moved = join(ctx.root, 'moved-archives');
+      const data = join(ctx.root, 'elsewhere', '.purging-data');
+      mkdirSync(data, { recursive: true });
+      writeFileSync(join(data, 'file'), 'data');
+      renameSync(archives, moved);
+      try {
+        symlinkSync(dirname(data), archives, process.platform === 'win32' ? 'junction' : 'dir');
+      } catch (error) {
+        ctx.unavailable(`Cannot create directory symlink to verify redirection protection: ${String(error)}`);
+      }
+      try {
+        ctx.fail(['prune', '--purge-archives', '0']);
+        ctx.fail(['prune', '--apply', '--purge-archives', '0']);
+        assert.equal(readFileSync(join(data, 'file'), 'utf8'), 'data');
+      } finally {
+        unlinkSync(archives);
+      }
+      renameSync(moved, archives);
+      ctx.cli(['restore', 'gone', '--lease', gone.lease]);
+    },
+  },
+  {
+    name: 'prune --apply reports what it archived when the purge of archives fails',
+    run(ctx) {
+      const gone = ctx.spawn('gone');
+      ctx.cli(['remove', 'gone', '--lease', gone.lease]);
+      const archives = join(ctx.root, 'project.graft', '.retired');
+      // A plain file under the name a purge sets aside is no archive: the
+      // purge leaves it and goes on.
+      const stray = join(archives, '.purging-stray');
+      writeFileSync(stray, 'not an archive');
+      const idle = ctx.spawn('idle');
+      expire(ctx, idle.result.id);
+      // POSIX refuses to rename a directory over a plain file; Windows may
+      // replace the file instead, so the failure is checked on POSIX only.
+      const blocked = join(archives, `.purging-${String(gone.result.id)}`);
+      if (process.platform !== 'win32') {
+        writeFileSync(blocked, '');
+        // The command fails, and its error carries the whole reply.
+        const failed = ctx.fail(['prune', '--apply', '--purge-archives', '0']);
+        assert.equal(failed.code, 'purge_failed');
+        const applied = objectResult(failed.details);
+        assert.equal(applied.applied, true);
+        assert.equal(reasons(applied).idle, 'archived');
+        assert.deepEqual(objectResult(applied.archives).purged, []);
+        assert.ok(existsSync(join(archives, String(gone.result.id))));
+        unlinkSync(blocked);
+        ctx.cli(['restore', 'idle', '--lease', idle.lease]);
+      }
+      const applied = ctx.cli(['prune', '--apply', '--purge-archives', '0']);
+      const report = objectResult(applied.archives);
+      assert.deepEqual(array(report.purged).map(object).map(item => item.name), ['gone']);
+      assert.equal(readFileSync(stray, 'utf8'), 'not an archive');
+    },
+  },
+  {
+    name: 'prune --purge-archives finishes an interrupted purge whatever the age given',
+    run(ctx) {
+      const gone = ctx.spawn('gone');
+      ctx.cli(['remove', 'gone', '--lease', gone.lease]);
+      // A purge stopped after it set the archive aside, before it removed
+      // the record: the graft is still listed but cannot be restored.
+      const archives = join(ctx.root, 'project.graft', '.retired');
+      const id = String(gone.result.id);
+      renameSync(join(archives, id), join(archives, `.purging-${id}`));
+      const listed = () => array(ctx.cli(['list']).recoverable).map(object).some(item => item.name === 'gone');
+      assert.ok(listed());
+
+      const preview = objectResult(ctx.cli(['prune', '--purge-archives', '30']).archives);
+      assert.deepEqual(array(preview.purged).map(object).map(item => item.name), ['gone']);
+      const applied = objectResult(ctx.cli(['prune', '--apply', '--purge-archives', '30']).archives);
+      assert.deepEqual(applied.purged, preview.purged);
+      assert.equal(existsSync(join(archives, `.purging-${id}`)), false);
+      assert.equal(listed(), false);
     },
   },
   {
