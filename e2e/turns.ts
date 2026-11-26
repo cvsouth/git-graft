@@ -223,6 +223,8 @@ export const cases: Scenario[] = [
       const router = sibling(ctx, 'router');
       ctx.git(['init', '-q', '-b', 'main'], ctx.root);
       writeFileSync(join(ctx.root, '.graftconfig.local'), JSON.stringify({ turns: ['stack'] }));
+      // A configuration of its own does not take a repository out of the queue.
+      writeFileSync(join(router, '.graftconfig.local'), JSON.stringify({ include: [] }));
       const app = ctx.spawn('fix-parser');
       const api = ctx.spawn('fix-parser', [], router);
       const other = ctx.spawn('other', [], router);

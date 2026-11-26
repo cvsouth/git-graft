@@ -8,11 +8,12 @@
 //! A holder loses its turn and its place when its turn runs out, when the
 //! process it named ends, or when none of the grafts it named is active any
 //! more. Turn state is kept in a project's private state: the primary's, or,
-//! for a resource the configuration lists under `turns`, that of the
-//! repository at the configuration's directory, which every repository it
-//! configures shares. Graft does nothing to the resource itself: like a
-//! lease, a turn is a promise between cooperating clients. Callers hold the
-//! lock of the project that keeps the state while reading or changing it.
+//! for a resource the configuration of a directory above lists under
+//! `turns`, that of the repository at that directory, which the
+//! repositories below it share. Graft does nothing to the resource itself:
+//! like a lease, a turn is a promise between cooperating clients. Callers
+//! hold the lock of the project that keeps the state while reading or
+//! changing it.
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -28,8 +29,7 @@ use uuid::Uuid;
 
 use super::registry;
 use crate::{
-    api, cache,
-    config::Config,
+    api, cache, config,
     registry::{Paths, Project, atomic, dir, exists, now, owned_directory},
 };
 
@@ -445,16 +445,15 @@ fn write(p: &Project, resource: &str, turn: &Turn) -> Result<()> {
     atomic(&file(p, resource), &bytes)
 }
 
-/// Where the turns of the primary at `primary` are kept: the paths of the
-/// primary's own project, and, when the configuration shares resources, the
-/// paths of the project at its directory with the resources it shares.
 /// The project that keeps the turns the configuration shares, and their names.
 type Shared = Option<(Paths, Vec<String>)>;
 
+/// Where the turns of the primary at `primary` are kept: the paths of the
+/// primary's own project, and, when a directory above it shares resources,
+/// the paths of the project that keeps them with the resources it shares.
 fn places(primary: &Path, own: Paths) -> Result<(Paths, Shared)> {
-    let config = Config::read(primary)?;
-    let shared = match config.dir {
-        Some(dir) if !config.turns.is_empty() && dir != primary => {
+    let shared = match config::shared_turns(primary)? {
+        Some((dir, turns)) => {
             let paths = Project::paths(&dir).ok().filter(|paths| paths.0 == dir);
             let Some(paths) = paths else {
                 return Err(api::fault(
@@ -466,9 +465,9 @@ fn places(primary: &Path, own: Paths) -> Result<(Paths, Shared)> {
                     json!({"file": dir}),
                 ));
             };
-            Some((paths, config.turns))
+            Some((paths, turns))
         }
-        _ => None,
+        None => None,
     };
     Ok((own, shared))
 }
@@ -1053,6 +1052,39 @@ mod tests {
             json!({"resource": "stack", "released": true, "next": "agent-2"})
         );
         assert_eq!(f.ask(&f.api, "stack", "agent-2", None)?["granted"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn a_repository_with_its_own_configuration_stays_in_the_shared_queue() -> Result<()> {
+        let f = Fixture::new()?;
+        fs::write(
+            f.root.join(crate::config::SHARED),
+            r#"{"turns": ["stack"], "repositories": {"app": {}, "api": {}}}"#,
+        )?;
+        fs::write(
+            f.app.join(crate::config::SHARED),
+            r#"{"include": [".env"]}"#,
+        )?;
+        assert_eq!(f.ask(&f.app, "stack", "agent-1", None)?["granted"], true);
+        let queued = f.ask(&f.api, "stack", "agent-2", None)?;
+        assert_eq!(
+            (&queued["granted"], &queued["holder"]),
+            (&json!(false), &json!("agent-1"))
+        );
+        assert!(f.root.join(".git/graft/turns/turn-stack.json").is_file());
+        assert!(!f.app.join(".git/graft/turns").exists());
+        assert_eq!(
+            f.list(&f.app)?,
+            [("stack".into(), json!("agent-1"), json!(["agent-2"]))]
+        );
+        // Its own `turns`, if it lists any, must name the same resources.
+        fs::write(
+            f.app.join(crate::config::SHARED),
+            r#"{"turns": ["database"]}"#,
+        )?;
+        let error = f.ask(&f.app, "stack", "agent-1", None).unwrap_err();
+        assert_eq!(api::error_json(&error)["code"], "invalid_config");
         Ok(())
     }
 
