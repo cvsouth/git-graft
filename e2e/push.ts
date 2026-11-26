@@ -79,6 +79,7 @@ export const cases: Scenario[] = [
       const entries = (added.result.remotes as unknown[]).map(object);
       assert.deepEqual(entries.map(entry => [entry.name, entry.status, entry.reason ?? entry.refs]).filter(([name]) => name !== 'upstream'),
         [['origin', 'configured', 2], ['secret', 'skipped', 'url_has_credentials'], ['missing', 'skipped', 'not_configured']]);
+      assert.equal(entries[0].push, true);
       // The remote that failed is reported by name and leaves nothing behind.
       assert.equal(entries[1].name, 'upstream');
       assert.equal(entries[1].status, 'failed');
@@ -108,26 +109,104 @@ export const cases: Scenario[] = [
       const archived = ctx.cli(['remove', 'remoted', '--lease', added.lease, '--discard']);
       const restored = ctx.cli(['restore', 'remoted', '--lease', String(archived.recovery_lease)]);
       assert.deepEqual((restored.remotes as unknown[]).slice(0, 2).map(object),
-        [{ name: 'origin', status: 'kept' }, { name: 'upstream', status: 'configured', refs: 0 }]);
+        [{ name: 'origin', status: 'kept' }, { name: 'upstream', status: 'configured', refs: 0, push: true }]);
       writeFileSync(join(ctx.repo, '.graftconfig.local'), JSON.stringify({ remotes: ['origin'] }));
 
       // Isolated history gets the remote but no remote-tracking refs.
       const isolated = ctx.spawn('isolated', ['--history', 'isolated']);
-      assert.deepEqual(object((isolated.result.remotes as unknown[])[0]), { name: 'origin', status: 'configured', refs: 0 });
+      assert.deepEqual(object((isolated.result.remotes as unknown[])[0]), { name: 'origin', status: 'configured', refs: 0, push: true });
       assert.equal(ctx.git(['remote', 'get-url', 'origin'], String(isolated.path)), bare);
 
-      // MCP adds get them too, without --allow-exec.
+      // MCP adds get them too, without --allow-exec. Without --allow-push the
+      // graft can fetch through them, but Git refuses to push.
       await withClient(ctx, false, async client => {
         await initialize(client);
         const viaMcp = await call(client, 'graft_add', { name: 'via-mcp' });
-        assert.deepEqual(object((viaMcp.remotes as unknown[])[0]).status, 'configured');
-        assert.equal(ctx.git(['remote', 'get-url', 'origin'], String(viaMcp.path)), bare);
+        const entry = object((viaMcp.remotes as unknown[])[0]);
+        assert.equal(entry.status, 'configured');
+        assert.equal(entry.push, false);
+        const graft = String(viaMcp.path);
+        assert.equal(ctx.git(['remote', 'get-url', 'origin'], graft), bare);
+        ctx.git(['fetch', '-q', 'origin'], graft);
+        assert.equal(ctx.git(['rev-parse', 'origin/main'], graft), moved);
+        commit(ctx, graft, 'mcp.txt', 'mcp\n');
+        for (const target of ['HEAD:refs/heads/via-mcp', 'HEAD:main']) {
+          const pushed = ctx.command('git', ['push', 'origin', target], graft);
+          assert.notEqual(pushed.status, 0, target);
+          assert.match(pushed.stderr, /transport 'graft-push-disabled' not allowed/);
+        }
+        assert.equal(ctx.git(['for-each-ref', '--format=%(refname)', 'refs/heads'], bare), 'refs/heads/main\nrefs/heads/remoted');
+        assert.equal(ctx.git(['rev-parse', 'refs/heads/main'], bare), moved);
       });
+      // A host with --allow-push gives the graft a remote it can push through.
+      await withClient(ctx, false, async client => {
+        await initialize(client);
+        const viaPush = await call(client, 'graft_add', { name: 'via-push' });
+        assert.equal(object((viaPush.remotes as unknown[])[0]).push, true);
+        const pushedTip = commit(ctx, String(viaPush.path), 'push.txt', 'push\n');
+        ctx.git(['push', '-q', 'origin', 'HEAD:refs/heads/via-push'], String(viaPush.path));
+        assert.equal(ctx.git(['rev-parse', 'refs/heads/via-push'], bare), pushedTip);
+      }, true);
       // Without the setting, a graft has no remote, as before.
       writeFileSync(join(ctx.repo, '.graftconfig.local'), '{}');
       const plain = ctx.spawn('plain');
       assert(!('remotes' in plain.result));
       assert.equal(ctx.git(['remote'], String(plain.path)), '');
+    },
+  },
+  {
+    name: 'remotes a .graftconfig lists are set up only once trusted, and the person\'s own untracked file needs none',
+    run: async ctx => {
+      const bare = remote(ctx);
+      ctx.git(['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+      remote(ctx, 'fork');
+      writeFileSync(join(ctx.repo, '.graftconfig'), JSON.stringify({ remotes: ['origin'] }));
+      ctx.git(['add', '.graftconfig']);
+      ctx.git(['commit', '-qm', 'Name origin for grafts']);
+      const before = ctx.cli(['list']);
+      const refused = ctx.fail(['add', 'early']);
+      assert.equal(refused.code, 'hooks_untrusted');
+      assert.match(String(refused.message), /The remotes in \.graftconfig have not been trusted.*changed nothing.*git graft hook trust/);
+      assert.deepEqual(refused.details, { event: 'post-add', hooks: [], trusted: null, command: 'git graft hook trust',
+        remotes: ['origin'], trusted_remotes: null });
+      assert.deepEqual(ctx.cli(['list']), before);
+      // Unlike a hook, a remote is set up for a host that runs nothing, so it refuses too.
+      await withClient(ctx, false, async client => {
+        await initialize(client);
+        const viaMcp = await call(client, 'graft_add', { name: 'agent' }, true);
+        assert.equal(viaMcp.code, 'hooks_untrusted');
+        assert.match(String(viaMcp.message), /No MCP tool can trust hooks or remotes/);
+      });
+      assert.deepEqual(ctx.cli(['hook', 'list']).remotes, [{ name: 'origin', trusted: false }]);
+
+      const trusted = ctx.cli(['hook', 'trust']);
+      assert.deepEqual(trusted.trusted, []);
+      assert.deepEqual(trusted.trusted_remotes, ['origin']);
+      assert.deepEqual(ctx.cli(['hook', 'list']).remotes, [{ name: 'origin', trusted: true }]);
+      const one = ctx.spawn('one');
+      assert.deepEqual(object((one.result.remotes as unknown[])[0]), { name: 'origin', status: 'configured', refs: 1, push: true });
+      assert.equal(ctx.git(['remote', 'get-url', 'origin'], String(one.path)), bare);
+
+      // A change to the list makes add and restore refuse again, before changing anything.
+      const archived = ctx.cli(['remove', 'one', '--lease', one.lease, '--discard']);
+      writeFileSync(join(ctx.repo, '.graftconfig'), JSON.stringify({ remotes: ['origin', 'fork'] }));
+      const state = ctx.cli(['list']);
+      for (const args of [['add', 'two'], ['restore', 'one', '--lease', String(archived.recovery_lease)]]) {
+        const error = ctx.fail(args);
+        assert.equal(error.code, 'hooks_untrusted', args.join(' '));
+        assert.match(String(error.message), /changed since they were last trusted/);
+        assert.deepEqual(object(error.details).remotes, ['origin', 'fork']);
+        assert.deepEqual(object(error.details).trusted_remotes, ['origin']);
+      }
+      assert.deepEqual(ctx.cli(['list']), state);
+
+      // What the person's own untracked .graftconfig.local lists needs no trust.
+      writeFileSync(join(ctx.repo, '.graftconfig'), JSON.stringify({ remotes: ['origin'] }));
+      writeFileSync(join(ctx.repo, '.graftconfig.local'), JSON.stringify({ remotes: ['fork'] }));
+      const mine = ctx.spawn('mine');
+      assert.deepEqual((mine.result.remotes as unknown[]).map(object).map(entry => [entry.name, entry.status]),
+        [['origin', 'configured'], ['fork', 'configured']]);
+      ctx.cli(['restore', 'one', '--lease', String(archived.recovery_lease)]);
     },
   },
   {

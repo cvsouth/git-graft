@@ -100,7 +100,7 @@ fn is_bare_name(program: &str) -> bool {
 pub(crate) fn list(primary: &Path, state: &Path) -> Result<Value> {
     let config = Config::read(primary)?;
     let gate = trust::Gate::of(&config)?;
-    let trusted = trust::is_trusted(state, &gate.hooks(&config))?;
+    let trusted = trust::is_trusted(state, &gate.hooks(&config), &gate.remotes(&config))?;
     let hooks: Vec<_> = config
         .hooks
         .iter()
@@ -113,6 +113,16 @@ pub(crate) fn list(primary: &Path, state: &Path) -> Result<Value> {
     let mut listed = json!({ "hooks": hooks });
     if !config.missing_repositories.is_empty() {
         listed["missing_repositories"] = json!(config.missing_repositories);
+    }
+    // The remotes a new graft gets are trusted with the hooks.
+    if !config.remotes.is_empty() {
+        listed["remotes"] = config
+            .remotes
+            .iter()
+            .map(|name| {
+                json!({"name": name, "trusted": trusted || !gate.remote_needs_trust(&config, name)})
+            })
+            .collect();
     }
     Ok(listed)
 }

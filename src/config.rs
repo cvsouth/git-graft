@@ -78,6 +78,17 @@ impl Hook {
     }
 }
 
+/// An entry of a configuration file's `remotes` list, as written: a remote's
+/// name, or `!name`, which removes a shared one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Remote {
+    pub name: String,
+    /// The file that lists it, named as [`Hook::file`] names it.
+    pub file: String,
+    /// Whether it comes from `.graftconfig.local`.
+    pub local: bool,
+}
+
 /// The effective configuration of a project: both files merged.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Config {
@@ -103,6 +114,9 @@ pub(crate) struct Config {
     pub missing_repositories: Vec<Value>,
     /// The remotes of the primary every new graft gets.
     pub remotes: Vec<String>,
+    /// Every entry of the files' `remotes` lists as written: the shared
+    /// file's, then the local file's.
+    pub listed_remotes: Vec<Remote>,
 }
 
 impl Config {
@@ -896,6 +910,18 @@ fn merge(shared: Option<Part>, local: Option<Part>, names: &Names<'_>) -> Result
     let shared = shared.unwrap_or_default();
     let local = local.unwrap_or_default();
     // Remotes are joined like include patterns; a local `!name` removes one.
+    for (remotes, file, local) in [
+        (&shared.remotes, &names.shared, false),
+        (&local.remotes, &names.local, true),
+    ] {
+        for name in remotes.iter().flatten() {
+            config.listed_remotes.push(Remote {
+                name: name.clone(),
+                file: file.clone(),
+                local,
+            });
+        }
+    }
     for remote in shared.remotes.iter().flatten() {
         if !config.remotes.contains(remote) {
             config.remotes.push(remote.clone());
