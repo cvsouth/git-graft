@@ -8,24 +8,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `add --include PATTERN` and MCP `include` copy chosen untracked or ignored files, such as `.env`, into a new graft; `'*'` copies all of them. Nothing is copied by default.
-- `.graftconfig`, which a project commits, and `.graftconfig.local`, the person's own, are JSON files at the root of the primary checkout that set default `include` patterns and define `hooks`. The local file overrides the shared one setting by setting: include lists are joined and a local `!pattern` removes a shared one; a local hook replaces the shared hook of the same name, `null` turns it off, and a new name adds one. A file Graft cannot read refuses commands with `invalid_config`.
-- `git graft local-files` and the MCP tool `graft_local_files` list the checkout's untracked and ignored files, so an agent can choose what to bring.
-- `status`, `merge` and `remove` don't count included copies as changes until the graft edits them.
-- `git graft push NAME --lease TOKEN [--remote REMOTE] [--to BRANCH]` pushes a graft's commits to a branch on a remote of the primary repository, for work that goes through a pull request. It uses the primary's remote configuration, credentials and `pre-push` hook, never forces, and leaves the graft active. Without `--to` it refuses to update the remote's default branch, as recorded in `refs/remotes/REMOTE/HEAD`. SSH runs in batch mode unless an SSH command is configured. New error codes: `push_rejected`, `push_failed`, `remote_not_found`, `detached_head`, `default_branch` and `nothing_to_push`.
-- MCP hosts started with `mcp --allow-push` offer the `graft_push` tool. It is a separate opt-in from `--allow-exec`.
-- `git graft turn take`, `turn release` and `turn list`, and the MCP tools `graft_turn_take`, `graft_turn_release` and `graft_turn_list`: grafts take turns on something a project has only one of, such as a development server on a fixed port. Turns go in the order grafts asked, expire unless renewed, and are dropped when their graft is archived.
-- Hooks run the commands the configuration names at `post-add`, `pre-archive` or `post-restore`, for a project's own setup and cleanup such as creating and dropping a per-graft database. An event can have several, which run in the order written; once one fails, the rest are skipped. `git graft hook list` shows the hooks in effect and the file of each. A failing `pre-archive` hook stops `remove`, `merge` and `prune --apply` from archiving that graft with `hook_failed`. A plain `remove`, and `prune --apply`, run no `pre-archive` hook for a graft they would keep for its commits or a change to a tracked file. A hook program is an absolute path or a bare name looked up in `PATH`; the configuration refuses a relative path such as `./scripts/setup`.
-- Results of `add`, `merge`, `remove`, `restore` and `prune --apply` report each hook they ran in a `hooks` array. MCP hosts run hooks only with `--allow-exec` and report them as skipped otherwise; no MCP tool defines one.
-- Hooks that come with the repository, those in `.graftconfig` and in a `.graftconfig.local` that Git tracks, run only after `git graft hook trust`, which records a SHA-256 digest of their events, names and arguments in `.git/graft/trusted-hooks.json`. Until then, and again after any change to them, `add`, `remove`, `merge`, `restore` and `prune --apply` refuse with `hooks_untrusted` before running or changing anything. `git graft hook list` reports whether each hook is trusted. No MCP tool trusts hooks.
-- `prune --purge-archives DAYS` previews, and with `--apply` deletes, the archives of grafts archived at least DAYS days ago, with their records. Records now note when a graft was archived (`archived`). If a deletion fails, the command fails with `purge_failed`, and `details` holds the prune reply.
-- Where the primary checkout's root holds neither `.graftconfig` nor `.graftconfig.local`, Graft reads them from the nearest directory above it that holds either, up to the home directory (`HOME`, or `USERPROFILE` on Windows) when the checkout is inside it and up to the root otherwise, under `repositories` and the checkout's path relative to that directory. One directory that holds several repositories can then configure them all. A hook there may name its program by a path relative to that directory, which trust covers by contents; it must stay inside that directory and outside the repository and every `*.graft` directory, after following links and, on macOS and Windows, ignoring case. On Unix such files must belong to the user or the superuser. Windows does not check their owner, so there every hook from them needs trust, tracked or not. Hooks receive `GIT_GRAFT_CONFIG_DIR`, and `hook list` shows a resolved `program` and reports keys under `repositories` that name no repository in `missing_repositories`.
+- `add --include PATTERN` copies chosen untracked or ignored files, such as `.env`, into a new graft. Nothing is copied by default, and `local-files` lists what there is to choose from.
+- `.graftconfig`, which a project commits, and `.graftconfig.local`, your own, set a project's default includes and hooks. One directory above several repositories can configure them all.
+- Hooks run your own commands after `add` and `restore` and before a graft is archived, for setup and cleanup such as a per-graft database.
+- `push` sends a graft's commits to a branch on the primary's remote, for pull request work. It never forces and won't update the default branch unless you name it.
+- `turn take`, `turn release` and `turn list` let grafts take turns on something there is only one of, such as a development server on a fixed port.
+- `prune --purge-archives DAYS` deletes archives older than DAYS days.
+- MCP tools for the above: `graft_local_files`, `graft_turn_take`, `graft_turn_release`, `graft_turn_list`, and `graft_push` for hosts started with `--allow-push`.
 
 ### Changed
 
-- A graft name may start with a number as well as a letter, so a name can begin with a ticket ID such as `4c2a9-fix-login`. The other rules are unchanged: 1 to 48 lowercase letters, numbers or hyphens, not a reserved Windows device name.
-- On Linux filesystems that cannot clone files, such as ext4, a graft with local history now hard-links the primary's Git object files instead of exporting a copy of them, as `git clone --local` does. On a repository with 186 MB of objects, `add` takes 1.0 s instead of 16 s and a graft uses 80 MB instead of 324 MB. The graft and its primary then name the same object files, which Git never rewrites in place. Such a graft can read every object in the primary, as local history already does on Btrfs, XFS and APFS; set `graft.history` to `isolated` to keep the previous contents.
-- `doctor` reports `history_sharing`: whether a graft with local history shares the primary's Git object files, and by which method (`clonefile`, `reflink` or `hardlink`). Like `source_storage`, it probes the state filesystem only and says so in `scope`.
+- On ext4 and other Linux filesystems without file cloning, a graft with local history hard-links the primary's Git objects instead of copying them: `add` takes 1.0 s instead of 16 s on a 186 MB repository, and uses 80 MB instead of 324 MB. Set `graft.history` to `isolated` to keep copying.
+- `doctor` reports whether grafts share the primary's Git objects.
+- Graft names may start with a number, such as a ticket ID.
+
+### Safety
+
+- Hooks that come with a repository run only after you approve them with `git graft hook trust`, and again after any change to them. No MCP tool can approve them.
+- MCP hosts run hooks only when started with `--allow-exec`.
 
 ## [0.2.0] - 2026-11-22
 

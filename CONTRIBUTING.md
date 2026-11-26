@@ -17,6 +17,17 @@ Pushes that change only Markdown or `docs/` skip CI.
 
 When reporting a bug, include the operating system, Git version, storage receipt and a minimal reproduction. Remove leases and private repository data from logs. Contributions use the [MIT license](LICENSE).
 
+## Changelog
+
+A pull request that changes anything a user of Graft can notice adds to `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md), in the same pull request, without being asked. Write for someone deciding whether to upgrade, and match the released sections below it.
+
+- Write one bullet per feature or fix, in one or two short sentences and under 40 words. Say what someone can now do, or what no longer goes wrong, not how it works.
+- File it under `Added`, `Changed`, `Fixed`, `Removed` or `Safety`.
+- Name commands, options and settings in backticks. Leave out error codes, JSON fields, internal files, platform edge cases and design detail: those belong in [docs](docs/operations.md).
+- Give before-and-after numbers for a speed or size change, such as "1.0 s instead of 16 s".
+- When a change extends or fixes something that is still under `Unreleased`, edit that bullet instead of adding one. Users never saw the earlier version.
+- If upgrading can break scripts or needs action, add a bold note at the top of the section, as 0.2.0 does.
+
 ## Releasing
 
 Pushing a `v*` tag builds, verifies, attests and publishes a release; a tag with a pre-release suffix such as `v0.2.0-rc.1` publishes a GitHub pre-release only. Running the Release workflow by hand is a dry run that builds, packages and smoke-tests everything without publishing.
