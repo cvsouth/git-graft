@@ -46,7 +46,7 @@ Hooks for the same event run in the order they are written. `null` is only meani
 
 ### Configure several repositories from one directory
 
-Some projects keep several repositories side by side in one directory, which may itself be a repository, and use them together. When the primary checkout's root holds neither `.graftconfig` nor `.graftconfig.local`, Graft reads them from the nearest directory above it that holds either. There, a `repositories` object holds the same settings for each repository below, keyed by its path relative to that directory, with `/` between parts:
+Some projects keep several repositories side by side in one directory, which may itself be a repository, and use them together. When the primary checkout's root holds neither `.graftconfig` nor `.graftconfig.local`, Graft reads them from the nearest directory above it that holds either. When the checkout is inside your home directory, the search stops at home, which it still reads, as Git's `GIT_CEILING_DIRECTORIES` stops Git's own search; otherwise it goes up to the root of the filesystem. Home is `HOME` on Unix and `USERPROFILE` on Windows. There, a `repositories` object holds the same settings for each repository below, keyed by its path relative to that directory, with `/` between parts:
 
 ```json
 {
@@ -63,7 +63,7 @@ Some projects keep several repositories side by side in one directory, which may
 }
 ```
 
-- A checkout's own files always come first: once its root holds either file, the directory above is not read. Of the directories above, only the nearest that holds either file is read, and a repository it does not name under `repositories` gets nothing from it. The directory's own top-level `include` and `hooks` are for the repository whose root it is, if any, and are not passed down.
+- A checkout's own files always come first: once its root holds either file, the directory above is not read. Of the directories above, up to home, only the nearest that holds either file is read, and a repository it does not name under `repositories` gets nothing from it. The directory's own top-level `include` and `hooks` are for the repository whose root it is, if any, and are not passed down.
 - `.graftconfig.local` in that directory overrides `.graftconfig` for each repository as described above. Reports name the files by their path from the primary checkout, such as `../.graftconfig`.
 - A hook there may name its program by a path relative to that directory, such as `./scripts/graft-hook.sh`, which keeps a committed file free of absolute paths. No graft of the repository holds that file, so the graft's work cannot change it. The path must stay inside the directory, without `..`, and outside the repository and every directory of grafts: for `app`, a program under `app/`, `app.graft/` or any other directory whose name ends in `.graft` is refused. Graft follows the links on the path before it checks, and on macOS and Windows it ignores case, so `App/bin/setup` is refused there as well. `git graft hook list` shows such a hook's resolved `program`.
 - On Unix, both files there must belong to you or to the superuser, as must the directory and any link to them; otherwise every command that reads them refuses with `invalid_config`. A file in a shared directory such as `/tmp` could otherwise run another user's commands as you. Windows does not check who owns them, so there every hook from either file in that directory needs trust, whether Git tracks the file or not.

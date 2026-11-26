@@ -20,8 +20,9 @@ Examples:
 Untracked and ignored files stay behind unless --include names them, or the
 project's .graftconfig or .graftconfig.local lists .gitignore-style patterns
 under \"include\". Those files are read from the root of the primary checkout,
-or else from the nearest directory above it that holds either, under
-\"repositories\" and the checkout's path relative to that directory.")]
+or else from the nearest directory above it that holds either, up to home when
+the checkout is inside it, under \"repositories\" and the checkout's path
+relative to that directory.")]
     Add(api::Spawn),
     /// List active and recoverable grafts.
     List,
@@ -52,8 +53,9 @@ Hooks are defined by name in .graftconfig, which a project commits, and
   {\"hooks\": {\"database\": {\"event\": \"post-add\", \"argv\": [\"/usr/local/bin/create-db\"]}}}
 
 Where the checkout has neither file, the nearest directory above it that holds
-either configures it under \"repositories\", by its path relative to that
-directory. A hook there may name its program relative to that directory:
+either, up to home when the checkout is inside it, configures it under
+\"repositories\", by its path relative to that directory. A hook there may name
+its program relative to that directory:
 
   {\"repositories\": {\"app\": {\"hooks\": {\"setup\": {\"event\": \"post-add\", \"argv\": [\"./scripts/setup\"]}}}}}
 

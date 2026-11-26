@@ -108,7 +108,19 @@ impl Config {
     /// at its root, or else those of the nearest directory above it that
     /// holds either, for the repository at `primary`. A missing file sets
     /// nothing. A bare repository has no configuration.
+    ///
+    /// The search above stops at the person's home directory, which it
+    /// still reads, when the checkout is inside it, as Git's
+    /// `GIT_CEILING_DIRECTORIES` stops its own search; otherwise it goes up
+    /// to the root of the filesystem. A stray file in a directory that holds
+    /// homes, such as `/Users`, or at the root, then cannot configure or
+    /// break every repository in a home.
     pub(crate) fn read(primary: &Path) -> Result<Self> {
+        Self::read_within(primary, home().as_deref())
+    }
+
+    /// [`Self::read`], with `home` as the person's home directory.
+    fn read_within(primary: &Path, home: Option<&Path>) -> Result<Self> {
         if primary.join(".git").symlink_metadata().is_err() {
             return Ok(Self::default());
         }
@@ -129,7 +141,16 @@ impl Config {
             config.missing_repositories = missing;
             return Ok(config.placed(primary, false));
         }
+        let ceiling = home
+            .map(|home| dunce::canonicalize(home).unwrap_or_else(|_| home.to_owned()))
+            .filter(|home| inside(primary, home, FOLD_CASE));
         for (depth, dir) in primary.ancestors().enumerate().skip(1) {
+            if ceiling
+                .as_deref()
+                .is_some_and(|home| !inside(dir, home, FOLD_CASE))
+            {
+                break;
+            }
             if !(present(dir, SHARED) || present(dir, LOCAL)) {
                 continue;
             }
@@ -178,6 +199,15 @@ impl Config {
     pub(crate) fn include_defaults(&self) -> Value {
         json!({"patterns": self.include, "files": self.include_files})
     }
+}
+
+/// The person's home directory, from `HOME` on Unix and `USERPROFILE` on
+/// Windows, when that is an absolute path.
+fn home() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
 }
 
 /// Whether `dir` has an entry called `name`, of any type, so that a file
@@ -1143,6 +1173,35 @@ mod tests {
         assert_eq!(config.include, ["own"]);
         assert_eq!(config.include_files, [SHARED]);
         assert_eq!(config.dir.as_deref(), Some(api.as_path()));
+    }
+
+    #[test]
+    fn the_search_above_stops_at_the_home_directory_that_holds_the_checkout() {
+        let (_tmp, root, _app, api) = enclosing();
+        let services = root.join("services");
+        // A broken file above home is not read, so it breaks nothing.
+        write(&root, SHARED, "not json");
+        let config = Config::read_within(&api, Some(&services)).unwrap();
+        assert_eq!(config, Config::default());
+        // A file in home itself is read.
+        write(
+            &services,
+            SHARED,
+            r#"{"repositories": {"api": {"include": ["from-home"]}}}"#,
+        );
+        let config = Config::read_within(&api, Some(&services)).unwrap();
+        assert_eq!(config.include, ["from-home"]);
+        assert_eq!(config.dir.as_deref(), Some(services.as_path()));
+        fs::remove_file(services.join(SHARED)).unwrap();
+        // Where the filesystem ignores case, so does the comparison with home.
+        let other_case = root.join("SERVICES");
+        let config = Config::read_within(&api, Some(&other_case));
+        assert_eq!(config.is_ok(), FOLD_CASE, "{config:?}");
+        // A home that does not hold the checkout sets no bound, nor does none.
+        for home in [Some(root.join("app")), None] {
+            let error = Config::read_within(&api, home.as_deref()).unwrap_err();
+            assert_eq!(crate::api::error_json(&error)["code"], "invalid_config");
+        }
     }
 
     #[test]
