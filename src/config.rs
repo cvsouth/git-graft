@@ -141,16 +141,7 @@ impl Config {
             config.missing_repositories = missing;
             return Ok(config.placed(primary, false));
         }
-        let ceiling = home
-            .map(|home| dunce::canonicalize(home).unwrap_or_else(|_| home.to_owned()))
-            .filter(|home| inside(primary, home, FOLD_CASE));
-        for (depth, dir) in primary.ancestors().enumerate().skip(1) {
-            if ceiling
-                .as_deref()
-                .is_some_and(|home| !inside(dir, home, FOLD_CASE))
-            {
-                break;
-            }
+        for (depth, dir) in searched(primary, home) {
             if !(present(dir, SHARED) || present(dir, LOCAL)) {
                 continue;
             }
@@ -250,13 +241,19 @@ fn listed_turns(dir: &Path, above: bool) -> Result<(Vec<String>, PathBuf)> {
 /// A checkout whose own files list `turns` as well must list the same
 /// resources, or Graft would have to guess which list is meant.
 pub(crate) fn shared_turns(primary: &Path) -> Result<Option<(PathBuf, Vec<String>)>> {
+    shared_turns_within(primary, home().as_deref())
+}
+
+/// [`shared_turns`], with `home` as the person's home directory.
+fn shared_turns_within(
+    primary: &Path,
+    home: Option<&Path>,
+) -> Result<Option<(PathBuf, Vec<String>)>> {
     if primary.join(".git").symlink_metadata().is_err() {
         return Ok(None);
     }
-    let Some(dir) = primary
-        .ancestors()
-        .skip(1)
-        .find(|dir| present(dir, SHARED) || present(dir, LOCAL))
+    let Some((_, dir)) =
+        searched(primary, home).find(|(_, dir)| present(dir, SHARED) || present(dir, LOCAL))
     else {
         return Ok(None);
     };
@@ -288,8 +285,29 @@ pub(crate) fn shared_turns(primary: &Path) -> Result<Option<(PathBuf, Vec<String
         }
     }
     Ok(Some(
-        shared_turns(dir)?.unwrap_or_else(|| (dir.to_owned(), above)),
+        shared_turns_within(dir, home)?.unwrap_or_else(|| (dir.to_owned(), above)),
     ))
+}
+
+/// The directories above `primary` that Graft searches for a configuration,
+/// nearest first, each with how many levels up it is: up to and including
+/// `home` when `primary` is inside it, and up to the root otherwise.
+fn searched<'a>(
+    primary: &'a Path,
+    home: Option<&Path>,
+) -> impl Iterator<Item = (usize, &'a Path)> + use<'a> {
+    let ceiling = home
+        .map(|home| dunce::canonicalize(home).unwrap_or_else(|_| home.to_owned()))
+        .filter(|home| inside(primary, home, FOLD_CASE));
+    primary
+        .ancestors()
+        .enumerate()
+        .skip(1)
+        .take_while(move |(_, dir)| {
+            ceiling
+                .as_deref()
+                .is_none_or(|home| inside(dir, home, FOLD_CASE))
+        })
 }
 
 /// Whether `dir` has an entry called `name`, of any type, so that a file
@@ -1587,6 +1605,24 @@ mod tests {
         // Nothing listed above leaves the checkout's own turns its own.
         write(&root, SHARED, r#"{"repositories": {}}"#);
         assert_eq!(shared_turns(&app).unwrap(), None);
+    }
+
+    #[test]
+    fn turns_listed_above_home_are_not_shared() {
+        let (_tmp, root, app, api) = enclosing();
+        write(&root, SHARED, r#"{"turns": ["stack"]}"#);
+        let stack = Some((root.clone(), vec!["stack".to_owned()]));
+        // With the root as home, the file there is read.
+        assert_eq!(shared_turns_within(&app, Some(&root)).unwrap(), stack);
+        // With home below it, the search stops before reaching it.
+        let services = root.join("services");
+        assert_eq!(shared_turns_within(&api, Some(&services)).unwrap(), None);
+        // A file at home is still read.
+        write(&services, SHARED, r#"{"turns": ["web"]}"#);
+        assert_eq!(
+            shared_turns_within(&api, Some(&services)).unwrap(),
+            Some((services.clone(), vec!["web".to_owned()]))
+        );
     }
 
     #[test]
