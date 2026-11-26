@@ -529,6 +529,7 @@ fn grafts_at(paths: &[PathBuf], liveness: &Liveness<'_>) -> Result<Vec<Graft>> {
 /// the grafts of one it holds, the `post-take` hooks of the project that
 /// keeps the turn run, with no lock held; if one fails, the turn is given up
 /// again and the take refused. `hooks` says whether the caller may run them.
+/// Only a take that would run them requires the hooks to be trusted.
 pub(super) fn take(
     primary: &Path,
     own: Paths,
@@ -550,7 +551,6 @@ pub(super) fn take(
     let (p, lock) = Project::open_at(place.clone(), false)?;
     // The project that keeps the turn defines what runs when it is taken.
     let config = Config::read(&p.repo)?;
-    hook::trust::require(&p, &config, Event::PostTake, hooks)?;
     let post_take = config.hooks_for(Event::PostTake);
     let liveness = Liveness::new(&p);
     let who = Party {
@@ -569,6 +569,18 @@ pub(super) fn take(
         .filter(|holder| holder.who.name == who.name)
         .map(|holder| holder.who.grafts.clone());
     let granted = turn.take(now, &who, args.ttl, &|party| liveness.gone(party))?;
+    let changed = granted
+        && before.is_none_or(|before| {
+            turn.holder
+                .as_ref()
+                .is_some_and(|holder| holder.who.grafts != before)
+        });
+    // Only a take that would run a hook needs it trusted: a renewal or a
+    // queued ask runs none, so an edited hook does not cost its holder the
+    // turn or a waiter its place. A refused take changes nothing.
+    if changed {
+        hook::trust::require(&p, &config, Event::PostTake, hooks)?;
+    }
     if turn != stored {
         write(&p, &args.resource, &turn)?;
     }
@@ -589,12 +601,6 @@ pub(super) fn take(
                 .collect()
         })
         .unwrap_or_default();
-    let changed = granted
-        && before.is_none_or(|before| {
-            turn.holder
-                .as_ref()
-                .is_some_and(|holder| holder.who.grafts != before)
-        });
     if !changed || post_take.is_empty() {
         return Ok(reply);
     }
@@ -1378,6 +1384,67 @@ mod tests {
             (&quiet["granted"], &quiet["hooks"][0]["status"]),
             (&json!(true), &json!("skipped"))
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_edited_hook_needs_trust_only_for_a_take_that_would_run_it() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new()?;
+        let log = f.root.join("hook.log");
+        let script = f.root.join("switch");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$GIT_GRAFT_TURN_HOLDER\" >> '{}'\n",
+                log.display()
+            ),
+        )?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+        let configure = |argv: Value| {
+            fs::write(
+                f.root.join(crate::config::SHARED),
+                json!({"turns": ["stack"], "hooks": {"switch": {"event": "post-take", "argv": argv}}})
+                    .to_string(),
+            )
+        };
+        let trust = || -> Result<Value> {
+            let (p, _lock) = Project::open_at(Project::paths(&f.root)?, false)?;
+            hook::trust::trust(&p)
+        };
+        let ran = || fs::read_to_string(&log).unwrap_or_default();
+        configure(json!([script]))?;
+        let untrusted = f.ask(&f.app, "stack", "agent-1", None).unwrap_err();
+        assert_eq!(api::error_json(&untrusted)["code"], "hooks_untrusted");
+        assert_eq!(f.list(&f.app)?, []);
+        trust()?;
+        assert_eq!(f.ask(&f.app, "stack", "agent-1", None)?["granted"], true);
+        assert_eq!(f.ask(&f.api, "stack", "agent-2", None)?["position"], 1);
+        assert_eq!(ran(), "agent-1\n");
+
+        // Once the trusted hook is edited, a renewal and a queued ask run
+        // nothing and so are not refused.
+        configure(json!([script, "--edited"]))?;
+        let renewed = f.ask(&f.app, "stack", "agent-1", None)?;
+        assert_eq!(renewed["granted"], true);
+        assert!(renewed.get("hooks").is_none());
+        let queued = f.ask(&f.api, "stack", "agent-2", None)?;
+        assert_eq!(queued["position"], 1);
+        assert!(queued.get("hooks").is_none());
+
+        // A take that would run it is refused and changes nothing.
+        f.give_up(&f.app, "stack", "agent-1")?;
+        let error = f.ask(&f.api, "stack", "agent-2", None).unwrap_err();
+        assert_eq!(api::error_json(&error)["code"], "hooks_untrusted");
+        assert_eq!(
+            f.list(&f.app)?,
+            [("stack".into(), Value::Null, json!(["agent-2"]))]
+        );
+        // Trusted again, it runs for that take.
+        trust()?;
+        assert_eq!(f.ask(&f.api, "stack", "agent-2", None)?["granted"], true);
+        assert_eq!(ran(), "agent-1\nagent-2\n");
         Ok(())
     }
 }
