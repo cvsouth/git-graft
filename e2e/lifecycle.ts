@@ -493,6 +493,26 @@ export const cases: Scenario[] = [
     },
   },
   {
+    name: 'prune --apply --purge-archives deletes the archives its preview names, not those it archives',
+    run(ctx) {
+      const gone = ctx.spawn('gone');
+      ctx.cli(['remove', 'gone', '--lease', gone.lease]);
+      const idle = ctx.spawn('idle');
+      expire(ctx, idle.result.id);
+      const preview = objectResult(ctx.cli(['prune', '--purge-archives', '0']).archives);
+      assert.deepEqual(array(preview.purged).map(object).map(item => item.name), ['gone']);
+
+      const applied = ctx.cli(['prune', '--apply', '--purge-archives', '0']);
+      assert.equal(reasons(applied).idle, 'archived');
+      const archives = objectResult(applied.archives);
+      assert.deepEqual(archives.purged, preview.purged);
+      assert.equal('error' in archives, false);
+      const kept = array(applied.retained).map(object).find(item => item.name === 'idle');
+      assert(kept !== undefined && typeof kept.archive_path === 'string');
+      assert.ok(existsSync(kept.archive_path));
+    },
+  },
+  {
     name: 'prune --purge-archives refuses an archive directory that is a link',
     run(ctx) {
       const gone = ctx.spawn('gone');
@@ -517,6 +537,39 @@ export const cases: Scenario[] = [
       }
       renameSync(moved, archives);
       ctx.cli(['restore', 'gone', '--lease', gone.lease]);
+    },
+  },
+  {
+    name: 'prune --apply reports what it archived when the purge of archives fails',
+    run(ctx) {
+      const gone = ctx.spawn('gone');
+      ctx.cli(['remove', 'gone', '--lease', gone.lease]);
+      const archives = join(ctx.root, 'project.graft', '.retired');
+      // A plain file under the name a purge sets aside is no archive: the
+      // purge leaves it and goes on.
+      const stray = join(archives, '.purging-stray');
+      writeFileSync(stray, 'not an archive');
+      const idle = ctx.spawn('idle');
+      expire(ctx, idle.result.id);
+      // POSIX refuses to rename a directory over a plain file; Windows may
+      // replace the file instead, so the failure is checked on POSIX only.
+      const blocked = join(archives, `.purging-${String(gone.result.id)}`);
+      if (process.platform !== 'win32') {
+        writeFileSync(blocked, '');
+        const applied = ctx.cli(['prune', '--apply', '--purge-archives', '0']);
+        assert.equal(reasons(applied).idle, 'archived');
+        const report = objectResult(applied.archives);
+        assert.equal(typeof report.error, 'string');
+        assert.deepEqual(report.purged, []);
+        assert.ok(existsSync(join(archives, String(gone.result.id))));
+        unlinkSync(blocked);
+        ctx.cli(['restore', 'idle', '--lease', idle.lease]);
+      }
+      const applied = ctx.cli(['prune', '--apply', '--purge-archives', '0']);
+      const report = objectResult(applied.archives);
+      assert.equal('error' in report, false);
+      assert.deepEqual(array(report.purged).map(object).map(item => item.name), ['gone']);
+      assert.equal(readFileSync(stray, 'utf8'), 'not an archive');
     },
   },
   {

@@ -1147,19 +1147,37 @@ pub(crate) fn run_found(
             if a.apply {
                 hooks.hooks(p, hook::Event::PreArchive)?;
             }
+            // The archives to purge are found before prune archives
+            // anything, so it never purges a graft it has just archived.
+            let purge = a
+                .purge_archives
+                .map(|days| registry::archives_to_purge(p, days))
+                .transpose()?;
             let retained = registry::prune_with(p, a.apply, &mut |r| hooks.before_prune(p, r))?;
             let cache = if !a.purge_cache {
                 json!({"requested":false,"purged":false})
             } else {
                 engine::gc::purge_caches(p, a.apply)?
             };
-            let archives = match a.purge_archives {
+            let archives = match purge {
                 None => json!({"requested": false, "purged": []}),
-                Some(days) => json!({
-                    "requested": true,
-                    "older_than_days": days,
-                    "purged": registry::purge_archives(p, days, a.apply)?,
-                }),
+                Some(purge) => {
+                    let mut archives = json!({
+                        "requested": true,
+                        "older_than_days": purge.days(),
+                        "purged": purge.report(),
+                    });
+                    if a.apply {
+                        // Prune has archived grafts by now. A purge that
+                        // fails is reported beside them, not instead.
+                        let mut purged = Vec::new();
+                        if let Err(error) = registry::purge_archives(p, &purge, &mut purged) {
+                            archives["error"] = json!(format!("{error:#}"));
+                        }
+                        archives["purged"] = json!(purged);
+                    }
+                    archives
+                }
             };
             let mut pruned =
                 json!({"applied":a.apply,"retained":retained,"cache":cache,"archives":archives});
