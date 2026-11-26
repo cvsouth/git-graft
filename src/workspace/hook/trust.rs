@@ -3,15 +3,18 @@
 //! a clone, a checked-out branch or a merged graft, so it runs only after the
 //! person has run `git graft hook trust`. That command records a digest of
 //! every hook those files define, by event, name and program with arguments,
-//! in the project's Graft state. A command that would run one of them refuses
-//! with `hooks_untrusted` until the digest matches, and again after any
-//! change. What an untracked `.graftconfig.local` adds, replaces or turns off
-//! is the person's own and needs no trust. No MCP tool records trust, so an
-//! agent cannot approve its own hook.
+//! in the project's Graft state. A program named by a path relative to the
+//! configuration's directory is part of what is trusted, contents included.
+//! A command that would run one of them refuses with `hooks_untrusted` until
+//! the digest matches, and again after any change. What an untracked
+//! `.graftconfig.local` adds, replaces or turns off is the person's own and
+//! needs no trust, except one in a directory above the checkout on Windows,
+//! where Graft cannot check that the person owns it. No MCP tool records
+//! trust, so an agent cannot approve its own hook.
 
 use crate::{
     api,
-    config::{Config, Hook, LOCAL, SHARED},
+    config::{Config, Hook, LOCAL, OWNER_CHECKED},
     registry::{self, Project},
 };
 use anyhow::{Context, Result};
@@ -43,16 +46,28 @@ pub(crate) struct Gate {
 
 impl Gate {
     /// `.graftconfig` always does, and `.graftconfig.local` when Git tracks
-    /// it in the primary. Git is asked only when the local file defines a hook.
-    pub(crate) fn of(primary: &Path, config: &Config) -> Result<Self> {
-        let local =
-            config.defined.iter().any(|hook| hook.file == LOCAL) && tracked(primary, LOCAL)?;
+    /// it in the repository whose working tree holds it, or when it is in a
+    /// directory above the checkout and Graft does not check who owns it.
+    /// Git is asked only when the local file defines a hook.
+    pub(crate) fn of(config: &Config) -> Result<Self> {
+        Self::with_owner_check(config, OWNER_CHECKED)
+    }
+
+    /// [`Self::of`], as on a platform that checks the owner of a file above
+    /// the checkout when `owner_checked` is set.
+    fn with_owner_check(config: &Config, owner_checked: bool) -> Result<Self> {
+        let local = match &config.dir {
+            Some(dir) if config.defined.iter().any(|hook| hook.local) => {
+                (config.above && !owner_checked) || tracked(dir, LOCAL)?
+            }
+            _ => false,
+        };
         Ok(Self { local })
     }
 
-    /// Whether a hook from `file` runs only once trusted.
-    pub(crate) fn needs_trust(&self, file: &str) -> bool {
-        file == SHARED || self.local && file == LOCAL
+    /// Whether `hook` runs only once trusted.
+    pub(crate) fn needs_trust(&self, hook: &Hook) -> bool {
+        !hook.local || self.local
     }
 
     /// The hooks that run only once trusted, as the files define them.
@@ -60,32 +75,79 @@ impl Gate {
         config
             .defined
             .iter()
-            .filter(|hook| self.needs_trust(hook.file))
+            .filter(|hook| self.needs_trust(hook))
             .collect()
     }
 }
 
-/// Whether the index of `primary` holds `name`, at the root of the checkout,
-/// in any case: on a case-insensitive filesystem Graft reads a tracked
-/// `.GraftConfig.local` as `.graftconfig.local`, so it must be gated as one.
-fn tracked(primary: &Path, name: &str) -> Result<bool> {
-    let pathspec = format!(":(top,icase,literal){name}");
-    let listed = crate::git::bytes(primary, &["ls-files", "--cached", "-z", "--", &pathspec])
+/// Whether Git tracks the file `name` in `dir`, in any case: on a
+/// case-insensitive filesystem Graft reads a tracked `.GraftConfig.local` as
+/// `.graftconfig.local`, and the index may spell `dir` itself in another case
+/// than the path Graft found it by, so both must be gated as one. The
+/// pathspec names `dir` by its path from the top of the working tree, because
+/// `icase` does not apply to the prefix Git takes from the current directory.
+/// A directory outside any working tree tracks nothing.
+fn tracked(dir: &Path, name: &str) -> Result<bool> {
+    let found = crate::git::raw(
+        dir,
+        &["rev-parse", "--is-inside-work-tree", "--show-prefix"],
+    )
+    .with_context(|| format!("check whether Git tracks {name}"))?;
+    let mut lines = found.stdout.split(|byte| *byte == b'\n');
+    if !found.status.success() || lines.next() != Some(b"true".as_slice()) {
+        return Ok(false);
+    }
+    // A prefix that is not UTF-8 cannot be put in a pathspec here, so the
+    // file is treated as tracked: it then needs trust.
+    let Ok(prefix) = std::str::from_utf8(lines.next().unwrap_or_default()) else {
+        return Ok(true);
+    };
+    let pathspec = format!(":(top,icase,literal){prefix}{name}");
+    let listed = crate::git::bytes(dir, &["ls-files", "--cached", "-z", "--", &pathspec])
         .with_context(|| format!("check whether Git tracks {name}"))?;
     Ok(!listed.is_empty())
 }
 
-/// The digest of `hooks`: their events, names and arguments, in order.
+/// The SHA-256 of the file at `path`, or `None` when it cannot be read.
+fn file_digest(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match io::Read::read(&mut file, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(hex(&hasher.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The digest of `hooks`: their events, names and arguments, in order. A
+/// hook whose program is a path relative to its configuration's directory
+/// also counts that path and the program's contents, since the file comes
+/// with the repository that holds the configuration as the hook does.
 fn digest(hooks: &[&Hook]) -> String {
-    let parts: Vec<(&str, &str, &[String])> = hooks
+    let parts: Vec<Value> = hooks
         .iter()
-        .map(|hook| (hook.event.name(), hook.name.as_str(), hook.argv.as_slice()))
+        .map(|hook| match &hook.program {
+            None => json!([hook.event.name(), hook.name, hook.argv]),
+            Some(program) => json!([
+                hook.event.name(),
+                hook.name,
+                hook.argv,
+                program,
+                file_digest(program)
+            ]),
+        })
         .collect();
     let bytes = serde_json::to_vec(&parts).expect("hook descriptions serialize");
-    Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex(&Sha256::digest(&bytes))
 }
 
 /// The record in the Graft state directory `state`, if trust was recorded.
@@ -122,8 +184,8 @@ pub(crate) fn require(p: &Project, config: &Config, event: Event, policy: Policy
     if due.is_empty() {
         return Ok(());
     }
-    let gate = Gate::of(&p.repo, config)?;
-    if !due.iter().any(|hook| gate.needs_trust(hook.file)) {
+    let gate = Gate::of(config)?;
+    if !due.iter().any(|hook| gate.needs_trust(hook)) {
         return Ok(());
     }
     let gated = gate.hooks(config);
@@ -134,7 +196,7 @@ pub(crate) fn require(p: &Project, config: &Config, event: Event, policy: Policy
     {
         return Ok(());
     }
-    let mut files: Vec<&str> = gated.iter().map(|hook| hook.file).collect();
+    let mut files: Vec<&str> = gated.iter().map(|hook| hook.file.as_str()).collect();
     files.dedup();
     let state = if record.is_some() {
         "have changed since they were last trusted"
@@ -161,7 +223,7 @@ pub(crate) fn require(p: &Project, config: &Config, event: Event, policy: Policy
 /// trusted. Returns them with their digest.
 pub(crate) fn trust(p: &Project) -> Result<Value> {
     let config = Config::read(&p.repo)?;
-    let gated = Gate::of(&p.repo, &config)?.hooks(&config);
+    let gated = Gate::of(&config)?.hooks(&config);
     let hooks: Vec<Value> = gated.iter().map(|hook| hook.describe()).collect();
     let record = Record {
         sha256: digest(&gated),
@@ -174,13 +236,17 @@ pub(crate) fn trust(p: &Project) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SHARED;
 
     fn hook(name: &str, event: Event, argv: &[&str], file: &'static str) -> Hook {
         Hook {
             name: name.into(),
             event,
             argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
-            file,
+            file: file.to_owned(),
+            local: file == LOCAL,
+            program: None,
+            dir: None,
         }
     }
 
@@ -237,8 +303,11 @@ mod tests {
         };
         // What an untracked local file replaces or turns off leaves the
         // shared definitions, and so their trust, as they were.
-        let untracked = Gate::of(primary, &config)?;
-        assert!(!untracked.needs_trust(LOCAL));
+        let untracked = Gate::of(&config)?;
+        assert!(!untracked.local);
+        // The checkout's own file needs no owner check, on any platform.
+        assert!(!config.above);
+        assert!(!Gate::with_owner_check(&config, false)?.local);
         assert_eq!(
             names(untracked.hooks(&config)),
             [
@@ -249,11 +318,11 @@ mod tests {
         );
         assert_eq!(
             digest(&untracked.hooks(&config)),
-            digest(&Gate::of(primary, &shared_only)?.hooks(&shared_only))
+            digest(&Gate::of(&shared_only)?.hooks(&shared_only))
         );
         crate::git::bytes(primary, &["add", "--", LOCAL])?;
-        let tracked = Gate::of(primary, &config)?;
-        assert!(tracked.needs_trust(LOCAL));
+        let tracked = Gate::of(&config)?;
+        assert!(tracked.local);
         assert_eq!(
             names(tracked.hooks(&config)),
             [
@@ -301,6 +370,87 @@ mod tests {
             ],
         )?;
         assert!(tracked(primary, LOCAL)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_file_in_a_directory_the_index_spells_in_another_case_counts_as_tracked() -> Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        crate::git::bytes(root, &["init", "-q", "--template="])?;
+        // As a clone on a case-insensitive filesystem leaves it: the index
+        // holds `sub/`, and the directory on disk is `Sub/`.
+        let dir = root.join("Sub");
+        fs::create_dir(&dir)?;
+        assert!(!tracked(&dir, LOCAL)?);
+        let blob = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        crate::git::bytes(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},sub/.GraftConfig.local"),
+            ],
+        )?;
+        assert!(tracked(&dir, LOCAL)?);
+        // The file in another directory is not this one.
+        let other = root.join("other");
+        fs::create_dir(&other)?;
+        assert!(!tracked(&other, LOCAL)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_above_needs_trust_when_tracked_and_a_relative_program_counts_by_contents()
+    -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = dunce::canonicalize(tmp.path())?;
+        let app = root.join("app");
+        fs::create_dir(&app)?;
+        crate::git::bytes(&app, &["init", "-q", "--template="])?;
+        fs::create_dir(root.join("scripts"))?;
+        fs::write(root.join("scripts").join("setup"), "#!/bin/sh\n")?;
+        let local = r#"{"repositories": {"app": {"hooks": {"setup": {"event": "post-add", "argv": ["./scripts/setup"]}}}}}"#;
+        fs::write(root.join(LOCAL), local)?;
+
+        // Outside any working tree, the local file is the person's own,
+        // where Graft checks that the person owns it.
+        let config = Config::read(&app)?;
+        assert!(config.above);
+        assert!(!Gate::with_owner_check(&config, true)?.local);
+        assert!(
+            Gate::with_owner_check(&config, true)?
+                .hooks(&config)
+                .is_empty()
+        );
+        // Where it does not, as on Windows, the hook needs trust.
+        assert!(Gate::with_owner_check(&config, false)?.local);
+        assert_eq!(
+            Gate::with_owner_check(&config, false)?.hooks(&config).len(),
+            1
+        );
+        assert_eq!(Gate::of(&config)?.local, !OWNER_CHECKED);
+
+        // Once the directory's own repository tracks it, it needs trust.
+        crate::git::bytes(&root, &["init", "-q", "--template="])?;
+        assert!(!Gate::with_owner_check(&config, true)?.local);
+        crate::git::bytes(&root, &["add", "--", LOCAL])?;
+        assert!(Gate::with_owner_check(&config, true)?.local);
+        let gate = Gate::of(&config)?;
+        assert!(gate.local);
+        let gated = gate.hooks(&config);
+        assert_eq!(gated.len(), 1);
+        let before = digest(&gated);
+
+        // Changing the program changes what was trusted; restoring it does not.
+        fs::write(root.join("scripts").join("setup"), "#!/bin/sh\nrm -rf ~\n")?;
+        assert_ne!(digest(&gated), before);
+        fs::write(root.join("scripts").join("setup"), "#!/bin/sh\n")?;
+        assert_eq!(digest(&gated), before);
+        fs::remove_file(root.join("scripts").join("setup"))?;
+        assert_ne!(digest(&gated), before);
         Ok(())
     }
 }

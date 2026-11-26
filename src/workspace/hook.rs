@@ -91,21 +91,26 @@ fn is_bare_name(program: &str) -> bool {
 /// The effective hooks of the project whose primary checkout is `primary`,
 /// in the order they run, with the file each came from and whether it may
 /// run as trust stands in the Graft state directory `state`, which need not
-/// exist.
+/// exist. Keys under `repositories` that name no repository are reported in
+/// `missing_repositories`, when there are any.
 pub(crate) fn list(primary: &Path, state: &Path) -> Result<Value> {
     let config = Config::read(primary)?;
-    let gate = trust::Gate::of(primary, &config)?;
+    let gate = trust::Gate::of(&config)?;
     let trusted = trust::is_trusted(state, &gate.hooks(&config))?;
     let hooks: Vec<_> = config
         .hooks
         .iter()
         .map(|hook| {
             let mut described = hook.describe();
-            described["trusted"] = json!(trusted || !gate.needs_trust(hook.file));
+            described["trusted"] = json!(trusted || !gate.needs_trust(hook));
             described
         })
         .collect();
-    Ok(json!({ "hooks": hooks }))
+    let mut listed = json!({ "hooks": hooks });
+    if !config.missing_repositories.is_empty() {
+        listed["missing_repositories"] = json!(config.missing_repositories);
+    }
+    Ok(listed)
 }
 
 /// The graft a hook runs in, as the hook's environment describes it.
@@ -123,7 +128,7 @@ struct Graft<'a> {
 /// drops the lease and the variables that point Git at another repository.
 fn command(hook: &Hook, graft: &Graft<'_>) -> Result<Command> {
     let (program, args) = hook.argv.split_first().context("the hook has no program")?;
-    let mut command = Command::new(program);
+    let mut command = Command::new(hook.program.as_deref().unwrap_or(Path::new(program)));
     crate::git::clear_location(&mut command);
     command
         .args(args)
@@ -134,6 +139,10 @@ fn command(hook: &Hook, graft: &Graft<'_>) -> Result<Command> {
         .env("GIT_GRAFT_NAME", graft.name)
         .env("GIT_GRAFT_PATH", graft.path)
         .env("GIT_GRAFT_PRIMARY", graft.primary)
+        .env(
+            "GIT_GRAFT_CONFIG_DIR",
+            hook.dir.as_deref().unwrap_or(Path::new("")),
+        )
         .env("GIT_GRAFT_BRANCH", graft.branch.unwrap_or_default())
         .env("GIT_GRAFT_BASE", graft.base.unwrap_or_default())
         .env("GIT_GRAFT_PORT", graft.port.to_string());
@@ -393,7 +402,10 @@ mod tests {
             name: "setup".into(),
             event,
             argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
-            file: crate::config::SHARED,
+            file: crate::config::SHARED.to_owned(),
+            local: false,
+            program: None,
+            dir: Some(Path::new("configured").to_owned()),
         }
     }
 
@@ -531,6 +543,7 @@ mod tests {
             ("GIT_GRAFT_NAME", "fix-parser"),
             ("GIT_GRAFT_PATH", "grafts/fix-parser"),
             ("GIT_GRAFT_PRIMARY", "primary"),
+            ("GIT_GRAFT_CONFIG_DIR", "configured"),
             ("GIT_GRAFT_BRANCH", ""),
             ("GIT_GRAFT_BASE", "0123456789abcdef"),
             ("GIT_GRAFT_PORT", "30123"),

@@ -41,7 +41,7 @@ pub(crate) enum Patterns {
     /// Read from the project's configuration files, which are named.
     Config {
         patterns: Vec<String>,
-        files: Vec<&'static str>,
+        files: Vec<String>,
     },
 }
 
