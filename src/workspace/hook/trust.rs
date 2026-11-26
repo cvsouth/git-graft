@@ -65,9 +65,11 @@ impl Gate {
     }
 }
 
-/// Whether the index of `primary` holds `name`, at the root of the checkout.
+/// Whether the index of `primary` holds `name`, at the root of the checkout,
+/// in any case: on a case-insensitive filesystem Graft reads a tracked
+/// `.GraftConfig.local` as `.graftconfig.local`, so it must be gated as one.
 fn tracked(primary: &Path, name: &str) -> Result<bool> {
-    let pathspec = format!(":(top,literal){name}");
+    let pathspec = format!(":(top,icase,literal){name}");
     let listed = crate::git::bytes(primary, &["ls-files", "--cached", "-z", "--", &pathspec])
         .with_context(|| format!("check whether Git tracks {name}"))?;
     Ok(!listed.is_empty())
@@ -277,6 +279,28 @@ mod tests {
         assert!(!is_trusted(&state, &gated[..1])?);
         fs::write(state.join(FILE), "{")?;
         assert!(is_trusted(&state, &gated).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_file_tracked_in_another_case_counts_as_tracked() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let primary = tmp.path();
+        crate::git::bytes(primary, &["init", "-q", "--template="])?;
+        assert!(!tracked(primary, LOCAL)?);
+        // Added to the index directly, so the test needs no particular
+        // filesystem to hold a name in another case.
+        let blob = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        crate::git::bytes(
+            primary,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},.GraftConfig.local"),
+            ],
+        )?;
+        assert!(tracked(primary, LOCAL)?);
         Ok(())
     }
 }
