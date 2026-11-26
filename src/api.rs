@@ -4,6 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fmt;
+use std::path::PathBuf;
 
 fn head() -> String {
     "HEAD".into()
@@ -369,17 +370,26 @@ pub const TURN_TTL_DEFAULT: u64 = 30 * 60;
 /// Longest turn `ttl`, in seconds.
 pub const TURN_TTL_MAX: u64 = 24 * 60 * 60;
 
-/// Arguments of `turn take` and the MCP `graft_turn_take` tool.
+/// Arguments of `turn take`.
 #[derive(Debug, Clone, Args, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TurnTake {
-    /// Name of the graft.
-    pub name: String,
     /// Shared resource, a name the project chooses, such as web or database: 1 to 64 lowercase letters, numbers or hyphens.
     pub resource: String,
-    /// Lease returned when the graft was created.
-    #[arg(long, env = "GIT_GRAFT_LEASE", hide_env_values = true)]
+    /// Name the turn is held under, such as the agent's or the task's: 1 to 64 letters, digits, '-', '_' or '.'.
+    #[arg(long)]
+    pub holder: String,
+    /// A random UUIDv4 the holder chooses for its first take and gives to every later take and release under the same name.
+    #[arg(long, hide_env_values = true)]
     pub lease: String,
+    /// A process whose life bounds the holder: once it ends, the holder loses the turn and its place in the queue.
+    #[arg(long)]
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// A graft the holder works in, by path. Repeatable, for grafts of any repository. Once none of them is active, the holder loses the turn and its place in the queue.
+    #[arg(long = "graft", value_name = "PATH")]
+    #[serde(default)]
+    pub grafts: Vec<PathBuf>,
     /// Keep asking for up to this many seconds, at most 3600, until the turn is granted. The default asks once.
     #[arg(
         long,
@@ -416,17 +426,49 @@ impl TurnTake {
     }
 }
 
-/// Arguments of `turn release` and the MCP `graft_turn_release` tool.
-#[derive(Debug, Args, Deserialize, Serialize, JsonSchema)]
+/// Arguments of `turn release`.
+#[derive(Debug, Clone, Args, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TurnRelease {
-    /// Name of the graft.
-    pub name: String,
     /// Shared resource whose turn to give up, or whose queue to leave.
     pub resource: String,
-    /// Lease returned when the graft was created.
-    #[arg(long, env = "GIT_GRAFT_LEASE", hide_env_values = true)]
+    /// Name the turn is held or waited for under.
+    #[arg(long)]
+    pub holder: String,
+    /// The lease the holder gave when it first asked.
+    #[arg(long, hide_env_values = true)]
     pub lease: String,
+}
+
+/// Arguments of the MCP `graft_turn_take` tool. The MCP server is the
+/// holder's process and supplies its lease, so an agent handles neither.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTurnTake {
+    /// Shared resource, a name the project chooses, such as web or database: 1 to 64 lowercase letters, numbers or hyphens.
+    pub resource: String,
+    /// Name the turn is held under, such as the task's: 1 to 64 letters, digits, '-', '_' or '.'.
+    pub holder: String,
+    /// Paths of the grafts this work uses, in any repository. Once none of them is active, the turn and the place in the queue are lost.
+    #[serde(default)]
+    pub grafts: Vec<PathBuf>,
+    /// Keep asking for up to this many seconds, at most 3600, until the turn is granted. The default asks once.
+    #[serde(default)]
+    #[schemars(range(max = TURN_WAIT_MAX))]
+    pub wait: u64,
+    /// Seconds the turn lasts unless it is taken again, from 1 to 86400. A new turn defaults to 1800; a renewal keeps the turn's current value.
+    #[schemars(range(min = 1, max = TURN_TTL_MAX))]
+    pub ttl: Option<u64>,
+}
+
+/// Arguments of the MCP `graft_turn_release` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTurnRelease {
+    /// Shared resource whose turn to give up, or whose queue to leave.
+    pub resource: String,
+    /// Name the turn is held or waited for under.
+    pub holder: String,
 }
 
 /// Arguments of `push` and the MCP `graft_push` tool: publish a graft's

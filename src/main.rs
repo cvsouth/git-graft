@@ -11,6 +11,7 @@ mod landing;
 mod layer;
 mod mcp;
 mod package_manager;
+mod process;
 mod reconcile;
 mod recovery;
 mod registry;

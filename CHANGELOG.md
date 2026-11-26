@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `.graftconfig`, which a project commits, and `.graftconfig.local`, your own, set a project's default includes and hooks. One directory above several repositories can configure them all.
 - Hooks run your own commands after `add` and `restore` and before a graft is archived, for setup and cleanup such as a per-graft database.
 - `push` sends a graft's commits to a branch on the primary's remote, for pull request work. It never forces and won't update the default branch unless you name it.
-- `turn take`, `turn release` and `turn list` let grafts take turns on something there is only one of, such as a development server on a fixed port.
+- `turn take`, `turn release` and `turn list` let your work take turns on something there is only one of, such as a development server on a fixed port, across several repositories if need be.
 - `prune --purge-archives DAYS` deletes archives older than DAYS days.
 - MCP tools for the above: `graft_local_files`, `graft_turn_take`, `graft_turn_release`, `graft_turn_list`, and `graft_push` for hosts started with `--allow-push`.
 

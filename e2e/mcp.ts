@@ -24,8 +24,9 @@ const defaultTools = ['graft_list', 'graft_local_files', 'graft_add', 'graft_sta
   'graft_restore', 'graft_turn_take', 'graft_turn_release', 'graft_turn_list'];
 const spawnOptions = ['base', 'branch', 'detach', 'history', 'include', 'lock', 'name', 'no_checkout', 'no_deps', 'orphan',
   'reason', 'request_id', 'sparse'];
+// The turn tools take none: the MCP session holds its turns under a lease of its own.
 const leaseTools = new Set(['graft_add_dependency', 'graft_remove', 'graft_exec', 'graft_renew', 'graft_merge',
-  'graft_push', 'graft_restore', 'graft_turn_take', 'graft_turn_release']);
+  'graft_push', 'graft_restore']);
 
 function isObject(value: unknown): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value);

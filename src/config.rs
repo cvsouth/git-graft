@@ -141,16 +141,7 @@ impl Config {
             config.missing_repositories = missing;
             return Ok(config.placed(primary, false));
         }
-        let ceiling = home
-            .map(|home| dunce::canonicalize(home).unwrap_or_else(|_| home.to_owned()))
-            .filter(|home| inside(primary, home, FOLD_CASE));
-        for (depth, dir) in primary.ancestors().enumerate().skip(1) {
-            if ceiling
-                .as_deref()
-                .is_some_and(|home| !inside(dir, home, FOLD_CASE))
-            {
-                break;
-            }
+        for (depth, dir) in searched(primary, home) {
             if !(present(dir, SHARED) || present(dir, LOCAL)) {
                 continue;
             }
@@ -208,6 +199,124 @@ fn home() -> Option<PathBuf> {
     std::env::var_os(name)
         .map(PathBuf::from)
         .filter(|home| home.is_absolute())
+}
+
+/// The `turns` both files list, the shared file's first, each once.
+fn turns(shared: &Option<File>, local: &Option<File>) -> Vec<String> {
+    let mut turns: Vec<String> = Vec::new();
+    for resource in [shared, local]
+        .into_iter()
+        .flatten()
+        .flat_map(|file| &file.turns)
+    {
+        if !turns.contains(resource) {
+            turns.push(resource.clone());
+        }
+    }
+    turns
+}
+
+/// The `turns` the files in `dir` list, and the file that lists them: the
+/// shared one when it lists any. `above` is as for [`load`].
+fn listed_turns(dir: &Path, above: bool) -> Result<(Vec<String>, PathBuf)> {
+    let shared = load(dir, SHARED, above)?;
+    let local = load(dir, LOCAL, above)?;
+    let name = if shared.as_ref().is_some_and(|file| !file.turns.is_empty()) {
+        SHARED
+    } else {
+        LOCAL
+    };
+    Ok((turns(&shared, &local), dir.join(name)))
+}
+
+/// The shared resources whose turns the repository at `primary` keeps in a
+/// directory above it, and that directory. They are the `turns` of the
+/// nearest directory above, up to the same home-directory bound as the
+/// configuration, whose files list any; they are read whether or not the
+/// checkout has files of its own: those govern everything else, but cannot
+/// take the repository out of a queue it shares. When that directory is
+/// itself a checkout that keeps the same turns further up, they are kept
+/// there, so a queue is never split between levels. `None` when no
+/// directory above lists turns.
+///
+/// A checkout whose own files list `turns` as well must list the same
+/// resources, or Graft would have to guess which list is meant.
+pub(crate) fn shared_turns(primary: &Path) -> Result<Option<(PathBuf, Vec<String>)>> {
+    shared_turns_within(primary, home().as_deref())
+}
+
+/// [`shared_turns`], with `home` as the person's home directory.
+fn shared_turns_within(
+    primary: &Path,
+    home: Option<&Path>,
+) -> Result<Option<(PathBuf, Vec<String>)>> {
+    if primary.join(".git").symlink_metadata().is_err() {
+        return Ok(None);
+    }
+    // A directory whose files list no turns is passed over, so a checkout or
+    // directory configured for something else cannot split a queue kept
+    // further up.
+    let mut found = None;
+    for (_, dir) in searched(primary, home) {
+        if !(present(dir, SHARED) || present(dir, LOCAL)) {
+            continue;
+        }
+        let (listed, file) = listed_turns(dir, true)?;
+        if !listed.is_empty() {
+            found = Some((dir, listed, file));
+            break;
+        }
+    }
+    let Some((dir, above, above_file)) = found else {
+        return Ok(None);
+    };
+    if present(primary, SHARED) || present(primary, LOCAL) {
+        let (own, own_file) = listed_turns(primary, false)?;
+        let set = |list: &[String]| {
+            let mut list = list.to_vec();
+            list.sort();
+            list
+        };
+        if !own.is_empty() && set(&own) != set(&above) {
+            return Err(crate::api::fault(
+                "invalid_config",
+                format!(
+                    "{} lists the turns {}, but {} above it lists {}. The directory above decides \
+                     which turns a repository shares, so list the same resources in both files, \
+                     or list them only above",
+                    own_file.display(),
+                    own.join(", "),
+                    above_file.display(),
+                    above.join(", ")
+                ),
+                json!({"file": own_file, "above": above_file}),
+            ));
+        }
+    }
+    Ok(Some(
+        shared_turns_within(dir, home)?.unwrap_or_else(|| (dir.to_owned(), above)),
+    ))
+}
+
+/// The directories above `primary` that Graft searches for a configuration,
+/// nearest first, each with how many levels up it is: up to and including
+/// `home` when `primary` is inside it, and up to the root otherwise.
+fn searched<'a>(
+    primary: &'a Path,
+    home: Option<&Path>,
+) -> impl Iterator<Item = (usize, &'a Path)> + use<'a> {
+    let ceiling = home
+        .map(|home| dunce::canonicalize(home).unwrap_or_else(|_| home.to_owned()))
+        .filter(|home| inside(primary, home, FOLD_CASE));
+    primary
+        .ancestors()
+        .enumerate()
+        .skip(1)
+        .take_while(move |(_, dir)| {
+            ceiling
+                .as_deref()
+                .is_none_or(|home| inside(dir, home, FOLD_CASE))
+        })
 }
 
 /// Whether `dir` has an entry called `name`, of any type, so that a file
@@ -305,6 +414,7 @@ impl<'de> Deserialize<'de> for Part {
 struct File {
     own: Part,
     repositories: Vec<(String, Part)>,
+    turns: Vec<String>,
 }
 
 impl File {
@@ -328,6 +438,8 @@ impl<'de> Deserialize<'de> for File {
             hooks: Option<Named>,
             #[serde(default)]
             repositories: Option<Repositories>,
+            #[serde(default)]
+            turns: Option<Vec<String>>,
         }
         let written = Written::deserialize(deserializer)?;
         Ok(File {
@@ -336,6 +448,7 @@ impl<'de> Deserialize<'de> for File {
                 hooks: written.hooks,
             },
             repositories: written.repositories.map(|r| r.0).unwrap_or_default(),
+            turns: written.turns.unwrap_or_default(),
         })
     }
 }
@@ -507,6 +620,10 @@ fn load(dir: &Path, name: &'static str, above: bool) -> Result<Option<File>> {
 /// `dir`.
 fn check(file: &File, name: &'static str, dir: &Path) -> Result<()> {
     check_part(&file.own, name, None)?;
+    for resource in &file.turns {
+        crate::workspace::validate_resource(resource)
+            .map_err(|_| anyhow::anyhow!("turns: {resource:?} is not a resource name: use 1 to 64 lowercase letters, numbers or hyphens, starting with a letter or number"))?;
+    }
     for (key, part) in &file.repositories {
         check_key(key)?;
         check_part(part, name, Some((key, dir)))
@@ -1417,5 +1534,149 @@ mod tests {
         );
         std::os::unix::fs::symlink(&kept, root.join(LOCAL)).unwrap();
         assert_eq!(Config::read(&app).unwrap().include, [".env"]);
+    }
+
+    #[test]
+    fn turns_are_listed_at_the_top_of_either_file_and_checked() {
+        let (_tmp, root, app, _api) = enclosing();
+        write(&root, SHARED, r#"{"turns": ["stack", "database"]}"#);
+        write(&root, LOCAL, r#"{"turns": ["database", "simulator"]}"#);
+        assert_eq!(
+            shared_turns(&app).unwrap(),
+            Some((
+                root.clone(),
+                vec!["stack".into(), "database".into(), "simulator".into()]
+            ))
+        );
+        // Only the top level lists them, not a repository's settings.
+        write(
+            &root,
+            LOCAL,
+            r#"{"repositories": {"app": {"turns": ["web"]}}}"#,
+        );
+        let error = Config::read(&app).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field"), "{error:#}");
+        for bad in [
+            r#"{"turns": ["Stack"]}"#,
+            r#"{"turns": "stack"}"#,
+            r#"{"turns": [""]}"#,
+        ] {
+            write(&root, LOCAL, bad);
+            for error in [
+                Config::read(&app).unwrap_err(),
+                shared_turns(&app).unwrap_err(),
+            ] {
+                assert_eq!(
+                    crate::api::error_json(&error)["code"],
+                    "invalid_config",
+                    "{bad}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_checkout_s_own_files_do_not_hide_the_turns_of_the_directory_above() {
+        let (_tmp, root, app, api) = enclosing();
+        write(
+            &root,
+            SHARED,
+            r#"{"turns": ["stack"], "repositories": {"app": {"include": ["from-root"]}}}"#,
+        );
+        write(&app, SHARED, r#"{"include": ["own"]}"#);
+        let stack = Some((root.clone(), vec!["stack".to_owned()]));
+        // The checkout's own file governs everything else.
+        let config = Config::read(&app).unwrap();
+        assert_eq!(config.include, ["own"]);
+        assert_eq!(config.dir.as_deref(), Some(app.as_path()));
+        assert_eq!(shared_turns(&app).unwrap(), stack);
+        assert_eq!(shared_turns(&api).unwrap(), stack);
+
+        // Its own `turns` may repeat those above, in any order.
+        write(&root, SHARED, r#"{"turns": ["stack", "database"]}"#);
+        write(&app, LOCAL, r#"{"turns": ["database", "stack", "stack"]}"#);
+        assert_eq!(
+            shared_turns(&app).unwrap(),
+            Some((root.clone(), vec!["stack".into(), "database".into()]))
+        );
+        // A list that differs is refused rather than guessed at, naming both files.
+        write(&app, LOCAL, r#"{"turns": ["stack"]}"#);
+        let error = shared_turns(&app).unwrap_err();
+        let json = crate::api::error_json(&error);
+        assert_eq!(json["code"], "invalid_config");
+        assert_eq!(json["details"]["file"], json!(app.join(LOCAL)));
+        assert_eq!(json["details"]["above"], json!(root.join(SHARED)));
+        let message = json["message"].as_str().unwrap();
+        assert!(message.contains("same resources"), "{message}");
+        // Only turns: every other command still reads the checkout's own files.
+        assert_eq!(Config::read(&app).unwrap().include, ["own"]);
+
+        // Nothing listed above leaves the checkout's own turns its own.
+        write(&root, SHARED, r#"{"repositories": {}}"#);
+        assert_eq!(shared_turns(&app).unwrap(), None);
+    }
+
+    #[test]
+    fn a_directory_between_that_lists_no_turns_does_not_split_the_queue() {
+        let (_tmp, root, app, api) = enclosing();
+        write(&root, SHARED, r#"{"turns": ["stack"]}"#);
+        let stack = Some((root.clone(), vec!["stack".to_owned()]));
+        // A checkout configured for something else, with a repository inside it.
+        write(&app, SHARED, r#"{"include": ["x"]}"#);
+        let web = app.join("web");
+        fs::create_dir_all(&web).unwrap();
+        crate::git::bytes(&web, &["init", "-q", "--template="]).unwrap();
+        assert_eq!(shared_turns(&app).unwrap(), stack);
+        assert_eq!(shared_turns(&web).unwrap(), stack);
+        // A plain directory configured for something else.
+        write(&root.join("services"), SHARED, r#"{"repositories": {}}"#);
+        assert_eq!(shared_turns(&api).unwrap(), stack);
+    }
+
+    #[test]
+    fn turns_listed_above_home_are_not_shared() {
+        let (_tmp, root, app, api) = enclosing();
+        write(&root, SHARED, r#"{"turns": ["stack"]}"#);
+        let stack = Some((root.clone(), vec!["stack".to_owned()]));
+        // With the root as home, the file there is read.
+        assert_eq!(shared_turns_within(&app, Some(&root)).unwrap(), stack);
+        // With home below it, the search stops before reaching it.
+        let services = root.join("services");
+        assert_eq!(shared_turns_within(&api, Some(&services)).unwrap(), None);
+        // A file at home is still read.
+        write(&services, SHARED, r#"{"turns": ["web"]}"#);
+        assert_eq!(
+            shared_turns_within(&api, Some(&services)).unwrap(),
+            Some((services.clone(), vec!["web".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn turns_listed_at_two_levels_are_kept_at_the_higher() {
+        let (_tmp, root, app, _api) = enclosing();
+        crate::git::bytes(&root, &["init", "-q", "--template="]).unwrap();
+        // `app` is a checkout that holds the repository `web`, and lists
+        // `stack` for it as the directory above `app` does.
+        let web = app.join("web");
+        fs::create_dir(&web).unwrap();
+        crate::git::bytes(&web, &["init", "-q", "--template="]).unwrap();
+        write(&root, SHARED, r#"{"turns": ["stack"]}"#);
+        write(&app, SHARED, r#"{"turns": ["stack"]}"#);
+        let stack = Some((root.clone(), vec!["stack".to_owned()]));
+        assert_eq!(shared_turns(&app).unwrap(), stack);
+        assert_eq!(shared_turns(&web).unwrap(), stack);
+        // A repository the higher list disagrees with is refused below it too.
+        write(&root, SHARED, r#"{"turns": ["database"]}"#);
+        for repo in [&app, &web] {
+            let error = shared_turns(repo).unwrap_err();
+            assert_eq!(crate::api::error_json(&error)["code"], "invalid_config");
+        }
+        // With nothing listed higher up, `app` keeps them for `web`.
+        write(&root, SHARED, "{}");
+        assert_eq!(
+            shared_turns(&web).unwrap(),
+            Some((app.clone(), vec!["stack".to_owned()]))
+        );
+        assert_eq!(shared_turns(&app).unwrap(), None);
     }
 }

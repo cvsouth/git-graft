@@ -18,12 +18,12 @@ Use cache-only registration for package downloads. For installed-file reuse, a u
 
 ## Take turns on something every graft shares
 
-A graft has its own files, but a project can have one development server on a fixed port, one local database or one device. Before you use such a thing, take a turn on it. Graft does nothing to the resource itself: it only records whose turn it is, so the turn works when every agent asks.
+A graft has its own files, but a project can have one development server on a fixed port, one local database or one device. Before you use such a thing, take a turn on it. Graft does nothing to the resource itself: it only records whose turn it is, so the turn works when every agent asks. Your MCP session holds the turn, so you give no lease, and the turn ends when the session does.
 
-1. Call `graft_turn_take` with your graft's `name` and `lease` and a `resource` name. Use the name the project's instructions give, so that every agent asks for the same one.
+1. Call `graft_turn_take` with a `resource` name and a `holder` name for your work, such as your task's. Use the resource name the project's instructions give, so that every agent asks for the same one. Use one holder name for all of your work, even when it spans grafts of several repositories, and list those grafts' paths in `grafts`.
 2. `granted: true` means the turn is yours until `expires_at`. During long use, call `graft_turn_take` again before then to renew it.
-3. `granted: false` means another graft holds the turn or is ahead of you, and `position` is your place in line. Do not use the resource. Call again within 300 seconds to keep your place, or pass `wait` in seconds, shorter than your limit for one tool call, to keep asking in a single call.
-4. Stop what you started and call `graft_turn_release` as soon as you finish, and also when you stop waiting. If you stop without releasing, the others wait until your turn expires.
+3. `granted: false` means another holder has the turn or is ahead of you, and `position` is your place in line. Do not use the resource. Call again within 300 seconds to keep your place, or pass `wait` in seconds, shorter than your limit for one tool call, to keep asking in a single call.
+4. Stop what you started and call `graft_turn_release` with the same `resource` and `holder` as soon as you finish, and also when you stop waiting. If you stop without releasing, the others wait until your session ends, your grafts are archived or your turn expires.
 
 `graft_turn_list` shows who holds and who waits for each resource. On the CLI these are `git graft turn take`, `turn release` and `turn list`. [Rules for turns](../../docs/operations.md#take-turns-on-a-shared-resource)
 

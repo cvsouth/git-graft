@@ -169,14 +169,24 @@ enum TurnCommand {
     /// Take the turn on a shared resource, join its queue, or renew a turn already held.
     #[command(after_help = "\
 Examples:
-  git graft turn take fix-parser web --lease <lease>             Ask once
-  git graft turn take fix-parser web --lease <lease> --wait 600  Keep asking for ten minutes
-  git graft turn take fix-parser web --lease <lease> --ttl 3600  Hold for an hour between renewals
+  git graft turn take web --holder fix-parser --lease <uuid>             Ask once
+  git graft turn take web --holder fix-parser --lease <uuid> --wait 600  Keep asking for ten minutes
+  git graft turn take web --holder fix-parser --lease <uuid> --pid $PPID Lose the turn when the shell ends
+  git graft turn take web --holder fix-parser --lease <uuid> \\
+      --graft ../app.graft/fix-parser --graft ../api.graft/fix-parser    One turn for grafts of two repositories
 
-Prints \"granted\": true when the graft holds the turn. Otherwise the graft is
-queued and \"position\" is its place in line; ask again within 300 seconds to
-keep it. Being queued is not a failure: the exit status is 0 either way.
-Graft does nothing to the resource itself.")]
+The holder is the work that needs the resource, such as an agent or a task,
+under a name it chooses. Its lease is a random UUIDv4 it chooses for its first
+take and gives to every later take and release under that name. It loses the
+turn and its place in the queue when the turn runs out, when the --pid process
+ends, or when none of the --graft grafts is active any more.
+
+Prints \"granted\": true when the holder holds the turn. Otherwise it is queued
+and \"position\" is its place in line; ask again within 300 seconds to keep it.
+Being queued is not a failure: the exit status is 0 either way. A resource the
+configuration lists under \"turns\" in a directory above the primary is shared
+by every repository that directory configures. Graft does nothing to the
+resource itself.")]
     Take(api::TurnTake),
     /// Give up the turn on a shared resource, or leave its queue.
     Release(api::TurnRelease),
