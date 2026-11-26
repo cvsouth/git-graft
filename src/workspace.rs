@@ -350,9 +350,9 @@ fn spawn(
 }
 
 /// Give the graft `r` the remotes `config` names, and report them in `reply`
-/// as `remotes`. The graft is usable either way, so a failure is reported,
-/// not returned. Remote-tracking refs are copied only with local history,
-/// which already holds their objects.
+/// as `remotes`. The graft is usable either way, so a remote that fails is
+/// reported by name, not returned. Remote-tracking refs are copied only with
+/// local history, which already holds their objects.
 fn with_remotes(
     p: &Project,
     r: &Record,
@@ -364,10 +364,7 @@ fn with_remotes(
         return;
     }
     let copy = history == api::History::Local;
-    reply["remotes"] = match remotes::configure(&p.repo, &r.path, &config.remotes, copy) {
-        Ok(entries) => json!(entries),
-        Err(error) => json!([{"status": "failed", "reason": format!("{error:#}")}]),
-    };
+    reply["remotes"] = json!(remotes::configure(&p.repo, &r.path, &config.remotes, copy));
 }
 
 /// The history a recorded request built its graft with.

@@ -65,28 +65,51 @@ export const cases: Scenario[] = [
       const bare = remote(ctx);
       ctx.git(['push', '-q', 'origin', 'HEAD:refs/heads/main']);
       ctx.git(['fetch', '-q', 'origin']);
+      ctx.git(['remote', 'set-head', 'origin', 'main']);
       ctx.git(['remote', 'add', 'secret', 'https://user:token@example.invalid/repo.git']);
-      writeFileSync(join(ctx.repo, '.graftconfig.local'), JSON.stringify({ remotes: ['origin', 'secret', 'missing'] }));
+      // A remote-tracking ref of upstream whose object the primary lacks
+      // fails the copy of its refs after its keys are written.
+      remote(ctx, 'upstream');
+      const broken = join(ctx.repo, '.git', 'refs', 'remotes', 'upstream', 'broken');
+      mkdirSync(join(broken, '..'), { recursive: true });
+      writeFileSync(broken, '1'.repeat(40) + '\n');
+      writeFileSync(join(ctx.repo, '.graftconfig.local'), JSON.stringify({ remotes: ['origin', 'upstream', 'secret', 'missing'] }));
       const added = ctx.spawn('remoted', ['--history', 'local']);
       const path = String(added.path);
-      const entries = added.result.remotes;
-      assert(Array.isArray(entries));
-      assert.deepEqual(entries.map(object).map(entry => [entry.name, entry.status, entry.reason ?? entry.refs]),
-        [['origin', 'configured', 1], ['secret', 'skipped', 'url_has_credentials'], ['missing', 'skipped', 'not_configured']]);
+      const entries = (added.result.remotes as unknown[]).map(object);
+      assert.deepEqual(entries.map(entry => [entry.name, entry.status, entry.reason ?? entry.refs]).filter(([name]) => name !== 'upstream'),
+        [['origin', 'configured', 2], ['secret', 'skipped', 'url_has_credentials'], ['missing', 'skipped', 'not_configured']]);
+      // The remote that failed is reported by name and leaves nothing behind.
+      assert.equal(entries[1].name, 'upstream');
+      assert.equal(entries[1].status, 'failed');
+      assert.equal(typeof entries[1].reason, 'string');
+      assert.equal(ctx.git(['remote'], path), 'origin');
+      assert.equal(refs(ctx, path, 'refs/remotes/upstream'), '');
       assert.equal(ctx.git(['remote', 'get-url', 'origin'], path), bare);
       assert.equal(ctx.git(['rev-parse', 'origin/main'], path), ctx.git(['rev-parse', 'origin/main']));
-      assert.equal(ctx.git(['remote'], path), 'origin');
+      assert.equal(ctx.git(['symbolic-ref', 'refs/remotes/origin/HEAD'], path), 'refs/remotes/origin/main');
       // Plain Git works in the graft at once.
       const tip = commit(ctx, path, 'remoted.txt', 'remoted\n');
       ctx.git(['push', '-q', 'origin', 'HEAD:refs/heads/remoted'], path);
       assert.equal(ctx.git(['rev-parse', 'refs/heads/remoted'], bare), tip);
       ctx.git(['fetch', '-q', 'origin'], path);
       assert.equal(ctx.git(['rev-parse', 'origin/remoted'], path), tip);
+      // When the upstream moves on, a fetch moves origin, not only origin/main.
+      const other = join(ctx.root, 'other');
+      ctx.git(['clone', '-q', '-b', 'main', bare, other], ctx.root);
+      const moved = commit(ctx, other, 'moved.txt', 'moved\n');
+      ctx.git(['push', '-q', 'origin', 'HEAD:refs/heads/main'], other);
+      ctx.git(['fetch', '-q', 'origin'], path);
+      assert.equal(ctx.git(['rev-parse', 'origin/main'], path), moved);
+      assert.equal(ctx.git(['rev-parse', 'origin'], path), moved);
 
-      // Restored, the graft keeps the remote it has.
+      // Restored, the graft keeps the remote it has and gets the one that failed.
+      rmSync(broken);
       const archived = ctx.cli(['remove', 'remoted', '--lease', added.lease, '--discard']);
       const restored = ctx.cli(['restore', 'remoted', '--lease', String(archived.recovery_lease)]);
-      assert.deepEqual(object((restored.remotes as unknown[])[0]), { name: 'origin', status: 'kept' });
+      assert.deepEqual((restored.remotes as unknown[]).slice(0, 2).map(object),
+        [{ name: 'origin', status: 'kept' }, { name: 'upstream', status: 'configured', refs: 0 }]);
+      writeFileSync(join(ctx.repo, '.graftconfig.local'), JSON.stringify({ remotes: ['origin'] }));
 
       // Isolated history gets the remote but no remote-tracking refs.
       const isolated = ctx.spawn('isolated', ['--history', 'isolated']);

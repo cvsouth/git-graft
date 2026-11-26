@@ -3,9 +3,9 @@
 //! in it. A graft has no remotes otherwise. Only a remote's URLs and fetch
 //! refspecs are copied, never credentials: a remote whose URL carries a user
 //! name or password is left out.
-use std::path::Path;
+use std::{io::Write, path::Path, process::Stdio};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::git;
@@ -40,93 +40,208 @@ fn carries_credentials(url: &str) -> bool {
     !ssh || userinfo.contains(':')
 }
 
+/// What the primary configures for a remote the graft is to get.
+struct Source {
+    urls: Vec<String>,
+    pushurls: Vec<String>,
+    fetch: Vec<String>,
+}
+
+/// Whether the graft gets the remote `name`: its configuration in the
+/// primary, or the fields of the entry that reports why not.
+enum Found {
+    Copy(Source),
+    Leave(Value),
+}
+
+/// Read the remote `name` of the primary at `primary`, for the graft at
+/// `graft`. Changes nothing.
+fn find(primary: &Path, graft: &Path, name: &str) -> Result<Found> {
+    let urls = values(primary, &format!("remote.{name}.url"))?;
+    if urls.is_empty() {
+        return Ok(Found::Leave(
+            json!({"status": "skipped", "reason": "not_configured"}),
+        ));
+    }
+    let pushurls = values(primary, &format!("remote.{name}.pushurl"))?;
+    if urls
+        .iter()
+        .chain(&pushurls)
+        .any(|url| carries_credentials(url))
+    {
+        return Ok(Found::Leave(
+            json!({"status": "skipped", "reason": "url_has_credentials"}),
+        ));
+    }
+    if !values(graft, &format!("remote.{name}.url"))?.is_empty() {
+        return Ok(Found::Leave(json!({"status": "kept"})));
+    }
+    let mut fetch = values(primary, &format!("remote.{name}.fetch"))?;
+    if fetch.is_empty() {
+        fetch.push(format!("+refs/heads/*:refs/remotes/{name}/*"));
+    }
+    Ok(Found::Copy(Source {
+        urls,
+        pushurls,
+        fetch,
+    }))
+}
+
+/// Give the graft the remote `name` as `source` describes it, and, when
+/// `copy_refs`, the primary's remote-tracking refs of it. Returns the fields
+/// of the entry that reports it.
+fn give(
+    primary: &Path,
+    graft: &Path,
+    name: &str,
+    source: &Source,
+    copy_refs: bool,
+) -> Result<Value> {
+    let set = |key: String, values: &[String]| -> Result<()> {
+        for value in values {
+            git::bytes(graft, &["config", "--add", &key, value])?;
+        }
+        Ok(())
+    };
+    set(format!("remote.{name}.url"), &source.urls)?;
+    set(format!("remote.{name}.pushurl"), &source.pushurls)?;
+    set(format!("remote.{name}.fetch"), &source.fetch)?;
+    let mut refs = 0;
+    if copy_refs {
+        // With local history the graft already holds their objects. The
+        // primary's `HEAD` of the remote is a symbolic ref, which a fetch
+        // would copy as a plain one that no later fetch moves, so it is
+        // left out and made again below.
+        let head = format!("refs/remotes/{name}/HEAD");
+        git::bytes(
+            graft,
+            &[
+                "fetch",
+                "-q",
+                "--no-tags",
+                "--no-write-fetch-head",
+                git::path_str(primary)?,
+                &format!("+refs/remotes/{name}/*:refs/remotes/{name}/*"),
+                &format!("^{head}"),
+            ],
+        )?;
+        let prefix = format!("refs/remotes/{name}/");
+        if let Some(target) = git::symbolic_ref(primary, &head)?
+            && target.starts_with(&prefix)
+            && git::raw(graft, &["rev-parse", "--verify", "--quiet", &target])?
+                .status
+                .success()
+        {
+            git::bytes(graft, &["symbolic-ref", &head, &target])?;
+        }
+        refs = list_refs(graft, &prefix)?.len();
+    }
+    Ok(json!({"status": "configured", "refs": refs}))
+}
+
+/// The names of the refs under `prefix` in the repository at `dir`.
+fn list_refs(dir: &Path, prefix: &str) -> Result<Vec<String>> {
+    Ok(
+        git::text(dir, &["for-each-ref", "--format=%(refname)", prefix])?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// Take out of the graft at `graft` what [`give`] set up for the remote
+/// `name`: its configuration and its remote-tracking refs. Only called for a
+/// remote the graft did not have before.
+fn undo(graft: &Path, name: &str) -> Result<()> {
+    let section = git::raw(
+        graft,
+        &["config", "--remove-section", &format!("remote.{name}")],
+    )?;
+    // A failure before the first key was written leaves no section.
+    anyhow::ensure!(
+        section.status.success() || values(graft, &format!("remote.{name}.url"))?.is_empty(),
+        "git config --remove-section remote.{name}: {}",
+        String::from_utf8_lossy(&section.stderr).trim_end()
+    );
+    let refs = list_refs(graft, &format!("refs/remotes/{name}/"))?;
+    if refs.is_empty() {
+        return Ok(());
+    }
+    // `no-deref` deletes a symbolic `HEAD` itself, not the ref it names.
+    let script: String = refs
+        .iter()
+        .map(|reference| format!("option no-deref\ndelete {reference}\n"))
+        .collect();
+    let mut child = git::command(graft)
+        .args(["update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("start Git")?;
+    let written = child
+        .stdin
+        .take()
+        .context("open the input of git update-ref")?
+        .write_all(script.as_bytes());
+    let out = child
+        .wait_with_output()
+        .context("wait for git update-ref")?;
+    written.context("write to git update-ref")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "git update-ref: {}",
+        String::from_utf8_lossy(&out.stderr).trim_end()
+    );
+    Ok(())
+}
+
 /// Give the graft at `graft` each remote `names` lists, as the primary at
 /// `primary` configures it, and, when `copy_refs`, the primary's
 /// remote-tracking refs of it. A remote the graft already has is left as it
-/// is. Returns one entry per name: `configured`, the `refs` copied, or why it
-/// was `skipped`.
+/// is. Returns one entry per name: `configured`, with the `refs` copied;
+/// `kept`; why it was `skipped`; or why it `failed`.
+/// A remote that fails is taken out again whole, and the others are still set
+/// up.
 pub(crate) fn configure(
     primary: &Path,
     graft: &Path,
     names: &[String],
     copy_refs: bool,
-) -> Result<Vec<Value>> {
-    let mut entries = Vec::new();
-    for name in names {
-        let urls = values(primary, &format!("remote.{name}.url"))?;
-        let entry = |status: &str, extra: Value| {
-            let mut entry = json!({"name": name, "status": status});
-            if let (Value::Object(entry), Value::Object(extra)) = (&mut entry, extra) {
-                entry.extend(extra);
+) -> Vec<Value> {
+    names
+        .iter()
+        .map(|name| {
+            let fields = match find(primary, graft, name) {
+                Err(error) => json!({"status": "failed", "reason": format!("{error:#}")}),
+                Ok(Found::Leave(fields)) => fields,
+                Ok(Found::Copy(source)) => match give(primary, graft, name, &source, copy_refs) {
+                    Ok(fields) => fields,
+                    Err(error) => {
+                        let mut reason = format!("{error:#}");
+                        if let Err(undone) = undo(graft, name) {
+                            reason.push_str(&format!(
+                                "; taking the remote out again also failed: {undone:#}"
+                            ));
+                        }
+                        json!({"status": "failed", "reason": reason})
+                    }
+                },
+            };
+            let mut entry = json!({"name": name});
+            if let (Value::Object(entry), Value::Object(fields)) = (&mut entry, fields) {
+                entry.extend(fields);
             }
             entry
-        };
-        if urls.is_empty() {
-            entries.push(entry("skipped", json!({"reason": "not_configured"})));
-            continue;
-        }
-        let pushurls = values(primary, &format!("remote.{name}.pushurl"))?;
-        if urls
-            .iter()
-            .chain(&pushurls)
-            .any(|url| carries_credentials(url))
-        {
-            entries.push(entry("skipped", json!({"reason": "url_has_credentials"})));
-            continue;
-        }
-        if !values(graft, &format!("remote.{name}.url"))?.is_empty() {
-            entries.push(entry("kept", json!({})));
-            continue;
-        }
-        let mut fetch = values(primary, &format!("remote.{name}.fetch"))?;
-        if fetch.is_empty() {
-            fetch.push(format!("+refs/heads/*:refs/remotes/{name}/*"));
-        }
-        let set = |key: String, values: &[String]| -> Result<()> {
-            for value in values {
-                git::bytes(graft, &["config", "--add", &key, value])?;
-            }
-            Ok(())
-        };
-        set(format!("remote.{name}.url"), &urls)?;
-        set(format!("remote.{name}.pushurl"), &pushurls)?;
-        set(format!("remote.{name}.fetch"), &fetch)?;
-        let mut refs = 0;
-        if copy_refs {
-            // With local history the graft already holds their objects.
-            let refspec = format!("+refs/remotes/{name}/*:refs/remotes/{name}/*");
-            let primary_str = git::path_str(primary)?;
-            git::bytes(
-                graft,
-                &[
-                    "fetch",
-                    "-q",
-                    "--no-tags",
-                    "--no-write-fetch-head",
-                    primary_str,
-                    &refspec,
-                ],
-            )?;
-            refs = git::bytes(
-                graft,
-                &[
-                    "for-each-ref",
-                    "--format=x",
-                    &format!("refs/remotes/{name}/"),
-                ],
-            )?
-            .split(|b| *b == b'\n')
-            .filter(|line| !line.is_empty())
-            .count();
-        }
-        entries.push(entry("configured", json!({"refs": refs})));
-    }
-    Ok(entries)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn credentials_in_a_url_are_recognised() {
@@ -197,7 +312,7 @@ mod tests {
             ],
         )?;
         let names: Vec<String> = ["origin", "secret", "missing"].map(str::to_owned).into();
-        let entries = configure(&primary, &graft, &names, false)?;
+        let entries = configure(&primary, &graft, &names, false);
         assert_eq!(
             entries,
             [
@@ -220,19 +335,141 @@ mod tests {
         );
         assert!(values(&graft, "remote.secret.url")?.is_empty());
         // A remote the graft has is kept as it is.
-        let again = configure(&primary, &graft, &names[..1], true)?;
+        let again = configure(&primary, &graft, &names[..1], true);
         assert_eq!(again, [json!({"name": "origin", "status": "kept"})]);
 
         // With refs copied, the graft has the primary's remote-tracking refs.
         let fresh = tmp.path().join("fresh");
         repo(&fresh);
         git::bytes(&fresh, &["fetch", "-q", git::path_str(&primary)?, "HEAD"])?;
-        let copied = configure(&primary, &fresh, &names[..1], true)?;
+        let copied = configure(&primary, &fresh, &names[..1], true);
         assert_eq!(
             copied,
             [json!({"name": "origin", "status": "configured", "refs": 1})]
         );
         assert_eq!(git::text(&fresh, &["rev-parse", "origin/main"])?, head);
+        Ok(())
+    }
+
+    /// A primary with a bare upstream `origin` it has fetched, whose
+    /// `origin/HEAD` names `origin/main`, and a graft that holds its objects.
+    fn cloned(tmp: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
+        let (upstream, primary, graft) = (
+            tmp.join("upstream.git"),
+            tmp.join("primary"),
+            tmp.join("graft"),
+        );
+        repo(&primary);
+        git::bytes(
+            tmp,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "--template=",
+                git::path_str(&upstream)?,
+            ],
+        )?;
+        git::bytes(
+            &primary,
+            &["remote", "add", "origin", git::path_str(&upstream)?],
+        )?;
+        git::bytes(&primary, &["push", "-q", "origin", "main"])?;
+        git::bytes(&primary, &["fetch", "-q", "origin"])?;
+        git::bytes(&primary, &["remote", "set-head", "origin", "main"])?;
+        repo(&graft);
+        git::bytes(&graft, &["fetch", "-q", git::path_str(&primary)?, "main"])?;
+        Ok((upstream, primary, graft))
+    }
+
+    #[test]
+    fn origin_head_is_made_again_as_a_symbolic_ref_and_follows_a_fetch() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (_upstream, primary, graft) = cloned(tmp.path())?;
+        let names = ["origin".to_owned()];
+        let entries = configure(&primary, &graft, &names, true);
+        assert_eq!(
+            entries,
+            [json!({"name": "origin", "status": "configured", "refs": 2})]
+        );
+        assert_eq!(
+            git::symbolic_ref(&graft, "refs/remotes/origin/HEAD")?.as_deref(),
+            Some("refs/remotes/origin/main")
+        );
+        // The upstream moves on; a fetch in the graft moves `origin` with it.
+        let before = git::text(&graft, &["rev-parse", "origin/main"])?;
+        git::bytes(
+            &primary,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "two",
+            ],
+        )?;
+        git::bytes(&primary, &["push", "-q", "origin", "main"])?;
+        let moved = git::text(&primary, &["rev-parse", "HEAD"])?;
+        assert_ne!(moved, before);
+        git::bytes(&graft, &["fetch", "-q", "origin"])?;
+        assert_eq!(git::text(&graft, &["rev-parse", "origin/main"])?, moved);
+        assert_eq!(git::text(&graft, &["rev-parse", "origin"])?, moved);
+        Ok(())
+    }
+
+    #[test]
+    fn a_remote_that_fails_is_taken_out_whole_and_the_others_are_still_set_up() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (_upstream, primary, graft) = cloned(tmp.path())?;
+        git::bytes(
+            &primary,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@example.com:owner/repo.git",
+            ],
+        )?;
+        let head = git::text(&primary, &["rev-parse", "HEAD"])?;
+        git::bytes(
+            &primary,
+            &["update-ref", "refs/remotes/upstream/main", &head],
+        )?;
+        // Git cannot make `origin/HEAD` while its lock file exists, which
+        // fails `origin` after its keys and refs are in place.
+        let lock = graft.join(".git/refs/remotes/origin/HEAD.lock");
+        std::fs::create_dir_all(lock.parent().context("no parent")?)?;
+        std::fs::write(&lock, "")?;
+        let names = ["origin".to_owned(), "upstream".to_owned()];
+        let entries = configure(&primary, &graft, &names, true);
+        assert_eq!(entries[0]["name"], "origin");
+        assert_eq!(entries[0]["status"], "failed");
+        assert!(
+            entries[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("symbolic-ref"))
+        );
+        assert_eq!(
+            entries[1],
+            json!({"name": "upstream", "status": "configured", "refs": 1})
+        );
+        let keys = git::raw(&graft, &["config", "--get-regexp", r"^remote\.origin\."])?;
+        assert_eq!(
+            keys.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&keys.stdout)
+        );
+        assert!(list_refs(&graft, "refs/remotes/origin/")?.is_empty());
+        // With the cause gone, a later restore sets it up rather than keeping half.
+        std::fs::remove_file(&lock)?;
+        let again = configure(&primary, &graft, &names, true);
+        assert_eq!(again[0]["status"], "configured");
+        assert_eq!(again[1], json!({"name": "upstream", "status": "kept"}));
         Ok(())
     }
 }
