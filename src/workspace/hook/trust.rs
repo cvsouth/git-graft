@@ -82,15 +82,27 @@ impl Gate {
 
 /// Whether Git tracks the file `name` in `dir`, in any case: on a
 /// case-insensitive filesystem Graft reads a tracked `.GraftConfig.local` as
-/// `.graftconfig.local`, so it must be gated as one. A directory outside any
-/// working tree tracks nothing.
+/// `.graftconfig.local`, and the index may spell `dir` itself in another case
+/// than the path Graft found it by, so both must be gated as one. The
+/// pathspec names `dir` by its path from the top of the working tree, because
+/// `icase` does not apply to the prefix Git takes from the current directory.
+/// A directory outside any working tree tracks nothing.
 fn tracked(dir: &Path, name: &str) -> Result<bool> {
-    let inside = crate::git::raw(dir, &["rev-parse", "--is-inside-work-tree"])
-        .with_context(|| format!("check whether Git tracks {name}"))?;
-    if !inside.status.success() || inside.stdout.trim_ascii() != b"true" {
+    let found = crate::git::raw(
+        dir,
+        &["rev-parse", "--is-inside-work-tree", "--show-prefix"],
+    )
+    .with_context(|| format!("check whether Git tracks {name}"))?;
+    let mut lines = found.stdout.split(|byte| *byte == b'\n');
+    if !found.status.success() || lines.next() != Some(b"true".as_slice()) {
         return Ok(false);
     }
-    let pathspec = format!(":(icase,literal){name}");
+    // A prefix that is not UTF-8 cannot be put in a pathspec here, so the
+    // file is treated as tracked: it then needs trust.
+    let Ok(prefix) = std::str::from_utf8(lines.next().unwrap_or_default()) else {
+        return Ok(true);
+    };
+    let pathspec = format!(":(top,icase,literal){prefix}{name}");
     let listed = crate::git::bytes(dir, &["ls-files", "--cached", "-z", "--", &pathspec])
         .with_context(|| format!("check whether Git tracks {name}"))?;
     Ok(!listed.is_empty())
@@ -358,6 +370,35 @@ mod tests {
             ],
         )?;
         assert!(tracked(primary, LOCAL)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_file_in_a_directory_the_index_spells_in_another_case_counts_as_tracked() -> Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        crate::git::bytes(root, &["init", "-q", "--template="])?;
+        // As a clone on a case-insensitive filesystem leaves it: the index
+        // holds `sub/`, and the directory on disk is `Sub/`.
+        let dir = root.join("Sub");
+        fs::create_dir(&dir)?;
+        assert!(!tracked(&dir, LOCAL)?);
+        let blob = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+        crate::git::bytes(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},sub/.GraftConfig.local"),
+            ],
+        )?;
+        assert!(tracked(&dir, LOCAL)?);
+        // The file in another directory is not this one.
+        let other = root.join("other");
+        fs::create_dir(&other)?;
+        assert!(!tracked(&other, LOCAL)?);
         Ok(())
     }
 
