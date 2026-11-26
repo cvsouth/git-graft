@@ -231,12 +231,13 @@ fn listed_turns(dir: &Path, above: bool) -> Result<(Vec<String>, PathBuf)> {
 
 /// The shared resources whose turns the repository at `primary` keeps in a
 /// directory above it, and that directory. They are the `turns` of the
-/// nearest directory above that holds either file, which are read whether
-/// or not the checkout has files of its own: those govern everything else,
-/// but cannot take the repository out of a queue it shares. When that
-/// directory is itself a checkout that keeps the same turns further up,
-/// they are kept there, so a queue is never split between levels. `None`
-/// when that directory lists no turns.
+/// nearest directory above, up to the same home-directory bound as the
+/// configuration, whose files list any; they are read whether or not the
+/// checkout has files of its own: those govern everything else, but cannot
+/// take the repository out of a queue it shares. When that directory is
+/// itself a checkout that keeps the same turns further up, they are kept
+/// there, so a queue is never split between levels. `None` when no
+/// directory above lists turns.
 ///
 /// A checkout whose own files list `turns` as well must list the same
 /// resources, or Graft would have to guess which list is meant.
@@ -252,15 +253,23 @@ fn shared_turns_within(
     if primary.join(".git").symlink_metadata().is_err() {
         return Ok(None);
     }
-    let Some((_, dir)) =
-        searched(primary, home).find(|(_, dir)| present(dir, SHARED) || present(dir, LOCAL))
-    else {
+    // A directory whose files list no turns is passed over, so a checkout or
+    // directory configured for something else cannot split a queue kept
+    // further up.
+    let mut found = None;
+    for (_, dir) in searched(primary, home) {
+        if !(present(dir, SHARED) || present(dir, LOCAL)) {
+            continue;
+        }
+        let (listed, file) = listed_turns(dir, true)?;
+        if !listed.is_empty() {
+            found = Some((dir, listed, file));
+            break;
+        }
+    }
+    let Some((dir, above, above_file)) = found else {
         return Ok(None);
     };
-    let (above, above_file) = listed_turns(dir, true)?;
-    if above.is_empty() {
-        return Ok(None);
-    }
     if present(primary, SHARED) || present(primary, LOCAL) {
         let (own, own_file) = listed_turns(primary, false)?;
         let set = |list: &[String]| {
@@ -1605,6 +1614,23 @@ mod tests {
         // Nothing listed above leaves the checkout's own turns its own.
         write(&root, SHARED, r#"{"repositories": {}}"#);
         assert_eq!(shared_turns(&app).unwrap(), None);
+    }
+
+    #[test]
+    fn a_directory_between_that_lists_no_turns_does_not_split_the_queue() {
+        let (_tmp, root, app, api) = enclosing();
+        write(&root, SHARED, r#"{"turns": ["stack"]}"#);
+        let stack = Some((root.clone(), vec!["stack".to_owned()]));
+        // A checkout configured for something else, with a repository inside it.
+        write(&app, SHARED, r#"{"include": ["x"]}"#);
+        let web = app.join("web");
+        fs::create_dir_all(&web).unwrap();
+        crate::git::bytes(&web, &["init", "-q", "--template="]).unwrap();
+        assert_eq!(shared_turns(&app).unwrap(), stack);
+        assert_eq!(shared_turns(&web).unwrap(), stack);
+        // A plain directory configured for something else.
+        write(&root.join("services"), SHARED, r#"{"repositories": {}}"#);
+        assert_eq!(shared_turns(&api).unwrap(), stack);
     }
 
     #[test]
